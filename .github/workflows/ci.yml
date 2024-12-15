@@ -28,13 +28,10 @@ jobs:
         python-version: 3.8  # or your preferred Python version
 
     - name: Create conda environment
-      run: conda env create -f env.yml
-
-    - name: Activate conda environment
-      run: echo "conda activate iqc-env" >> $GITHUB_ENV
+      run: conda env create -f env.yaml
 
     - name: Install iqc
-      run: pip install -e .
+      run: conda run -n iqc-env pip install -e .
 
     - name: Run tests
-      run: pytest iqc/tests
+      run: conda run -n iqc-env pytest iqc/tests
