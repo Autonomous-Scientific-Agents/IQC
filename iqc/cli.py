@@ -2,13 +2,13 @@
 """
 
 import argparse
+import os
 
 
 def get_args():
     """
     Returns args object that contains command line options.
     """
-    import argparse
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,

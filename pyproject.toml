@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "iqc"
 version = "0.1.0"
-description = "IQC: A quantum chemistry package"
+description = "IQC: Interactive Quantum Chemistry"
 authors = [
-    {name = "Your Name", email = "your.email@example.com"},
+    {name = "Murat Keceli", email = "keceli@gmail.com"},
 ]
 readme = "README.md"
 requires-python = ">=3.8"
@@ -47,3 +47,6 @@ include = '\.pyi?$'
 [tool.isort]
 profile = "black"
 multi_line_output = 3 
+
+[project.scripts]
+iqc = "iqc.main:main"
