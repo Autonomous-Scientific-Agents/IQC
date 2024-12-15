@@ -28,7 +28,7 @@ jobs:
         python-version: 3.8  # or your preferred Python version
 
     - name: Create conda environment
-      run: conda env create -f env.yaml
+      run: conda env create -f env.yml
 
     - name: Install iqc
       run: conda run -n iqc-env pip install -e .
