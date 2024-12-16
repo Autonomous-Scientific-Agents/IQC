@@ -7,6 +7,7 @@ from mace.calculators import mace_mp
 from . import cli
 from . import mpitools
 from . import asetools
+import logging
 
 
 def main():
@@ -19,7 +20,9 @@ def main():
 
     # Set up logging
     log_level = getattr(logging, args.loglevel.upper(), logging.INFO)
-    logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
+    logging.basicConfig(
+        level=log_level, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
 
     logging.debug(f"Rank {rank} started with size {size}.")
 
@@ -39,7 +42,9 @@ def main():
     number_of_files = len(xyz_files)
 
     start_index, end_index = mpitools.get_start_end(comm, number_of_files)
-    logging.debug(f"Rank {rank} processing files from index {start_index} to {end_index}.")
+    logging.debug(
+        f"Rank {rank} processing files from index {start_index} to {end_index}."
+    )
 
     for file in xyz_files[start_index:end_index]:
         unique_name = os.path.splitext(os.path.basename(file))[0]
