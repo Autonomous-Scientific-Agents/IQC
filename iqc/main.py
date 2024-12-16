@@ -29,7 +29,7 @@ def main():
     if rank == 0:
         # Check if args.xyz is a file or directory
         if os.path.isdir(args.xyz):
-            xyz_dir = os.args.xyz
+            xyz_dir = args.xyz
             xyz_files = glob.glob(os.path.join(xyz_dir, "*.xyz"))
         elif os.path.isfile(args.xyz):
             xyz_files = [args.xyz]
