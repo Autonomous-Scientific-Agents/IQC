@@ -29,7 +29,7 @@ def main():
     if rank == 0:
         # Check if args.xyz is a file or directory
         if os.path.isdir(args.xyz):
-            xyz_dir = os.path.dirname(args.xyz)
+            xyz_dir = os.args.xyz
             xyz_files = glob.glob(os.path.join(xyz_dir, "*.xyz"))
         elif os.path.isfile(args.xyz):
             xyz_files = [args.xyz]
@@ -40,6 +40,8 @@ def main():
 
     xyz_files = comm.bcast(xyz_files if rank == 0 else None, root=0)
     number_of_files = len(xyz_files)
+    if number_of_files == 0:
+        raise FileNotFoundError(f"No .xyz files found in directory: {args.xyz}")
 
     start_index, end_index = mpitools.get_start_end(comm, number_of_files)
     logging.debug(
