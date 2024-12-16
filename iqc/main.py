@@ -20,8 +20,8 @@ def main():
     if rank == 0:
         # Check if args.xyz is a file or directory
         if os.path.isdir(args.xyz):
-            xyzdir = os.path.dirname(args.xyz)
-            xyz_files = glob.glob(os.path.join(xyzdir, "*.xyz"))
+            xyz_dir = os.path.dirname(args.xyz)
+            xyz_files = glob.glob(os.path.join(xyz_dir, "*.xyz"))
         elif os.path.isfile(args.xyz):
             xyz_files = [args.xyz]
         else:
@@ -61,7 +61,6 @@ def main():
                 results[key] = val
         except Exception as e:
             results["thermo_error"] = str(e)
-            raise
         time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         with open(f"{unique_name}_{time_stamp}.json", "w") as f:
             json.dump(results, f, indent=2, cls=asetools.ComplexEncoder)
