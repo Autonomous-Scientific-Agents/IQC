@@ -2,6 +2,8 @@ from mpi4py import MPI
 import os
 import glob
 import json
+from datetime import datetime
+from mace.calculators import mace_mp
 from . import cli
 from . import mpitools
 from . import asetools
@@ -11,35 +13,58 @@ def main():
     # Initialize MPI
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
-
+    size = comm.Get_size()
     # Get command line arguments
     args = cli.get_args()
 
     if rank == 0:
-        xyzdir = args.xyzdir
-        # Create a list of all .xyz files in the specified directory
-        xyz_files = glob.glob(os.path.join(xyzdir, "*.xyz"))
+        # Check if args.xyz is a file or directory
+        if os.path.isdir(args.xyz):
+            xyzdir = os.path.dirname(args.xyz)
+            xyz_files = glob.glob(os.path.join(xyzdir, "*.xyz"))
+        elif os.path.isfile(args.xyz):
+            xyz_files = [args.xyz]
+        else:
+            raise FileNotFoundError(f"Path {args.xyz} does not exist")
         number_of_files = len(xyz_files)
-        print(f"Rank {rank} found {number_of_files} .xyz files in {xyzdir}")
+        print(f"Rank {rank} found {number_of_files} .xyz file(s).")
 
     xyz_files = comm.bcast(xyz_files if rank == 0 else None, root=0)
     number_of_files = len(xyz_files)
 
     start_index, end_index = mpitools.get_start_end(comm, number_of_files)
     for file in xyz_files[start_index:end_index]:
-        file_name = os.path.splitext(os.path.basename(file))[0]
+        unique_name = os.path.splitext(os.path.basename(file))[0]
         atoms = asetools.get_atoms_from_xyz(file)
-        smiles = asetools.atoms2smiles(atoms)
         results = {
-            "name": file,
-            "number_of_atoms": int(len(atoms)),
-            "number_of_electrons": int(asetools.get_total_electrons(atoms)),
-            "spin": asetools.get_spin(atoms),
-            "formula": atoms.get_chemical_formula(mode="hill"),
-            "smiles": smiles,
+            "xyz_file": file,
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "mpi_size": size,
+            "mpi_rank": rank,
+            "hostname": os.uname().nodename,
         }
-        with open(f"{file_name}.json", "w") as f:
-            json.dump(results, f, indent=2)
+        try:
+            thermo, thermo_results = asetools.run_thermo(
+                atoms,
+                calculators=[
+                    mace_mp(
+                        model="large",
+                        dispersion=True,
+                        default_dtype="float64",
+                        device="cpu",
+                    )
+                ],
+                fmax=0.001,
+                unique_name=unique_name,
+            )
+            for key, val in thermo_results.items():
+                results[key] = val
+        except Exception as e:
+            results["thermo_error"] = str(e)
+            raise
+        time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        with open(f"{unique_name}_{time_stamp}.json", "w") as f:
+            json.dump(results, f, indent=2, cls=asetools.ComplexEncoder)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from ase.visualize import view
 from ase.calculators.emt import EMT
 from xtb.ase.calculator import XTB
 from rdkit.Chem import AllChem
+import time
 
 
 def save_atoms(atoms, prefix="", suffix="", file_format="xyz", directory=None):
@@ -502,6 +503,12 @@ from ase.optimize import BFGS
 from ase.vibrations import Vibrations
 from ase.thermochemistry import IdealGasThermo
 import os
+from mace.calculators import mace_mp
+
+
+default_calculator = mace_mp(
+    model="medium", dispersion=True, default_dtype="float32", device="cpu"
+)
 
 
 def ase_to_rdkit_mol(atoms):
@@ -634,14 +641,85 @@ def get_spin(atoms):
     return 0.5 if total_electrons % 2 else 0.0
 
 
-def compute_thermochemical_props(
-    xyz_file, calculators, fmax=0.01, ignore_imag_modes=True, output_json="results.json"
+def get_inchikey(atoms):
+    """Convert ASE Atoms object to InChIKey using RDKit.
+
+    Parameters:
+        atoms (ase.Atoms): ASE Atoms object to convert
+
+    Returns:
+        str: InChIKey string, or empty string if conversion fails
+    """
+    try:
+        # Convert to RDKit mol using existing function
+        mol = ase2rdkit_manual(atoms)
+        if mol is None:
+            return ""
+
+        # Generate InChIKey
+        inchikey = Chem.MolToInchiKey(mol)
+        return inchikey
+
+    except Exception as e:
+        print(f"Error in atoms2inchikey: {e}")
+        return ""
+
+
+atoms2inchikey = get_inchikey
+
+
+def run_thermo(
+    atoms,
+    calculators=[default_calculator],
+    fmax=0.01,
+    ignore_imag_modes=True,
+    unique_name="",
 ):
-    # Store results in a dictionary
-    file_name = os.path.splitext(os.path.basename(xyz_file))[0]
-    # Read initial structure
-    atoms = read(xyz_file)
+    """Run thermochemistry calculation on ASE Atoms object.
+
+    Performs geometry optimization, frequency calculation, and thermochemistry analysis.
+    Returns IdealGasThermo object and key results as a Python dictionary.
+
+    Args:
+        atoms (ase.Atoms): ASE Atoms object to analyze
+        calculators (list): List of ASE calculators to use. If one calculator provided,
+            it is used for both geometry optimization and frequency calculation.
+            If two calculators provided, first is used for geometry optimization and
+            second for frequency calculation.
+        fmax (float): Maximum force criterion for geometry optimization convergence
+        ignore_imag_modes (bool): Whether to ignore imaginary frequencies in
+            thermochemistry calculation
+
+    Returns:
+        tuple: (IdealGasThermo object, dict of results)
+            The results dict contains:
+            - number_of_atoms: Number of atoms
+            - number_of_electrons: Total number of electrons
+            - spin: Spin value (0.0 or 0.5)
+            - formula: Chemical formula
+            - initial_smiles: SMILES string before optimization
+            - initial_xyz: XYZ coordinates before optimization
+            - initial_sym_number: Initial symmetry number
+            - initial_energy_eV: Initial energy in eV
+            - error: Error message if calculation failed
+            - opt_smiles: SMILES string after optimization
+            - opt_xyz: XYZ coordinates after optimization
+            - opt_sym_number: Optimized symmetry number
+            - opt_energy_eV: Optimized energy in eV
+            - smiles_changed: Whether SMILES changed during optimization
+            - frequencies_cm^-1: Vibrational frequencies in cm^-1
+            - number_of_imaginary: Number of imaginary frequencies
+            - G_eV: Gibbs free energy in eV
+            - H_eV: Enthalpy in eV
+            - S_eV/K: Entropy in eV/K
+            - E_ZPE_eV: Zero point energy in eV
+            - opt_time: Optimization time in milliseconds
+            - vib_time: Vibrational frequency calculation time in milliseconds
+            - thermo_time: Thermochemistry calculation time in milliseconds
+    """
     thermo = atoms
+    if unique_name == "":
+        unique_name = get_inchikey(atoms)
     # Ensure calculators is a list; if only one is provided, use it for all steps
     if not isinstance(calculators, list):
         calculators = [calculators]
@@ -661,11 +739,11 @@ def compute_thermochemical_props(
     initial_energy = atoms.get_potential_energy()
     error = None
     results = {
-        "name": file_name,
         "number_of_atoms": int(len(atoms)),
         "number_of_electrons": int(get_total_electrons(atoms)),
         "spin": get_spin(atoms),
         "formula": atoms.get_chemical_formula(mode="hill"),
+        "unique_name": unique_name,
         "initial_smiles": initial_smiles,
         "initial_xyz": initial_xyz,
         "initial_sym_number": get_external_symmetry_factor(atoms),
@@ -676,23 +754,28 @@ def compute_thermochemical_props(
         "opt_sym_number": 0,
         "opt_energy_eV": 0,
         "smiles_changed": None,
-        "frequencies_cm^-1": [0] * len(atoms),
+        "frequencies_cm^-1": [0],
         "number_of_imaginary": -1,
         "G_eV": 0,
         "H_eV": 0,
         "S_eV/K": 0,
         "E_ZPE_eV": 0,
+        "opt_time": 0,
+        "vib_time": 0,
+        "thermo_time": 0,
     }
-    with open(f"{file_name}.json", "w") as f:
-        json.dump(results, f, indent=2, cls=ComplexEncoder)
+
     # Optimize geometry
-    dyn = BFGS(atoms)
+    opt = BFGS(atoms)
     try:
-        dyn.run(fmax=fmax)  # adjust criteria as needed
+        start_time = time.time()
+        opt.run(fmax=fmax)  # adjust criteria as needed
+        results["opt_time"] = (
+            time.time() - start_time
+        ) * 1000  # Convert to milliseconds
     except Exception as e:
         error = f"Error in optimization: {e}"
         results["error"] = error
-        print("opt_error")
 
     # After optimization, get optimized SMILES
     if error is None:
@@ -701,18 +784,23 @@ def compute_thermochemical_props(
         results["opt_xyz"] = atoms2xyz(atoms)
         results["opt_sym_number"] = get_external_symmetry_factor(atoms)
         results["smiles_changed"] = initial_smiles != results["opt_smiles"]
-        print(f"smiles: {initial_smiles}\nsmiles changed: {results['smiles_changed']}")
         # Now set the frequency calculator and compute vibrational frequencies
         atoms.calc = calc_freq
-        vib = Vibrations(atoms, name=f"vib_{file_name}", indices=None)
+        vib = Vibrations(atoms, name=f"vib_{unique_name}", indices=None)
         try:
+            start_time = time.time()
             vib.run()
+            freqs = vib.get_frequencies()  # in cm^-1
+            results["frequencies_cm^-1"] = (freqs.tolist(),)
+            results["vib_time"] = (
+                time.time() - start_time
+            ) * 1000  # Convert to milliseconds
         except Exception as e:
             error = f"Error in vibrations: {e}"
             results["error"] = error
     if error is None:
-        freqs = vib.get_frequencies()  # in cm^-1
-        results["frequencies_cm^-1"] = (freqs.tolist(),)
+        start_time = time.time()
+
         thermo = IdealGasThermo(
             vib_energies=vib.get_energies(),  # in eV
             geometry="nonlinear",  # guess or determine the molecular geometry type
@@ -722,17 +810,16 @@ def compute_thermochemical_props(
             symmetrynumber=get_external_symmetry_factor(atoms),
             ignore_imag_modes=ignore_imag_modes,
         )
-
-        # Compute standard thermochemical properties
+        # Save standard thermochemical properties
+        results["thermo_time"] = (
+            time.time() - start_time
+        ) * 1000  # Convert to milliseconds
         results["number_of_imaginary"] = int(thermo.n_imag)
         results["G_eV"] = thermo.get_gibbs_energy(temperature=298.15, pressure=101325.0)
         results["H_eV"] = thermo.get_enthalpy(temperature=298.15)
         results["S_eV/K"] = thermo.get_entropy(temperature=298.15, pressure=101325.0)
         results["E_ZPE_eV"] = thermo.get_ZPE_correction()
-    print(results)
-    with open(f"{file_name}.json", "w") as f:
-        json.dump(results, f, indent=2, cls=ComplexEncoder)
-    return thermo
+    return thermo, results
 
 
 def get_atoms_from_xyz(xyz, parallel=False):
@@ -760,7 +847,7 @@ def get_atoms_from_xyz(xyz, parallel=False):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".xyz") as tmp:
             tmp.write(xyz)
             tmp.flush()
-            atoms = read(tmp.name, format="xyz")
+            atoms = read(tmp.name, format="xyz", parallel=parallel)
 
     return atoms
 

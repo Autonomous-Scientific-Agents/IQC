@@ -40,10 +40,10 @@ def get_args():
     )
     parser.add_argument(
         "-x",
-        "--xyzdir",
+        "--xyz",
         type=str,
         default="xyz",
-        help="Path for the xyz directory, where .xyz files will be read",
+        help="Path for an .xyz file or a directory containing .xyz files",
     )
 
     return parser.parse_args()
