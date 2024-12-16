@@ -735,7 +735,7 @@ def compute_thermochemical_props(
     return thermo
 
 
-def get_atoms_from_xyz(xyz):
+def get_atoms_from_xyz(xyz, parallel=False):
     """
     Generate ASE Atoms object from XYZ input.
 
@@ -751,7 +751,7 @@ def get_atoms_from_xyz(xyz):
     """
     # Check if input is a file path
     if os.path.isfile(xyz):
-        atoms = read(xyz, format="xyz")
+        atoms = read(xyz, format="xyz", parallel=parallel)
     else:
         # Assume input is XYZ string content
         # Create temporary file to use ASE's read functionality

@@ -15,7 +15,6 @@ def main():
     # Get command line arguments
     args = cli.get_args()
 
-    # Only rank 0 should list the files
     if rank == 0:
         xyzdir = args.xyzdir
         # Create a list of all .xyz files in the specified directory
@@ -23,7 +22,6 @@ def main():
         number_of_files = len(xyz_files)
         print(f"Rank {rank} found {number_of_files} .xyz files in {xyzdir}")
 
-    # Broadcast the list of files to all ranks if needed
     xyz_files = comm.bcast(xyz_files if rank == 0 else None, root=0)
     number_of_files = len(xyz_files)
 
