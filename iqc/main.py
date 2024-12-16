@@ -7,7 +7,6 @@ from mace.calculators import mace_mp
 from . import cli
 from . import mpitools
 from . import asetools
-import logging
 
 
 def main():
@@ -19,7 +18,7 @@ def main():
     args = cli.get_args()
 
     # Set up logging
-    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    log_level = getattr(logging, args.loglevel.upper(), logging.INFO)
     logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
 
     logging.debug(f"Rank {rank} started with size {size}.")
