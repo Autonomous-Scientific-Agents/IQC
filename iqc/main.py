@@ -1,4 +1,4 @@
-from mpi4py import MPI
+import ase
 import os
 import glob
 import json
@@ -8,6 +8,7 @@ from . import cli
 from . import mpitools
 from . import asetools
 import logging
+from mpi4py import MPI
 
 
 def main():
@@ -49,7 +50,10 @@ def main():
     )
 
     for file in xyz_files[start_index:end_index]:
-        unique_name = os.path.splitext(os.path.basename(file))[0]
+        time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_name = (
+            f"{os.path.splitext(os.path.basename(file))[0]}_{rank}_{time_stamp}"
+        )
         logging.debug(f"Rank {rank} processing file: {file}")
         atoms = asetools.get_atoms_from_xyz(file)
         results = {

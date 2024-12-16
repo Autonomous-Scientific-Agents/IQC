@@ -685,6 +685,7 @@ def run_thermo(
     thermo = atoms
     if unique_name == "":
         unique_name = get_inchikey(atoms)
+
     # Ensure calculators is a list; if only one is provided, use it for all steps
     if not isinstance(calculators, list):
         calculators = [calculators]
@@ -696,13 +697,14 @@ def run_thermo(
         calc_freq = calculators[1]
 
     initial_smiles = atoms2smiles(atoms)
-    # Store initial coordinates before optimization
     initial_xyz = atoms2xyz(atoms)
     initial_sym_number = get_external_symmetry_factor(atoms)
+
     # Set the first calculator and calculate energy
     atoms.calc = calc_geom
     initial_energy = atoms.get_potential_energy()
     error = None
+
     results = {
         "number_of_atoms": int(len(atoms)),
         "number_of_electrons": int(get_total_electrons(atoms)),
@@ -711,7 +713,7 @@ def run_thermo(
         "unique_name": unique_name,
         "initial_smiles": initial_smiles,
         "initial_xyz": initial_xyz,
-        "initial_sym_number": get_external_symmetry_factor(atoms),
+        "initial_sym_number": initial_sym_number,
         "initial_energy_eV": initial_energy,
         "error": error,
         "opt_smiles": "",
@@ -719,7 +721,7 @@ def run_thermo(
         "opt_sym_number": 0,
         "opt_energy_eV": 0,
         "smiles_changed": None,
-        "frequencies_cm^-1": [0],
+        "frequencies_cm^-1": [],
         "number_of_imaginary": -1,
         "G_eV": 0,
         "H_eV": 0,
@@ -731,13 +733,11 @@ def run_thermo(
     }
 
     # Optimize geometry
-    dyn = BFGS(atoms)
     try:
         start_time = time.time()
-        dyn.run(fmax=fmax)  # adjust criteria as needed
-        results["opt_time"] = (
-            time.time() - start_time
-        ) * 1000  # Convert to milliseconds
+        dyn = BFGS(atoms)
+        dyn.run(fmax=fmax)
+        results["opt_time"] = (time.time() - start_time) * 1000
         logging.debug(f"Optimization completed in {results['opt_time']} ms")
     except Exception as e:
         error = f"Error in optimization: {e}"
@@ -768,7 +768,7 @@ def run_thermo(
 
     if error is None:
         start_time = time.time()
-        freqs = vib.get_frequencies()  # in cm^-1
+        freqs = vib.get_vibrations(read_cache=False).get_frequencies()  # in cm^-1
         results["frequencies_cm^-1"] = (freqs.tolist(),)
         thermo = IdealGasThermo(
             vib_energies=vib.get_energies(),  # in eV
