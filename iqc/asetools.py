@@ -12,13 +12,9 @@ from ase.io import read
 from ase.optimize import BFGS
 from mace.calculators import mace_mp
 from ase.visualize import view
-import ase
 from ase.calculators.emt import EMT
 from xtb.ase.calculator import XTB
 from rdkit.Chem import AllChem
-import rdkit
-from rdkit2ase import rdkit2ase, ase2rdkit, smiles2atoms, smiles2conformers
-import automol
 
 
 def save_atoms(atoms, prefix="", suffix="", file_format="xyz", directory=None):
