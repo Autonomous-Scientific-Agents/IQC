@@ -20,9 +20,9 @@ def get_args():
     parser.add_argument(
         "-l",
         "--loglevel",
-        type=int,
-        default=-1,
-        help="Verbosity level of logging, 0: errors, 1: 0 + warnings, 2: 1 + info, 3: 2 + debug",
+        type=str,
+        default="INFO",
+        help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
     )
     parser.add_argument(
         "-f",

@@ -16,6 +16,12 @@ from ase.calculators.emt import EMT
 from xtb.ase.calculator import XTB
 from rdkit.Chem import AllChem
 import time
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 
 def save_atoms(atoms, prefix="", suffix="", file_format="xyz", directory=None):
@@ -675,48 +681,7 @@ def run_thermo(
     ignore_imag_modes=True,
     unique_name="",
 ):
-    """Run thermochemistry calculation on ASE Atoms object.
-
-    Performs geometry optimization, frequency calculation, and thermochemistry analysis.
-    Returns IdealGasThermo object and key results as a Python dictionary.
-
-    Args:
-        atoms (ase.Atoms): ASE Atoms object to analyze
-        calculators (list): List of ASE calculators to use. If one calculator provided,
-            it is used for both geometry optimization and frequency calculation.
-            If two calculators provided, first is used for geometry optimization and
-            second for frequency calculation.
-        fmax (float): Maximum force criterion for geometry optimization convergence
-        ignore_imag_modes (bool): Whether to ignore imaginary frequencies in
-            thermochemistry calculation
-
-    Returns:
-        tuple: (IdealGasThermo object, dict of results)
-            The results dict contains:
-            - number_of_atoms: Number of atoms
-            - number_of_electrons: Total number of electrons
-            - spin: Spin value (0.0 or 0.5)
-            - formula: Chemical formula
-            - initial_smiles: SMILES string before optimization
-            - initial_xyz: XYZ coordinates before optimization
-            - initial_sym_number: Initial symmetry number
-            - initial_energy_eV: Initial energy in eV
-            - error: Error message if calculation failed
-            - opt_smiles: SMILES string after optimization
-            - opt_xyz: XYZ coordinates after optimization
-            - opt_sym_number: Optimized symmetry number
-            - opt_energy_eV: Optimized energy in eV
-            - smiles_changed: Whether SMILES changed during optimization
-            - frequencies_cm^-1: Vibrational frequencies in cm^-1
-            - number_of_imaginary: Number of imaginary frequencies
-            - G_eV: Gibbs free energy in eV
-            - H_eV: Enthalpy in eV
-            - S_eV/K: Entropy in eV/K
-            - E_ZPE_eV: Zero point energy in eV
-            - opt_time: Optimization time in milliseconds
-            - vib_time: Vibrational frequency calculation time in milliseconds
-            - thermo_time: Thermochemistry calculation time in milliseconds
-    """
+    logging.info(f"Starting thermochemistry calculation for {unique_name}")
     thermo = atoms
     if unique_name == "":
         unique_name = get_inchikey(atoms)
@@ -766,16 +731,18 @@ def run_thermo(
     }
 
     # Optimize geometry
-    opt = BFGS(atoms)
+    dyn = BFGS(atoms)
     try:
         start_time = time.time()
-        opt.run(fmax=fmax)  # adjust criteria as needed
+        dyn.run(fmax=fmax)  # adjust criteria as needed
         results["opt_time"] = (
             time.time() - start_time
         ) * 1000  # Convert to milliseconds
+        logging.debug(f"Optimization completed in {results['opt_time']} ms")
     except Exception as e:
         error = f"Error in optimization: {e}"
         results["error"] = error
+        logging.error(error)
 
     # After optimization, get optimized SMILES
     if error is None:
@@ -790,17 +757,19 @@ def run_thermo(
         try:
             start_time = time.time()
             vib.run()
-            freqs = vib.get_frequencies()  # in cm^-1
-            results["frequencies_cm^-1"] = (freqs.tolist(),)
             results["vib_time"] = (
                 time.time() - start_time
             ) * 1000  # Convert to milliseconds
+            logging.debug(f"Vibrational analysis completed in {results['vib_time']} ms")
         except Exception as e:
             error = f"Error in vibrations: {e}"
             results["error"] = error
+            logging.error(error)
+
     if error is None:
         start_time = time.time()
-
+        freqs = vib.get_frequencies()  # in cm^-1
+        results["frequencies_cm^-1"] = (freqs.tolist(),)
         thermo = IdealGasThermo(
             vib_energies=vib.get_energies(),  # in eV
             geometry="nonlinear",  # guess or determine the molecular geometry type
@@ -814,11 +783,16 @@ def run_thermo(
         results["thermo_time"] = (
             time.time() - start_time
         ) * 1000  # Convert to milliseconds
+        logging.debug(
+            f"Thermochemistry calculations completed in {results['thermo_time']} ms"
+        )
         results["number_of_imaginary"] = int(thermo.n_imag)
         results["G_eV"] = thermo.get_gibbs_energy(temperature=298.15, pressure=101325.0)
         results["H_eV"] = thermo.get_enthalpy(temperature=298.15)
         results["S_eV/K"] = thermo.get_entropy(temperature=298.15, pressure=101325.0)
         results["E_ZPE_eV"] = thermo.get_ZPE_correction()
+
+    logging.info(f"Thermochemistry calculation for {unique_name} completed")
     return thermo, results
 
 
@@ -836,6 +810,7 @@ def get_atoms_from_xyz(xyz, parallel=False):
     atoms : ase.Atoms
         ASE Atoms object
     """
+    logging.debug(f"Reading atoms from XYZ input: {xyz}")
     # Check if input is a file path
     if os.path.isfile(xyz):
         atoms = read(xyz, format="xyz", parallel=parallel)
@@ -849,6 +824,7 @@ def get_atoms_from_xyz(xyz, parallel=False):
             tmp.flush()
             atoms = read(tmp.name, format="xyz", parallel=parallel)
 
+    logging.debug(f"Successfully read atoms from {xyz}")
     return atoms
 
 
