@@ -17,6 +17,8 @@ dependencies = [
     "psutil",
     "ase",
     "rdkit",
+    "nglview",
+    "pandas",
 ]
 
 [project.optional-dependencies]
