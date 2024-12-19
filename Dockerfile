@@ -21,6 +21,9 @@ RUN pip install .
 # Create jupyter notebook directory and example notebook if it doesn't exist
 RUN mkdir -p /app/notebooks
 
+# Create and register the Jupyter kernel for the conda environment
+RUN python -m ipykernel install --user --name iqc-env --display-name "Python (IQC)"
+
 # Expose Jupyter Lab port
 EXPOSE 8888
 
