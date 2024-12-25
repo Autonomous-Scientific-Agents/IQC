@@ -1,22 +1,22 @@
-import os
-from datetime import datetime
-from ase import Atoms
-from ase.io import write
-from mace.calculators import mace_mp
-from ase import build
-import os
-from datetime import datetime
-from ase import Atoms
-from ase.io import write
-from ase.io import read
-from ase.optimize import BFGS
-from mace.calculators import mace_mp
-from ase.visualize import view
-from ase.calculators.emt import EMT
-from xtb.ase.calculator import XTB
-from rdkit.Chem import AllChem
-import time
+import json
 import logging
+import os
+import time
+from datetime import datetime
+
+import numpy as np
+from ase import Atoms, build
+from ase.calculators.emt import EMT
+from ase.io import read, write
+from ase.optimize import BFGS
+from ase.thermochemistry import IdealGasThermo
+from ase.vibrations import Vibrations
+from ase.visualize import view
+from mace.calculators import mace_mp
+from rdkit import Chem
+from rdkit.Chem import AllChem, rdmolops
+from xtb.ase.calculator import XTB
+
 
 # Configure logging
 logging.basicConfig(
@@ -29,21 +29,16 @@ def save_atoms(atoms, prefix="", suffix="", file_format="xyz", directory=None):
     Save an ASE Atoms object to a file with a name composed of:
     [prefix]_[chemical_formula]_[timestamp]_[suffix].[file_format]
 
-    Parameters
-    ----------
-    atoms : ase.Atoms
-        The ASE Atoms object to be saved.
-    prefix : str, optional
-        A prefix string to prepend to the filename (default: '').
-    suffix : str, optional
-        A suffix string to append before the file extension (default: '').
-    file_format : str, optional
-        The file format to save the structure in (default: 'xyz').
-        Common formats include: 'xyz', 'vasp', 'xsf', 'cif', etc.
-    directory : str, optional
-        The directory in which to save the file. If None, saves in the current directory.
-    """
+    Args:
+        atoms (ase.Atoms): The ASE Atoms object to be saved.
+        prefix (str): Optional prefix for the filename.
+        suffix (str): Optional suffix for the filename.
+        file_format (str): The format in which to save the file (default is "xyz").
+        directory (str): Optional directory where the file will be saved. If not provided, the file will be saved in the current directory.
 
+    Returns:
+        str: The path to the saved file.
+    """
     # Get chemical formula in a canonical form
     formula = atoms.get_chemical_formula(mode="hill")
 
@@ -70,8 +65,11 @@ def print_atoms_info(atoms):
     """
     Prints the index, symbol, and coordinates of each atom in an ASE Atoms object.
 
-    Parameters:
-        atoms (ase.Atoms): An ASE Atoms object containing atomic information.
+    Args:
+        atoms (ase.Atoms): The ASE Atoms object containing the atoms.
+
+    Returns:
+        None
     """
     print(f"{'Index':<6}{'Symbol':<8}{'Coordinates':<30}")
     print("-" * 44)
@@ -85,7 +83,7 @@ def translate_atoms(atoms, indices, reference_index, target_index, distance):
     """
     Translates specified atoms in the direction of a vector defined by two reference atoms.
 
-    Parameters:
+    Args:
         atoms (ase.Atoms): The ASE Atoms object containing the atoms.
         indices (list): List of indices of the atoms to be translated.
         reference_index (int): Index of the atom defining the origin of the direction vector.
@@ -109,23 +107,16 @@ def translate_atoms(atoms, indices, reference_index, target_index, distance):
     return atoms
 
 
-def show_atoms(atoms):
-    view(atoms, viewer="x3d")
-
-
 def get_rdmol_from_smiles(smiles: str, optimize=False, seed=0xF00D):
-    """Return RDKit molecule from a SMILES string
+    """Convert a SMILES string to an RDKit molecule.
 
-    Parameters
-    ----------
-    smiles : str
-        SMILES string
-    optimize : bool, optional
-    seed : hexadecimal, optional
+    Args:
+        smiles (str): The SMILES string representing the molecule.
+        optimize (bool, optional): Whether to optimize the molecule geometry using MMFF. Defaults to False.
+        seed (int, optional): The random seed for molecule embedding. Defaults to 0xF00D.
 
-    Returns
-    -------
-    rdkit.Chem.rdchem.Mol
+    Returns:
+        rdkit.Chem.rdchem.Mol: The RDKit molecule object.
     """
     rdmol = AllChem.MolFromSmiles(smiles)
     rdmol = AllChem.AddHs(rdmol)
@@ -136,18 +127,16 @@ def get_rdmol_from_smiles(smiles: str, optimize=False, seed=0xF00D):
 
 
 def get_rdmol_from_inchi(inchi: str, optimize=False, seed=0xF00D):
-    """Return RDKit molecule from an InChI string
+    """
+    Convert an InChI string to an RDKit molecule.
 
-    Parameters
-    ----------
-    inchi : str
-        InChI string
-    optimize : bool, optional
-    seed : hexadecimal, optional
+    Args:
+        inchi (str): The InChI string representing the molecule.
+        optimize (bool, optional): Whether to optimize the molecule geometry using MMFF. Defaults to False.
+        seed (int, optional): The random seed for molecule embedding. Defaults to 0xF00D.
 
-    Returns
-    -------
-    rdkit.Chem.rdchem.Mol
+    Returns:
+        rdkit.Chem.rdchem.Mol: The RDKit molecule object.
     """
     rdmol = AllChem.MolFromInchi(inchi)
     rdmol = AllChem.AddHs(rdmol)
@@ -178,17 +167,14 @@ def get_rdmol_from_xyz(xyz: str):
 
 
 def get_xyz_from_rdmol(rdmol):
-    """Return xyz formatted string for a given RDKit Molecule object
+    """
+    Convert an RDKit molecule to an XYZ formatted string.
 
-    Parameters
-    ----------
-    rdmol : rdkit.Chem.rdchem.Mol
-        RDKit Molecule object
+    Args:
+        rdmol (rdkit.Chem.rdchem.Mol): The RDKit molecule object.
 
-    Returns
-    -------
-    xyz : str
-        xyz formatted string
+    Returns:
+        str: The XYZ formatted string representing the molecule.
     """
     conf = rdmol.GetConformer()
     xyz = str(rdmol.GetNumAtoms()) + "\n\n"
@@ -205,7 +191,7 @@ def convert_extended_xyz_to_standard(file_path):
     """
     Reads an extended XYZ format file and converts it to standard XYZ format.
 
-    Parameters:
+    Args:
         file_path (str): Path to the extended XYZ file.
 
     Returns:
@@ -235,14 +221,11 @@ def convert_extended_xyz_to_standard(file_path):
     return standard_xyz_string
 
 
-from rdkit import Chem
-
-
 def get_canonical_smiles(molecule):
     """
     Generates the canonical SMILES string for an RDKit molecule object.
 
-    Parameters:
+    Args:
         molecule (rdkit.Chem.Mol): The RDKit molecule object.
 
     Returns:
@@ -258,14 +241,11 @@ def get_canonical_smiles(molecule):
         return None
 
 
-from rdkit import Chem
-
-
 def get_bonding_info(molecule):
     """
     Extracts bonding information for a given RDKit molecule object.
 
-    Parameters:
+    Args:
         molecule (rdkit.Chem.Mol): The RDKit molecule object.
 
     Returns:
@@ -297,11 +277,16 @@ def get_bonding_info(molecule):
     return bonding_info
 
 
-from rdkit import Chem
-from ase import Atoms
-
-
 def ase2rdkit2(atoms):
+    """
+    Converts an ASE Atoms object to an RDKit Mol object using RDKit's MolFromXYZBlock.
+
+    Parameters:
+        atoms (ase.Atoms): ASE Atoms object.
+
+    Returns:
+        rdkit.Chem.Mol: RDKit molecule object, or None if conversion fails.
+    """
     try:
         # Export ASE object to XYZ format and read with RDKit
         xyz = f"{len(atoms)}\n\n"
@@ -328,20 +313,11 @@ def ase2rdkit2(atoms):
         return None
 
 
-from rdkit import Chem
-from rdkit.Chem import rdmolops
-import numpy as np
-
-from rdkit import Chem
-from rdkit.Chem import rdmolops
-import numpy as np
-
-
 def ase2rdkit_manual(atoms, bond_threshold=1.2):
     """
     Converts an ASE Atoms object to an RDKit Mol object, manually determining bonds.
 
-    Parameters:
+    Args:
         atoms (ase.Atoms): ASE Atoms object.
         bond_threshold (float): Bonding threshold (multiplied by covalent radii).
 
@@ -384,16 +360,11 @@ def ase2rdkit_manual(atoms, bond_threshold=1.2):
         return None
 
 
-from rdkit import Chem
-from rdkit.Chem import rdmolops
-import numpy as np
-
-
 def ase2rdkit_with_bond_orders(atoms, bond_threshold=1.2):
     """
     Converts an ASE Atoms object to an RDKit Mol object, with higher-order bond detection.
 
-    Parameters:
+    Args:
         atoms (ase.Atoms): ASE Atoms object.
         bond_threshold (float): Base bonding threshold (multiplied by covalent radii).
 
@@ -482,7 +453,15 @@ rdmol2smiles = get_canonical_smiles
 
 
 def ase_atoms_to_tuple(atoms):
-    """Converts an ASE atoms object to a tuple of (atom_symbol, coordinates) tuples."""
+    """
+    Convert ASE Atoms object to a tuple of atom symbols and coordinates.
+
+    Args:
+        atoms (ase.Atoms): ASE Atoms object
+
+    Returns:
+        tuple: A tuple containing tuples of atom symbols and their coordinates
+    """
     atom_data = []
     for i in range(len(atoms)):
         atom_symbol = atoms.get_chemical_symbols()[i]
@@ -495,21 +474,19 @@ atoms2tuple = ase_atoms_to_tuple
 
 
 def get_external_symmetry_factor(atoms):
+    """
+    Calculate the external symmetry factor for an ASE Atoms object.
+
+    Args:
+        atoms (ase.Atoms): ASE Atoms object
+
+    Returns:
+        int: External symmetry factor
+    """
     import automol
 
     geo = atoms2tuple(atoms)
     return automol.geom.external_symmetry_factor(geo)
-
-
-import json
-from rdkit import Chem
-from rdkit.Chem import AllChem
-from ase.io import read, write
-from ase.optimize import BFGS
-from ase.vibrations import Vibrations
-from ase.thermochemistry import IdealGasThermo
-import os
-from mace.calculators import mace_mp
 
 
 default_calculator = mace_mp(
@@ -520,7 +497,12 @@ default_calculator = mace_mp(
 def ase_to_rdkit_mol(atoms):
     """
     Convert ASE Atoms to an RDKit Mol.
-    This is a conceptual placeholder. Actual implementation will depend on your needs.
+
+    Args:
+        atoms (ase.Atoms): ASE Atoms object
+
+    Returns:
+        rdkit.Chem.Mol: RDKit molecule object
     """
     symbols = atoms.get_chemical_symbols()
     positions = atoms.get_positions()
@@ -573,7 +555,7 @@ def atoms2xyz(atoms):
     """
     Converts an ASE Atoms object to an XYZ string.
 
-    Parameters:
+    Args:
         atoms (ase.Atoms): The ASE Atoms object to be converted.
 
     Returns:
@@ -608,21 +590,30 @@ class ComplexEncoder(json.JSONEncoder):
 
 
 def decode_complex(dct):
+    """
+    Decode a complex number from a dictionary.
+
+    Args:
+        dct (dict): A dictionary containing "real" and "imag" keys.
+
+    Returns:
+        complex: The decoded complex number.
+    """
     if "real" in dct and "imag" in dct:
         return complex(dct["real"], dct["imag"])
     return dct
 
 
 def get_total_electrons(atoms):
-    """Calculate total number of electrons for an ASE Atoms object.
+    """
+    Get the total number of electrons from an ASE Atoms object.
 
     Args:
-        atoms: ASE Atoms object
+        atoms (ase.Atoms): ASE Atoms object
 
     Returns:
         int: Total number of electrons
     """
-    # Get atomic numbers from atoms object
     atomic_numbers = atoms.get_atomic_numbers()
 
     # Sum up all electrons
@@ -650,7 +641,7 @@ def get_spin(atoms):
 def get_inchikey(atoms):
     """Convert ASE Atoms object to InChIKey using RDKit.
 
-    Parameters:
+    Args:
         atoms (ase.Atoms): ASE Atoms object to convert
 
     Returns:
@@ -681,8 +672,21 @@ def run_thermo(
     ignore_imag_modes=True,
     unique_name="",
 ):
+    """
+    Run thermochemistry calculations for an ASE Atoms object.
+
+    Args:
+        atoms (ase.Atoms): ASE Atoms object
+        calculators (list): List of calculators for geometry and frequency calculations
+        fmax (float): Maximum force for geometry optimization
+        ignore_imag_modes (bool): Whether to ignore imaginary vibrational modes
+        unique_name (str): Unique name for the molecule
+
+    Returns:
+        tuple: A tuple containing the thermochemistry results and a dictionary with calculated properties
+    """
     logging.info(f"Starting thermochemistry calculation for {unique_name}")
-    thermo = atoms
+    
     if unique_name == "":
         unique_name = get_inchikey(atoms)
 
@@ -706,8 +710,8 @@ def run_thermo(
     error = None
 
     results = {
-        "number_of_atoms": int(len(atoms)),
-        "number_of_electrons": int(get_total_electrons(atoms)),
+        "number_of_atoms": len(atoms),
+        "number_of_electrons": get_total_electrons(atoms),
         "spin": get_spin(atoms),
         "formula": atoms.get_chemical_formula(mode="hill"),
         "unique_name": unique_name,
@@ -769,7 +773,7 @@ def run_thermo(
     if error is None:
         start_time = time.time()
         freqs = vib.get_vibrations(read_cache=False).get_frequencies()  # in cm^-1
-        results["frequencies_cm^-1"] = (freqs.tolist(),)
+        results["frequencies_cm^-1"] = freqs.tolist()
         thermo = IdealGasThermo(
             vib_energies=vib.get_energies(),  # in eV
             geometry="nonlinear",  # guess or determine the molecular geometry type
@@ -786,7 +790,7 @@ def run_thermo(
         logging.debug(
             f"Thermochemistry calculations completed in {results['thermo_time']} ms"
         )
-        results["number_of_imaginary"] = int(thermo.n_imag)
+        results["number_of_imaginary"] = thermo.n_imag
         results["G_eV"] = thermo.get_gibbs_energy(temperature=298.15, pressure=101325.0)
         results["H_eV"] = thermo.get_enthalpy(temperature=298.15)
         results["S_eV/K"] = thermo.get_entropy(temperature=298.15, pressure=101325.0)
@@ -800,15 +804,11 @@ def get_atoms_from_xyz(xyz, parallel=False):
     """
     Generate ASE Atoms object from XYZ input.
 
-    Parameters
-    ----------
-    xyz : str
-        Either path to an XYZ file or XYZ content as string
+    Args:
+        xyz (str): Either path to an XYZ file or XYZ content as string
 
-    Returns
-    -------
-    atoms : ase.Atoms
-        ASE Atoms object
+    Returns:
+        ase.Atoms: ASE Atoms object
     """
     logging.debug(f"Reading atoms from XYZ input: {xyz}")
     # Check if input is a file path
