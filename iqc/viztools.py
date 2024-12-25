@@ -113,8 +113,8 @@ def display_filtered_data(df, display_columns):
                     StringIO(selected_row["opt_xyz"]), format="xyz"
                 )
                 # Create NGLView widgets
-                view1 = nv.show_ase(initial_atoms)
-                view2 = nv.show_ase(optimized_atoms)
+                view2 = nv.show_ase(initial_atoms)
+                view1 = nv.show_ase(optimized_atoms)
 
                 # Set display options
                 for view in [view1, view2]:
@@ -127,8 +127,8 @@ def display_filtered_data(df, display_columns):
                     }
 
                 # Create labels
-                label1 = widgets.Label("Initial Structure")
-                label2 = widgets.Label("Optimized Structure")
+                label2 = widgets.Label("Initial Structure")
+                label1 = widgets.Label("Optimized Structure")
 
                 # Arrange views
                 display(widgets.VBox([widgets.VBox([label1, view1, label2, view2])]))
