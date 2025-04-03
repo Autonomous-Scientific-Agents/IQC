@@ -9,39 +9,45 @@ on:
       - main
 
 jobs:
-  build-and-test:
+  test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
-
-    - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/checkout@v4
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
       with:
-        python-version: 3.8  # or your preferred Python version
-
+        python-version: ${{ matrix.python-version }}
+    
     - name: Install Miniconda
       uses: conda-incubator/setup-miniconda@v2
       with:
         auto-update-conda: true
-        python-version: 3.8  # or your preferred Python version
-
+        python-version: ${{ matrix.python-version }}
+    
     - name: Create conda environment
       run: conda env create -f env.yml
-
+    
     - name: Install iqc
       run: conda run -n iqc-env pip install -e .
-
+    
+    - name: Install test dependencies
+      run: conda run -n iqc-env pip install pytest
+    
     - name: Run tests
-      run: conda run -n iqc-env pytest iqc/tests
+      run: conda run -n iqc-env pytest iqc/tests/
 
   docker-build:
     runs-on: ubuntu-latest
     
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3

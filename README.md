@@ -1,6 +1,8 @@
 # IQC
 Interactive Quantum Chemistry
 
+[![CI](https://github.com/Autonomous-Scientific-Agents/IQC/actions/workflows/ci.yml/badge.svg)](https://github.com/Autonomous-Scientific-Agents/IQC/actions/workflows/ci.yml)
+
 ## Installation
 
 ### Clone the repository
