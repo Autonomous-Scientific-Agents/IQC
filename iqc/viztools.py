@@ -158,7 +158,13 @@ def display_filtered_data(df, display_columns):
 
 def read_json_from_tar_gz(url):
     """
-    Reads a tar.gz file from a URL, extracts JSON files, and returns a list of JSON objects.
+    Reads a list of JSON files from a tar.gz archive located at the given URL.
+
+    Args:
+        url (str): The URL of the tar.gz archive containing JSON files.
+
+    Returns:
+        list: A list of JSON objects read from the archive. Returns None if an error occurs.
     """
     try:
         response = requests.get(url, stream=True)
