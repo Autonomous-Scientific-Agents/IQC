@@ -4,6 +4,11 @@ import os
 import time
 from datetime import datetime
 
+# Configure logging first
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
 import numpy as np
 from ase import Atoms, build
 from ase.calculators.emt import EMT
@@ -12,16 +17,35 @@ from ase.optimize import BFGS
 from ase.thermochemistry import IdealGasThermo
 from ase.vibrations import Vibrations
 from ase.visualize import view
-from mace.calculators import mace_mp
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdmolops
-from xtb.ase.calculator import XTB
 
+# Optional dependencies with informative messages
+XTB = None
+try:
+    from xtb.ase.calculator import XTB
+except ImportError:
+    logging.warning(
+        "XTB calculator not available. Install with 'pip install xtb' if you need quantum chemistry calculations with XTB."
+    )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+default_calculator = None
+try:
+    from mace.calculators import mace_mp
+
+    try:
+        default_calculator = mace_mp(
+            model="medium", dispersion=True, default_dtype="float32", device="cpu"
+        )
+    except RuntimeError as e:
+        logging.warning(
+            f"MACE calculator initialization failed: {str(e)}. Install required dependencies if you need MACE calculations."
+        )
+        default_calculator = None
+except ImportError:
+    logging.warning(
+        "MACE calculator not available. Install with 'pip install mace' if you need machine learning-based quantum chemistry calculations."
+    )
 
 
 def save_atoms(atoms, prefix="", suffix="", file_format="xyz", directory=None):
@@ -487,11 +511,6 @@ def get_external_symmetry_factor(atoms):
 
     geo = atoms2tuple(atoms)
     return automol.geom.external_symmetry_factor(geo)
-
-
-default_calculator = mace_mp(
-    model="medium", dispersion=True, default_dtype="float32", device="cpu"
-)
 
 
 def ase_to_rdkit_mol(atoms):

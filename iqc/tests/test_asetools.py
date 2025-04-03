@@ -2,6 +2,9 @@ import os
 import numpy as np
 from ase import Atoms
 import pytest
+import sys
+from unittest.mock import patch, MagicMock
+
 from iqc.asetools import (
     save_atoms,
     translate_atoms,
@@ -10,6 +13,8 @@ from iqc.asetools import (
     get_total_electrons,
     get_spin,
     xyz2atoms,
+    default_calculator,
+    XTB,
 )
 
 
@@ -125,3 +130,85 @@ def test_get_canonical_smiles(methane_atoms):
 
     mol = Chem.MolFromSmiles(smiles)
     assert Chem.MolToSmiles(mol, canonical=True) in ["C", "[H]C([H])([H])[H]"]
+
+
+def test_mace_calculator_available():
+    """Test MACE calculator when available."""
+    # Only run this test if MACE is actually available
+    if default_calculator is not None:
+        # Create a simple molecule
+        atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
+
+        # Set the calculator
+        atoms.calc = default_calculator
+
+        # Calculate energy
+        energy = atoms.get_potential_energy()
+
+        # Basic checks
+        assert isinstance(energy, float)
+        assert not np.isnan(energy)
+    else:
+        pytest.skip("MACE calculator not available")
+
+
+def test_mace_calculator_unavailable():
+    """Test behavior when MACE calculator is not available."""
+    # Mock the import to simulate MACE not being available
+    with patch.dict(sys.modules, {"mace.calculators": None}):
+        # Re-import the module to get the updated default_calculator
+        import importlib
+        import iqc.asetools
+
+        importlib.reload(iqc.asetools)
+
+        # Check that default_calculator is None
+        assert iqc.asetools.default_calculator is None
+
+        # Create a simple molecule
+        atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
+
+        # Try to calculate energy without a calculator
+        with pytest.raises(RuntimeError, match="Atoms object has no calculator"):
+            atoms.get_potential_energy()
+
+
+def test_xtb_calculator_available():
+    """Test XTB calculator when available."""
+    # Only run this test if XTB is actually available
+    if XTB is not None:
+        # Create a simple molecule
+        atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
+
+        # Set the calculator
+        atoms.calc = XTB()
+
+        # Calculate energy
+        energy = atoms.get_potential_energy()
+
+        # Basic checks
+        assert isinstance(energy, float)
+        assert not np.isnan(energy)
+    else:
+        pytest.skip("XTB calculator not available")
+
+
+def test_xtb_calculator_unavailable():
+    """Test behavior when XTB calculator is not available."""
+    # Mock the import to simulate XTB not being available
+    with patch.dict(sys.modules, {"xtb.ase.calculator": None}):
+        # Re-import the module to get the updated XTB
+        import importlib
+        import iqc.asetools
+
+        importlib.reload(iqc.asetools)
+
+        # Check that XTB is None
+        assert iqc.asetools.XTB is None
+
+        # Create a simple molecule
+        atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
+
+        # Try to calculate energy without a calculator
+        with pytest.raises(RuntimeError, match="Atoms object has no calculator"):
+            atoms.get_potential_energy()
