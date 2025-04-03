@@ -85,9 +85,33 @@ def main():
             logging.error(f"Rank {rank} encountered an error: {e}")
 
         time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        with open(f"{unique_name}_{time_stamp}.json", "w") as f:
-            json.dump(results, f, indent=2, cls=asetools.ComplexEncoder)
-        logging.info(f"Rank {rank} saved results for file: {file}")
+        try:
+            with open(f"{unique_name}_{time_stamp}.json", "w") as f:
+                json.dump(results, f, indent=2, cls=asetools.ComplexEncoder)
+            logging.info(f"Rank {rank} saved results for file: {file}")
+        except (TypeError, ValueError) as json_error:
+            logging.warning(
+                f"JSON serialization failed: {json_error}. Trying pickle..."
+            )
+            try:
+                import pickle
+
+                with open(f"{unique_name}_{time_stamp}.pkl", "wb") as f:
+                    pickle.dump(results, f)
+                logging.info(f"Rank {rank} saved results using pickle for file: {file}")
+            except Exception as pickle_error:
+                logging.warning(
+                    f"Pickle serialization failed: {pickle_error}. Trying text file..."
+                )
+                try:
+                    with open(f"{unique_name}_{time_stamp}.txt", "w") as f:
+                        for key, value in results.items():
+                            f.write(f"{key}: {str(value)}\n")
+                    logging.info(f"Rank {rank} saved results as text for file: {file}")
+                except Exception as text_error:
+                    logging.error(
+                        f"All serialization attempts failed for file {file}: {text_error}"
+                    )
 
 
 if __name__ == "__main__":
