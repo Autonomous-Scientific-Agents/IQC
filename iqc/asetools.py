@@ -586,6 +586,8 @@ class ComplexEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, complex):
             return {"real": obj.real, "imag": obj.imag}
+        elif hasattr(obj, "item"):  # Handle numpy types
+            return obj.item()
         return super().default(obj)
 
 
@@ -686,7 +688,7 @@ def run_thermo(
         tuple: A tuple containing the thermochemistry results and a dictionary with calculated properties
     """
     logging.info(f"Starting thermochemistry calculation for {unique_name}")
-    
+
     if unique_name == "":
         unique_name = get_inchikey(atoms)
 
