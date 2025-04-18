@@ -1,117 +1,122 @@
-import ase
-import os
-import glob
+import argparse
 import json
-from datetime import datetime
-from mace.calculators import mace_mp
-from . import cli
-from . import mpitools
-from . import asetools
 import logging
-from mpi4py import MPI
+import os
+import pickle
+import sys
+from pathlib import Path
+
+import numpy as np
+from ase.io import read
+
+from iqc.asetools import (
+    run_optimization,
+    run_single_point,
+    run_thermo,
+    run_vibrations,
+    xyz2atoms,
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="IQC: ASE-based quantum chemistry calculations"
+    )
+    parser.add_argument(
+        "input",
+        help="Input XYZ file or SMILES string",
+        type=str,
+    )
+    parser.add_argument(
+        "-t",
+        "--task",
+        choices=["single", "opt", "vib", "thermo"],
+        default="thermo",
+        help="Calculation task to perform (default: thermo)",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="Output file path (default: results.json)",
+        default="results.json",
+        type=str,
+    )
+    parser.add_argument(
+        "-f",
+        "--fmax",
+        help="Maximum force for geometry optimization (default: 0.01)",
+        default=0.01,
+        type=float,
+    )
+    parser.add_argument(
+        "--ignore-imag",
+        help="Ignore imaginary modes in thermochemistry",
+        action="store_true",
+    )
+    return parser.parse_args()
+
+
+def save_results(results, output_file):
+    """Save results to file with fallback options."""
+    try:
+        # First attempt: Save as JSON
+        with open(output_file, "w") as f:
+            json.dump(results, f, indent=2)
+        logging.info(f"Results saved to {output_file} in JSON format")
+    except (TypeError, ValueError) as e:
+        logging.warning(f"JSON serialization failed: {e}. Trying pickle...")
+        try:
+            # Second attempt: Save as pickle
+            pickle_file = output_file.replace(".json", ".pkl")
+            with open(pickle_file, "wb") as f:
+                pickle.dump(results, f)
+            logging.info(f"Results saved to {pickle_file} in pickle format")
+        except Exception as e:
+            logging.warning(f"Pickle serialization failed: {e}. Saving as text...")
+            # Third attempt: Save as text
+            txt_file = output_file.replace(".json", ".txt")
+            with open(txt_file, "w") as f:
+                for key, value in results.items():
+                    f.write(f"{key}: {value}\n")
+            logging.info(f"Results saved to {txt_file} in text format")
 
 
 def main():
-    # Initialize MPI
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    size = comm.Get_size()
-    # Get command line arguments
-    args = cli.get_args()
+    """Main function."""
+    args = parse_args()
 
-    # Set up logging
-    log_level = getattr(logging, args.loglevel.upper(), logging.INFO)
-    logging.basicConfig(
-        level=log_level, format="%(asctime)s - %(levelname)s - %(message)s"
-    )
+    # Read input
+    if os.path.isfile(args.input):
+        atoms = xyz2atoms(args.input)
+    else:
+        # Assume input is SMILES string
+        from iqc.asetools import get_rdmol_from_smiles, ase2rdkit2
 
-    logging.debug(f"Rank {rank} started with size {size}.")
+        rdmol = get_rdmol_from_smiles(args.input, optimize=True)
+        atoms = ase2rdkit2(rdmol)
 
-    if rank == 0:
-        # Check if args.xyz is a file or directory
-        if os.path.isdir(args.xyz):
-            xyz_dir = args.xyz
-            xyz_files = glob.glob(os.path.join(xyz_dir, "*.xyz"))
-        elif os.path.isfile(args.xyz):
-            xyz_files = [args.xyz]
-        else:
-            raise FileNotFoundError(f"Path {args.xyz} does not exist")
-        number_of_files = len(xyz_files)
-        logging.info(f"Rank {rank} found {number_of_files} .xyz file(s).")
-
-    xyz_files = comm.bcast(xyz_files if rank == 0 else None, root=0)
-    number_of_files = len(xyz_files)
-    if number_of_files == 0:
-        raise FileNotFoundError(f"No .xyz files found in directory: {args.xyz}")
-
-    start_index, end_index = mpitools.get_start_end(comm, number_of_files)
-    logging.debug(
-        f"Rank {rank} processing files from index {start_index} to {end_index}."
-    )
-
-    for file in xyz_files[start_index:end_index]:
-        time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_name = (
-            f"{os.path.splitext(os.path.basename(file))[0]}_{rank}_{time_stamp}"
+    # Run calculation based on task
+    if args.task == "single":
+        atoms, results = run_single_point(atoms)
+    elif args.task == "opt":
+        atoms, results = run_optimization(atoms, fmax=args.fmax)
+    elif args.task == "vib":
+        atoms, results = run_vibrations(atoms)
+    else:  # thermo
+        atoms, results = run_thermo(
+            atoms, fmax=args.fmax, ignore_imag_modes=args.ignore_imag
         )
-        logging.debug(f"Rank {rank} processing file: {file}")
-        atoms = asetools.get_atoms_from_xyz(file)
-        results = {
-            "xyz_file": file,
-            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "mpi_size": size,
-            "mpi_rank": rank,
-            "hostname": os.uname().nodename,
-        }
-        try:
-            thermo, thermo_results = asetools.run_thermo(
-                atoms,
-                calculators=[
-                    mace_mp(
-                        model="large",
-                        dispersion=True,
-                        default_dtype="float64",
-                        device="cpu",
-                    )
-                ],
-                fmax=0.001,
-                unique_name=unique_name,
-            )
-            for key, val in thermo_results.items():
-                results[key] = val
-            logging.debug(f"Rank {rank} completed thermo calculations for file: {file}")
-        except Exception as e:
-            results["thermo_error"] = str(e)
-            logging.error(f"Rank {rank} encountered an error: {e}")
 
-        time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        try:
-            with open(f"{unique_name}_{time_stamp}.json", "w") as f:
-                json.dump(results, f, indent=2, cls=asetools.ComplexEncoder)
-            logging.info(f"Rank {rank} saved results for file: {file}")
-        except (TypeError, ValueError) as json_error:
-            logging.warning(
-                f"JSON serialization failed: {json_error}. Trying pickle..."
-            )
-            try:
-                import pickle
-
-                with open(f"{unique_name}_{time_stamp}.pkl", "wb") as f:
-                    pickle.dump(results, f)
-                logging.info(f"Rank {rank} saved results using pickle for file: {file}")
-            except Exception as pickle_error:
-                logging.warning(
-                    f"Pickle serialization failed: {pickle_error}. Trying text file..."
-                )
-                try:
-                    with open(f"{unique_name}_{time_stamp}.txt", "w") as f:
-                        for key, value in results.items():
-                            f.write(f"{key}: {str(value)}\n")
-                    logging.info(f"Rank {rank} saved results as text for file: {file}")
-                except Exception as text_error:
-                    logging.error(
-                        f"All serialization attempts failed for file {file}: {text_error}"
-                    )
+    # Save results
+    save_results(results, args.output)
 
 
 if __name__ == "__main__":

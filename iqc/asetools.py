@@ -47,6 +47,18 @@ except ImportError:
         "MACE calculator not available. Install with 'pip install mace' if you need machine learning-based quantum chemistry calculations."
     )
 
+# Fallback to EMT if no other calculator is available
+if default_calculator is None:
+    try:
+        from ase.calculators.emt import EMT
+
+        default_calculator = EMT()
+        logging.info("Using EMT calculator as default.")
+    except ImportError:
+        logging.warning(
+            "No calculator available. Please install at least one of: mace, xtb, or ase[calculators]"
+        )
+
 
 def save_atoms(atoms, prefix="", suffix="", file_format="xyz", directory=None):
     """
@@ -500,6 +512,7 @@ atoms2tuple = ase_atoms_to_tuple
 def get_external_symmetry_factor(atoms):
     """
     Calculate the external symmetry factor for an ASE Atoms object.
+    If automol is not available, returns a default value of 1.
 
     Args:
         atoms (ase.Atoms): ASE Atoms object
@@ -507,10 +520,19 @@ def get_external_symmetry_factor(atoms):
     Returns:
         int: External symmetry factor
     """
-    import automol
+    try:
+        import automol
 
-    geo = atoms2tuple(atoms)
-    return automol.geom.external_symmetry_factor(geo)
+        geo = atoms2tuple(atoms)
+        return automol.geom.external_symmetry_factor(geo)
+    except ImportError:
+        logging.warning("automol module not found. Using default symmetry factor of 1.")
+        return 1
+    except Exception as e:
+        logging.warning(
+            f"Error calculating symmetry factor: {e}. Using default value of 1."
+        )
+        return 1
 
 
 def ase_to_rdkit_mol(atoms):
@@ -686,6 +708,221 @@ def get_inchikey(atoms):
 atoms2inchikey = get_inchikey
 
 
+def _prepare_calculation(atoms, calculators, unique_name=""):
+    """
+    Prepare atoms and calculators for a calculation.
+
+    Args:
+        atoms (ase.Atoms): ASE Atoms object
+        calculators (list): List of calculators
+        unique_name (str): Unique name for the molecule
+
+    Returns:
+        tuple: (calculator, initial_data, results_dict)
+    """
+    if unique_name == "":
+        unique_name = get_inchikey(atoms)
+
+    # Ensure calculators is a list
+    if not isinstance(calculators, list):
+        calculators = [calculators]
+
+    # Use default calculator if none provided
+    if not calculators or calculators[0] is None:
+        if default_calculator is None:
+            raise RuntimeError(
+                "No calculator available. Please install at least one of: mace, xtb, or ase[calculators]"
+            )
+        calculators = [default_calculator]
+
+    calc = calculators[0]
+
+    # Get initial data
+    initial_smiles = atoms2smiles(atoms)
+    initial_xyz = atoms2xyz(atoms)
+    try:
+        initial_sym_number = get_external_symmetry_factor(atoms)
+    except Exception as e:
+        logging.warning(
+            f"Error getting symmetry number: {e}. Using default value of 1."
+        )
+        initial_sym_number = 1
+
+    # Set calculator and get initial energy
+    atoms.calc = calc
+    initial_energy = atoms.get_potential_energy()
+
+    # Prepare results dictionary
+    results = {
+        "number_of_atoms": len(atoms),
+        "number_of_electrons": get_total_electrons(atoms),
+        "spin": get_spin(atoms),
+        "formula": atoms.get_chemical_formula(mode="hill"),
+        "unique_name": unique_name,
+        "initial_smiles": initial_smiles,
+        "initial_xyz": initial_xyz,
+        "initial_sym_number": initial_sym_number,
+        "initial_energy_eV": initial_energy,
+        "error": None,
+    }
+
+    return calc, results
+
+
+def run_single_point(
+    atoms,
+    calculators=[default_calculator],
+    unique_name="",
+):
+    """
+    Run a single point energy calculation for an ASE Atoms object.
+
+    Args:
+        atoms (ase.Atoms): ASE Atoms object
+        calculators (list): List of calculators
+        unique_name (str): Unique name for the molecule
+
+    Returns:
+        tuple: A tuple containing the atoms and a dictionary with calculated properties
+    """
+    logging.info(f"Starting single point calculation for {unique_name}")
+
+    calc, results = _prepare_calculation(atoms, calculators, unique_name)
+    error = None
+
+    try:
+        start_time = time.time()
+        energy = atoms.get_potential_energy()
+        forces = atoms.get_forces()
+        results["calc_time"] = (time.time() - start_time) * 1000
+        results["energy_eV"] = energy
+        results["forces"] = forces.tolist()
+        logging.debug(
+            f"Single point calculation completed in {results['calc_time']} ms"
+        )
+    except Exception as e:
+        error = f"Error in single point calculation: {e}"
+        results["error"] = error
+        logging.error(error)
+
+    logging.info(f"Single point calculation for {unique_name} completed")
+    return atoms, results
+
+
+def run_vibrations(
+    atoms,
+    calculators=[default_calculator],
+    unique_name="",
+    indices=None,
+    delta=0.01,
+):
+    """
+    Run vibrational frequency calculations for an ASE Atoms object.
+
+    Args:
+        atoms (ase.Atoms): ASE Atoms object
+        calculators (list): List of calculators
+        unique_name (str): Unique name for the molecule
+        indices (list): List of atom indices to include in vibration calculation
+        delta (float): Displacement for finite difference calculation
+
+    Returns:
+        tuple: A tuple containing the atoms and a dictionary with calculated properties
+    """
+    logging.info(f"Starting vibrational analysis for {unique_name}")
+
+    calc, results = _prepare_calculation(atoms, calculators, unique_name)
+    error = None
+
+    try:
+        start_time = time.time()
+        vib = Vibrations(atoms, name=f"vib_{unique_name}", indices=indices, delta=delta)
+        vib.run()
+        results["vib_time"] = (time.time() - start_time) * 1000
+        results["frequencies_cm^-1"] = vib.get_frequencies().tolist()
+        results["modes"] = vib.get_modes().tolist()
+        results["number_of_imaginary"] = len(
+            [f for f in results["frequencies_cm^-1"] if f < 0]
+        )
+        logging.debug(f"Vibrational analysis completed in {results['vib_time']} ms")
+    except Exception as e:
+        error = f"Error in vibrational analysis: {e}"
+        results["error"] = error
+        logging.error(error)
+
+    logging.info(f"Vibrational analysis for {unique_name} completed")
+    return atoms, results
+
+
+def run_optimization(
+    atoms,
+    calculators=[default_calculator],
+    fmax=0.01,
+    unique_name="",
+    max_steps=200,
+    trajectory=None,
+    logfile=None,
+):
+    """
+    Run geometry optimization for an ASE Atoms object.
+
+    Args:
+        atoms (ase.Atoms): ASE Atoms object
+        calculators (list): List of calculators for geometry optimization
+        fmax (float): Maximum force for geometry optimization
+        unique_name (str): Unique name for the molecule
+        max_steps (int): Maximum number of optimization steps
+        trajectory (str): Path to save trajectory file
+        logfile (str): Path to save log file
+
+    Returns:
+        tuple: A tuple containing the optimized atoms and a dictionary with calculated properties
+    """
+    logging.info(f"Starting geometry optimization for {unique_name}")
+
+    calc, results = _prepare_calculation(atoms, calculators, unique_name)
+    error = None
+
+    # Add optimization-specific fields
+    results.update(
+        {
+            "opt_smiles": "",
+            "opt_xyz": "",
+            "opt_sym_number": 0,
+            "opt_energy_eV": 0,
+            "smiles_changed": None,
+            "opt_time": 0,
+            "opt_steps": 0,
+            "opt_converged": False,
+            "opt_forces": [],
+        }
+    )
+
+    try:
+        start_time = time.time()
+        dyn = BFGS(atoms, trajectory=trajectory, logfile=logfile)
+        converged = dyn.run(fmax=fmax, steps=max_steps)
+        results["opt_time"] = (time.time() - start_time) * 1000
+        results["opt_steps"] = dyn.get_number_of_steps()
+        results["opt_converged"] = converged
+        results["opt_forces"] = atoms.get_forces().tolist()
+        logging.debug(f"Optimization completed in {results['opt_time']} ms")
+    except Exception as e:
+        error = f"Error in optimization: {e}"
+        results["error"] = error
+        logging.error(error)
+
+    if error is None:
+        results["opt_smiles"] = atoms2smiles(atoms)
+        results["opt_energy_eV"] = atoms.get_potential_energy()
+        results["opt_xyz"] = atoms2xyz(atoms)
+        results["opt_sym_number"] = get_external_symmetry_factor(atoms)
+        results["smiles_changed"] = results["initial_smiles"] != results["opt_smiles"]
+
+    logging.info(f"Geometry optimization for {unique_name} completed")
+    return atoms, results
+
+
 def run_thermo(
     atoms,
     calculators=[default_calculator],
@@ -708,114 +945,43 @@ def run_thermo(
     """
     logging.info(f"Starting thermochemistry calculation for {unique_name}")
 
-    if unique_name == "":
-        unique_name = get_inchikey(atoms)
+    # First optimize the geometry
+    atoms, opt_results = run_optimization(atoms, calculators, fmax, unique_name)
+    if opt_results["error"] is not None:
+        return None, opt_results
 
-    # Ensure calculators is a list; if only one is provided, use it for all steps
-    if not isinstance(calculators, list):
-        calculators = [calculators]
-    if len(calculators) == 1:
-        calc_geom = calculators[0]
-        calc_freq = calculators[0]
-    else:
-        calc_geom = calculators[0]
-        calc_freq = calculators[1]
+    # Then run vibrational analysis
+    atoms, vib_results = run_vibrations(atoms, calculators, unique_name)
+    if vib_results["error"] is not None:
+        return None, vib_results
 
-    initial_smiles = atoms2smiles(atoms)
-    initial_xyz = atoms2xyz(atoms)
-    initial_sym_number = get_external_symmetry_factor(atoms)
-
-    # Set the first calculator and calculate energy
-    atoms.calc = calc_geom
-    initial_energy = atoms.get_potential_energy()
+    # Combine results
+    results = {**opt_results, **vib_results}
     error = None
 
-    results = {
-        "number_of_atoms": len(atoms),
-        "number_of_electrons": get_total_electrons(atoms),
-        "spin": get_spin(atoms),
-        "formula": atoms.get_chemical_formula(mode="hill"),
-        "unique_name": unique_name,
-        "initial_smiles": initial_smiles,
-        "initial_xyz": initial_xyz,
-        "initial_sym_number": initial_sym_number,
-        "initial_energy_eV": initial_energy,
-        "error": error,
-        "opt_smiles": "",
-        "opt_xyz": "",
-        "opt_sym_number": 0,
-        "opt_energy_eV": 0,
-        "smiles_changed": None,
-        "frequencies_cm^-1": [],
-        "number_of_imaginary": -1,
-        "G_eV": 0,
-        "H_eV": 0,
-        "S_eV/K": 0,
-        "E_ZPE_eV": 0,
-        "opt_time": 0,
-        "vib_time": 0,
-        "thermo_time": 0,
-    }
-
-    # Optimize geometry
     try:
         start_time = time.time()
-        dyn = BFGS(atoms)
-        dyn.run(fmax=fmax)
-        results["opt_time"] = (time.time() - start_time) * 1000
-        logging.debug(f"Optimization completed in {results['opt_time']} ms")
-    except Exception as e:
-        error = f"Error in optimization: {e}"
-        results["error"] = error
-        logging.error(error)
-
-    # After optimization, get optimized SMILES
-    if error is None:
-        results["opt_smiles"] = atoms2smiles(atoms)
-        results["opt_energy_eV"] = atoms.get_potential_energy()
-        results["opt_xyz"] = atoms2xyz(atoms)
-        results["opt_sym_number"] = get_external_symmetry_factor(atoms)
-        results["smiles_changed"] = initial_smiles != results["opt_smiles"]
-        # Now set the frequency calculator and compute vibrational frequencies
-        atoms.calc = calc_freq
-        vib = Vibrations(atoms, name=f"vib_{unique_name}", indices=None)
-        try:
-            start_time = time.time()
-            vib.run()
-            results["vib_time"] = (
-                time.time() - start_time
-            ) * 1000  # Convert to milliseconds
-            logging.debug(f"Vibrational analysis completed in {results['vib_time']} ms")
-        except Exception as e:
-            error = f"Error in vibrations: {e}"
-            results["error"] = error
-            logging.error(error)
-
-    if error is None:
-        start_time = time.time()
-        freqs = vib.get_vibrations(read_cache=False).get_frequencies()  # in cm^-1
-        results["frequencies_cm^-1"] = freqs.tolist()
         thermo = IdealGasThermo(
-            vib_energies=vib.get_energies(),  # in eV
-            geometry="nonlinear",  # guess or determine the molecular geometry type
+            vib_energies=vib_results["modes"],
+            geometry="nonlinear",
             atoms=atoms,
             potentialenergy=atoms.get_potential_energy(),
-            spin=get_spin(atoms),  # adjust if needed
+            spin=get_spin(atoms),
             symmetrynumber=get_external_symmetry_factor(atoms),
             ignore_imag_modes=ignore_imag_modes,
         )
-        # Save standard thermochemical properties
-        results["thermo_time"] = (
-            time.time() - start_time
-        ) * 1000  # Convert to milliseconds
-        logging.debug(
-            f"Thermochemistry calculations completed in {results['thermo_time']} ms"
-        )
-        results["number_of_imaginary"] = thermo.n_imag
+        results["thermo_time"] = (time.time() - start_time) * 1000
         results["G_eV"] = thermo.get_gibbs_energy(temperature=298.15, pressure=101325.0)
         results["H_eV"] = thermo.get_enthalpy(temperature=298.15)
         results["S_eV/K"] = thermo.get_entropy(temperature=298.15, pressure=101325.0)
         results["E_ZPE_eV"] = thermo.get_ZPE_correction()
+        logging.debug(
+            f"Thermochemistry calculations completed in {results['thermo_time']} ms"
+        )
+    except Exception as e:
+        error = f"Error in thermochemistry calculations: {e}"
+        results["error"] = error
+        logging.error(error)
 
     logging.info(f"Thermochemistry calculation for {unique_name} completed")
     return thermo, results
