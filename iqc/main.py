@@ -3,10 +3,13 @@ import logging
 import os
 import pickle
 import sys
+import glob
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from ase.io import read
+from mpi4py import MPI
 
 from iqc.asetools import (
     run_optimization,
@@ -16,6 +19,7 @@ from iqc.asetools import (
     xyz2atoms,
 )
 from iqc.cli import get_args
+from iqc.mpitools import get_start_end
 
 # Configure logging
 logging.basicConfig(
@@ -68,31 +72,89 @@ def save_results(results, output_file):
 
 def main():
     """Main function."""
+    # Initialize MPI
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
+    # Get command line arguments
     args = get_args()
 
-    # Read input
-    if os.path.isfile(args.xyz):
-        atoms = xyz2atoms(args.xyz)
-    else:
-        # Assume input is SMILES string
-        from iqc.asetools import get_rdmol_from_smiles, ase2rdkit2
+    # Set up logging
+    log_level = getattr(logging, args.loglevel.upper(), logging.INFO)
+    logging.basicConfig(
+        level=log_level, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
 
-        rdmol = get_rdmol_from_smiles(args.xyz, optimize=True)
-        atoms = ase2rdkit2(rdmol)
+    logging.debug(f"Rank {rank} started with size {size}.")
 
-    # Run calculation based on task
-    if args.task == "single":
-        atoms, results = run_single_point(atoms)
-    elif args.task == "opt":
-        atoms, results = run_optimization(atoms)
-    elif args.task == "vib":
-        atoms, results = run_vibrations(atoms)
-    else:  # thermo
-        atoms, results = run_thermo(atoms)
+    if rank == 0:
+        # Check if args.xyz is a file or directory
+        if os.path.isdir(args.xyz):
+            xyz_dir = args.xyz
+            xyz_files = glob.glob(os.path.join(xyz_dir, "*.xyz"))
+        elif os.path.isfile(args.xyz):
+            xyz_files = [args.xyz]
+        else:
+            raise FileNotFoundError(f"Path {args.xyz} does not exist")
+        number_of_files = len(xyz_files)
+        logging.info(f"Rank {rank} found {number_of_files} .xyz file(s).")
 
-    # Save results
-    output_file = f"results_{args.task}.json"
-    save_results(results, output_file)
+    xyz_files = comm.bcast(xyz_files if rank == 0 else None, root=0)
+    number_of_files = len(xyz_files)
+    if number_of_files == 0:
+        raise FileNotFoundError(f"No .xyz files found in directory: {args.xyz}")
+
+    start_index, end_index = get_start_end(comm, number_of_files)
+    logging.debug(
+        f"Rank {rank} processing files from index {start_index} to {end_index}."
+    )
+
+    for file in xyz_files[start_index:end_index]:
+        time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_name = (
+            f"{os.path.splitext(os.path.basename(file))[0]}_{rank}_{time_stamp}"
+        )
+        logging.debug(f"Rank {rank} processing file: {file}")
+        
+        # Read input
+        if os.path.isfile(file):
+            atoms = xyz2atoms(file)
+        else:
+            # Assume input is SMILES string
+            from iqc.asetools import get_rdmol_from_smiles, ase2rdkit2
+            rdmol = get_rdmol_from_smiles(file, optimize=True)
+            atoms = ase2rdkit2(rdmol)
+
+        results = {
+            "xyz_file": file,
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "mpi_size": size,
+            "mpi_rank": rank,
+            "hostname": os.uname().nodename,
+        }
+
+        try:
+            # Run calculation based on task
+            if args.task == "single":
+                atoms, task_results = run_single_point(atoms)
+            elif args.task == "opt":
+                atoms, task_results = run_optimization(atoms)
+            elif args.task == "vib":
+                atoms, task_results = run_vibrations(atoms)
+            else:  # thermo
+                atoms, task_results = run_thermo(atoms)
+            
+            for key, val in task_results.items():
+                results[key] = val
+            logging.debug(f"Rank {rank} completed {args.task} calculations for file: {file}")
+        except Exception as e:
+            results[f"{args.task}_error"] = str(e)
+            logging.error(f"Rank {rank} encountered an error: {e}")
+
+        # Save results
+        output_file = f"{unique_name}_{args.task}_{time_stamp}.json"
+        save_results(results, output_file)
 
 if __name__ == "__main__":
     main()
