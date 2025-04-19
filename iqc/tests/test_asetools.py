@@ -162,15 +162,18 @@ def test_mace_calculator_unavailable():
 
         importlib.reload(iqc.asetools)
 
-        # Check that default_calculator is None
-        assert iqc.asetools.default_calculator is None
+        # Check that default_calculator is EMT when MACE is not available
+        assert isinstance(iqc.asetools.default_calculator, iqc.asetools.EMT)
 
         # Create a simple molecule
         atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
+        
+        # Set the calculator on the atoms object
+        atoms.calc = iqc.asetools.default_calculator
 
-        # Try to calculate energy without a calculator
-        with pytest.raises(RuntimeError, match="Atoms object has no calculator"):
-            atoms.get_potential_energy()
+        # Try to calculate energy with EMT calculator
+        energy = atoms.get_potential_energy()
+        assert isinstance(energy, float)
 
 
 def test_xtb_calculator_available():
