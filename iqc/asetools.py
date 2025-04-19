@@ -4,10 +4,12 @@ import os
 import time
 from datetime import datetime
 
-# Configure logging first
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+# Library modules should not configure logging.
+# Let the main application handle configuration.
+# # Configure logging first
+# logging.basicConfig(
+#     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+# )
 
 import numpy as np
 from ase import Atoms, build
@@ -835,7 +837,7 @@ def run_single_point(
     Returns:
         tuple: A tuple containing the atoms and a dictionary with calculated properties
     """
-    logging.info(f"Starting single point calculation for {unique_name} with {calculator.name}")
+    logging.debug(f"Starting single point energy calculation")
 
     calc, results = _prepare_calculation(atoms, calculator, unique_name)
     error = None
@@ -855,7 +857,6 @@ def run_single_point(
         results["error"] = error
         logging.error(error)
 
-    logging.info(f"Single point calculation for {unique_name} completed")
     return atoms, results
 
 

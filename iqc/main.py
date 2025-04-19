@@ -22,13 +22,6 @@ from iqc.asetools import (
 from iqc.cli import get_args
 from iqc.mpitools import get_start_end
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()],
-)
-
 class ComplexEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, complex):
@@ -91,12 +84,37 @@ def main():
         sys.exit(1)   # Exit if not running under MPI
 
     # Set up logging (after calculator init which might log warnings)
-    log_level = getattr(logging, args.loglevel.upper(), logging.INFO)
-    logging.basicConfig(
-        level=log_level, format="%(asctime)s - %(levelname)s - %(message)s"
-    )
+    # Get the root logger instance
+    logger = logging.getLogger()
+    # Determine the log level from arguments, defaulting to INFO
+    log_level_name = args.loglevel.upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    # Set the determined level on the root logger
+    logger.setLevel(log_level)
 
-    logging.debug(f"Rank {rank} started with size {size}.")
+    # Define the desired formatter
+    formatter = logging.Formatter("IQC %(levelname)s: %(asctime)s - Rank %(mpi_rank)s - %(message)s")
+    
+    # Ensure at least one handler is configured and set the formatter
+    if not logger.hasHandlers():
+        # If no handlers exist, create a default StreamHandler
+        handler = logging.StreamHandler(sys.stdout) # Log to stdout
+        handler.setFormatter(formatter) # Apply formatter to the new handler
+        logger.addHandler(handler)
+    else:
+        # If handlers already exist, apply the formatter to all of them
+        for handler in logger.handlers:
+            handler.setFormatter(formatter)
+    
+    # Add MPI rank to the log record attributes for the formatter
+    old_factory = logging.getLogRecordFactory()
+    def record_factory(*args, **kwargs):
+        record = old_factory(*args, **kwargs)
+        record.mpi_rank = rank # Add rank info
+        return record
+    logging.setLogRecordFactory(record_factory)
+
+    logging.debug(f"Number of MPI ranks: {size}.")
 
     if rank == 0:
         # Check if args.xyz is a file or directory
@@ -108,7 +126,7 @@ def main():
         else:
             raise FileNotFoundError(f"Path {args.xyz} does not exist")
         number_of_files = len(xyz_files)
-        logging.info(f"Rank {rank} found {number_of_files} .xyz file(s).")
+        logging.info(f"Found {number_of_files} .xyz file(s).")
 
     xyz_files = comm.bcast(xyz_files if rank == 0 else None, root=0)
     number_of_files = len(xyz_files)
@@ -117,7 +135,7 @@ def main():
 
     start_index, end_index = get_start_end(comm, number_of_files)
     logging.debug(
-        f"Rank {rank} processing files from index {start_index} to {end_index}."
+        f"Processing files from index {start_index} to {end_index}."
     )
 
     for file in xyz_files[start_index:end_index]:
@@ -125,7 +143,7 @@ def main():
         unique_name = (
             f"{os.path.splitext(os.path.basename(file))[0]}_{rank}_{time_stamp}"
         )
-        logging.debug(f"Rank {rank} processing file: {file}")
+        logging.info(f"Processing file: {file}")
         
         # Read input
         try:
@@ -154,13 +172,13 @@ def main():
         try:
             # Run calculation based on task using the selected calculator
             if args.task == "single":
-                atoms, task_results = run_single_point(atoms, calculator)
+                atoms, task_results = run_single_point(atoms, calculator, unique_name)
             elif args.task == "opt":
-                atoms, task_results = run_optimization(atoms, calculator)
+                atoms, task_results = run_optimization(atoms, calculator, unique_name)
             elif args.task == "vib":
-                atoms, task_results = run_vibrations(atoms, calculator)
+                atoms, task_results = run_vibrations(atoms, calculator, unique_name)
             else:  # thermo
-                atoms, task_results = run_thermo(atoms, calculator)
+                atoms, task_results = run_thermo(atoms, calculator, unique_name)
             
             for key, val in task_results.items():
                 results[key] = val
