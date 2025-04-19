@@ -55,3 +55,32 @@ shmem: mmap: an error occurred while determining whether or not /tmp/ompi.yv.100
 ```
 
 Try: `export OMPI_MCA_btl_sm_backing_directory=/tmp`
+
+## Available Tasks
+
+IQC provides several computational tasks that can be performed on molecular systems:
+
+- `single`: Single-point energy and force calculation
+- `vib`: Vibrational frequency calculation
+- `opt`: Geometry optimization
+- `thermo`: Thermochemical analysis
+
+These tasks can be specified when running calculations. For example:
+
+```python
+from iqc.asetools import run_single_point, run_vibrations, run_optimization, run_thermo
+
+# Single-point calculation
+results = run_single_point(atoms)
+
+# Vibrational frequency calculation
+results = run_vibrations(atoms)
+
+# Geometry optimization
+results = run_optimization(atoms)
+
+# Thermochemical analysis
+results = run_thermo(atoms)
+```
+
+Each task returns a dictionary containing the results and timing information in milliseconds.
