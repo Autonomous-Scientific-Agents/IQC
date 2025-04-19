@@ -16,7 +16,8 @@ from iqc.asetools import (
     run_single_point,
     run_thermo,
     run_vibrations,
-    xyz2atoms,
+    get_atoms_from_xyz,
+    get_calculator,
 )
 from iqc.cli import get_args
 from iqc.mpitools import get_start_end
@@ -80,7 +81,16 @@ def main():
     # Get command line arguments
     args = get_args()
 
-    # Set up logging
+    # Initialize the calculator based on CLI argument
+    # Do this early so any initialization errors are caught before file processing
+    try:
+        calculator = get_calculator(name=args.calculator)
+    except RuntimeError as e:
+        logging.error(f"Failed to initialize calculator: {e}")
+        comm.Abort(1) # Abort MPI if calculator fails
+        sys.exit(1)   # Exit if not running under MPI
+
+    # Set up logging (after calculator init which might log warnings)
     log_level = getattr(logging, args.loglevel.upper(), logging.INFO)
     logging.basicConfig(
         level=log_level, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -118,13 +128,20 @@ def main():
         logging.debug(f"Rank {rank} processing file: {file}")
         
         # Read input
-        if os.path.isfile(file):
-            atoms = xyz2atoms(file)
-        else:
-            # Assume input is SMILES string
-            from iqc.asetools import get_rdmol_from_smiles, ase2rdkit2
-            rdmol = get_rdmol_from_smiles(file, optimize=True)
-            atoms = ase2rdkit2(rdmol)
+        try:
+            if os.path.isfile(file):
+                atoms = get_atoms_from_xyz(file)
+            else:
+                # Assume input is SMILES string
+                from iqc.asetools import get_rdmol_from_smiles, ase2rdkit2
+                rdmol = get_rdmol_from_smiles(file, optimize=True)
+                atoms = ase2rdkit2(rdmol)
+        except ValueError as e:
+            logging.error(f"Rank {rank} encountered an error reading file {file}: {e}. Skipping this file.")
+            continue  # Skip to the next file
+        except Exception as e:
+            logging.error(f"Rank {rank} encountered an unexpected error processing file {file}: {e}. Skipping this file.")
+            continue # Skip to the next file
 
         results = {
             "xyz_file": file,
@@ -135,15 +152,15 @@ def main():
         }
 
         try:
-            # Run calculation based on task
+            # Run calculation based on task using the selected calculator
             if args.task == "single":
-                atoms, task_results = run_single_point(atoms)
+                atoms, task_results = run_single_point(atoms, calculator)
             elif args.task == "opt":
-                atoms, task_results = run_optimization(atoms)
+                atoms, task_results = run_optimization(atoms, calculator)
             elif args.task == "vib":
-                atoms, task_results = run_vibrations(atoms)
+                atoms, task_results = run_vibrations(atoms, calculator)
             else:  # thermo
-                atoms, task_results = run_thermo(atoms)
+                atoms, task_results = run_thermo(atoms, calculator)
             
             for key, val in task_results.items():
                 results[key] = val

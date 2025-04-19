@@ -60,6 +60,74 @@ if default_calculator is None:
         )
 
 
+def get_calculator(name="mace", **kwargs):
+    """Initializes and returns the specified ASE calculator.
+
+    Args:
+        name (str): The name of the calculator ('mace', 'xtb', 'emt').
+        **kwargs: Additional keyword arguments passed to the calculator constructor.
+
+    Returns:
+        ase.calculators.calculator.Calculator: The initialized calculator instance.
+                                                 Returns EMT as a fallback if the requested
+                                                 calculator is not available or fails to initialize.
+    """
+    name = name.lower()
+    calculator = None
+    
+    if name == "mace":
+        try:
+            from mace.calculators import mace_mp
+            mace_kwargs = {
+                "model": "medium",
+                "dispersion": True,
+                "default_dtype": "float32",
+                "device": "cpu",
+                **kwargs
+            }
+            calculator = mace_mp(**mace_kwargs)
+            logging.info(f"Using MACE calculator with arguments: {mace_kwargs}")
+        except ImportError:
+            logging.warning("MACE not found. Install with 'pip install mace'. Falling back to EMT.")
+        except RuntimeError as e:
+            logging.warning(f"MACE initialization failed: {e}. Falling back to EMT.")
+            
+    elif name == "xtb":
+        try:
+            from xtb.ase.calculator import XTB
+            xtb_kwargs = {"method": "GFN2-xTB", **kwargs}
+            calculator = XTB(**xtb_kwargs)
+            logging.info(f"Using XTB calculator with arguments: {xtb_kwargs}")
+        except ImportError:
+            logging.warning("XTB not found. Install with 'pip install xtb-python'. Falling back to EMT.")
+        except Exception as e:
+            logging.warning(f"XTB initialization failed: {e}. Falling back to EMT.")
+            
+    elif name == "emt":
+        try:
+            from ase.calculators.emt import EMT
+            calculator = EMT(**kwargs)
+            logging.info(f"Using EMT calculator with arguments: {kwargs}")
+        except ImportError:
+            logging.warning("EMT not found, but it's usually built-in with ASE. Problem with ASE install? Returning None.")
+            return None # Should not happen if ASE is installed
+            
+    else:
+        logging.warning(f"Unknown calculator '{name}'. Falling back to EMT.")
+
+    # Fallback to EMT if the requested calculator failed or was unknown
+    if calculator is None:
+        try:
+            from ase.calculators.emt import EMT
+            calculator = EMT()
+            logging.info("Using EMT calculator as fallback.")
+        except ImportError:
+            logging.error("Fallback EMT calculator could not be imported. No calculator available.")
+            raise RuntimeError("No suitable ASE calculator found or could be initialized.")
+            
+    return calculator
+
+
 def save_atoms(atoms, prefix="", suffix="", file_format="xyz", directory=None):
     """
     Save an ASE Atoms object to a file with a name composed of:
@@ -623,15 +691,6 @@ def atoms2xyz(atoms):
         return ""
 
 
-class ComplexEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, complex):
-            return {"real": obj.real, "imag": obj.imag}
-        elif hasattr(obj, "item"):  # Handle numpy types
-            return obj.item()
-        return super().default(obj)
-
-
 def decode_complex(dct):
     """
     Decode a complex number from a dictionary.
@@ -708,13 +767,13 @@ def get_inchikey(atoms):
 atoms2inchikey = get_inchikey
 
 
-def _prepare_calculation(atoms, calculators, unique_name=""):
+def _prepare_calculation(atoms, calculator, unique_name=""):
     """
-    Prepare atoms and calculators for a calculation.
+    Prepare atoms and calculator for a calculation.
 
     Args:
         atoms (ase.Atoms): ASE Atoms object
-        calculators (list): List of calculators
+        calculator (ase.calculators.calculator.Calculator): The calculator instance to use.
         unique_name (str): Unique name for the molecule
 
     Returns:
@@ -723,19 +782,10 @@ def _prepare_calculation(atoms, calculators, unique_name=""):
     if unique_name == "":
         unique_name = get_inchikey(atoms)
 
-    # Ensure calculators is a list
-    if not isinstance(calculators, list):
-        calculators = [calculators]
+    if calculator is None:
+        raise ValueError("Calculator cannot be None.")
 
-    # Use default calculator if none provided
-    if not calculators or calculators[0] is None:
-        if default_calculator is None:
-            raise RuntimeError(
-                "No calculator available. Please install at least one of: mace, xtb, or ase[calculators]"
-            )
-        calculators = [default_calculator]
-
-    calc = calculators[0]
+    calc = calculator
 
     # Get initial data
     initial_smiles = atoms2smiles(atoms)
@@ -771,7 +821,7 @@ def _prepare_calculation(atoms, calculators, unique_name=""):
 
 def run_single_point(
     atoms,
-    calculators=[default_calculator],
+    calculator,
     unique_name="",
 ):
     """
@@ -779,15 +829,15 @@ def run_single_point(
 
     Args:
         atoms (ase.Atoms): ASE Atoms object
-        calculators (list): List of calculators
+        calculator (ase.calculators.calculator.Calculator): Calculator instance.
         unique_name (str): Unique name for the molecule
 
     Returns:
         tuple: A tuple containing the atoms and a dictionary with calculated properties
     """
-    logging.info(f"Starting single point calculation for {unique_name}")
+    logging.info(f"Starting single point calculation for {unique_name} with {calculator.name}")
 
-    calc, results = _prepare_calculation(atoms, calculators, unique_name)
+    calc, results = _prepare_calculation(atoms, calculator, unique_name)
     error = None
 
     try:
@@ -811,7 +861,7 @@ def run_single_point(
 
 def run_vibrations(
     atoms,
-    calculators=[default_calculator],
+    calculator,
     unique_name="",
     indices=None,
     delta=0.01,
@@ -821,7 +871,7 @@ def run_vibrations(
 
     Args:
         atoms (ase.Atoms): ASE Atoms object
-        calculators (list): List of calculators
+        calculator (ase.calculators.calculator.Calculator): Calculator instance.
         unique_name (str): Unique name for the molecule
         indices (list): List of atom indices to include in vibration calculation
         delta (float): Displacement for finite difference calculation
@@ -829,9 +879,9 @@ def run_vibrations(
     Returns:
         tuple: A tuple containing the atoms and a dictionary with calculated properties
     """
-    logging.info(f"Starting vibrational analysis for {unique_name}")
+    logging.info(f"Starting vibrational analysis for {unique_name} with {calculator.name}")
 
-    calc, results = _prepare_calculation(atoms, calculators, unique_name)
+    calc, results = _prepare_calculation(atoms, calculator, unique_name)
     error = None
 
     try:
@@ -856,7 +906,7 @@ def run_vibrations(
 
 def run_optimization(
     atoms,
-    calculators=[default_calculator],
+    calculator,
     fmax=0.01,
     unique_name="",
     max_steps=200,
@@ -868,7 +918,7 @@ def run_optimization(
 
     Args:
         atoms (ase.Atoms): ASE Atoms object
-        calculators (list): List of calculators for geometry optimization
+        calculator (ase.calculators.calculator.Calculator): Calculator instance.
         fmax (float): Maximum force for geometry optimization
         unique_name (str): Unique name for the molecule
         max_steps (int): Maximum number of optimization steps
@@ -878,9 +928,9 @@ def run_optimization(
     Returns:
         tuple: A tuple containing the optimized atoms and a dictionary with calculated properties
     """
-    logging.info(f"Starting geometry optimization for {unique_name}")
+    logging.info(f"Starting geometry optimization for {unique_name} with {calculator.name}")
 
-    calc, results = _prepare_calculation(atoms, calculators, unique_name)
+    calc, results = _prepare_calculation(atoms, calculator, unique_name)
     error = None
 
     # Add optimization-specific fields
@@ -925,7 +975,7 @@ def run_optimization(
 
 def run_thermo(
     atoms,
-    calculators=[default_calculator],
+    calculator,
     fmax=0.01,
     ignore_imag_modes=True,
     unique_name="",
@@ -935,7 +985,7 @@ def run_thermo(
 
     Args:
         atoms (ase.Atoms): ASE Atoms object
-        calculators (list): List of calculators for geometry and frequency calculations
+        calculator (ase.calculators.calculator.Calculator): Calculator instance.
         fmax (float): Maximum force for geometry optimization
         ignore_imag_modes (bool): Whether to ignore imaginary vibrational modes
         unique_name (str): Unique name for the molecule
@@ -943,15 +993,15 @@ def run_thermo(
     Returns:
         tuple: A tuple containing the thermochemistry results and a dictionary with calculated properties
     """
-    logging.info(f"Starting thermochemistry calculation for {unique_name}")
+    logging.info(f"Starting thermochemistry calculation for {unique_name} with {calculator.name}")
 
     # First optimize the geometry
-    atoms, opt_results = run_optimization(atoms, calculators, fmax, unique_name)
+    atoms, opt_results = run_optimization(atoms, calculator, fmax, unique_name)
     if opt_results["error"] is not None:
         return None, opt_results
 
     # Then run vibrational analysis
-    atoms, vib_results = run_vibrations(atoms, calculators, unique_name)
+    atoms, vib_results = run_vibrations(atoms, calculator, unique_name)
     if vib_results["error"] is not None:
         return None, vib_results
 

@@ -53,5 +53,13 @@ def get_args():
         default="thermo",
         help="Calculation task to perform (default: thermo)",
     )
+    parser.add_argument(
+        "-c",
+        "--calculator",
+        type=str,
+        choices=["mace", "xtb", "emt"],
+        default="mace",
+        help="ASE calculator to use (default: mace)",
+    )
 
     return parser.parse_args()
