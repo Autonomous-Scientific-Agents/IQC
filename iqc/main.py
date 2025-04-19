@@ -1,4 +1,3 @@
-import argparse
 import json
 import logging
 import os
@@ -16,6 +15,7 @@ from iqc.asetools import (
     run_vibrations,
     xyz2atoms,
 )
+from iqc.cli import get_args
 
 # Configure logging
 logging.basicConfig(
@@ -24,52 +24,30 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 
-
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="IQC: ASE-based quantum chemistry calculations"
-    )
-    parser.add_argument(
-        "input",
-        help="Input XYZ file or SMILES string",
-        type=str,
-    )
-    parser.add_argument(
-        "-t",
-        "--task",
-        choices=["single", "opt", "vib", "thermo"],
-        default="thermo",
-        help="Calculation task to perform (default: thermo)",
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        help="Output file path (default: results.json)",
-        default="results.json",
-        type=str,
-    )
-    parser.add_argument(
-        "-f",
-        "--fmax",
-        help="Maximum force for geometry optimization (default: 0.01)",
-        default=0.01,
-        type=float,
-    )
-    parser.add_argument(
-        "--ignore-imag",
-        help="Ignore imaginary modes in thermochemistry",
-        action="store_true",
-    )
-    return parser.parse_args()
-
+class ComplexEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, complex):
+            return {"real": obj.real, "imag": obj.imag}
+        elif isinstance(obj, (np.int_, np.intc, np.intp, np.int8,
+                            np.int16, np.int32, np.int64, np.uint8,
+                            np.uint16, np.uint32, np.uint64)):
+            return int(obj)
+        elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        elif hasattr(obj, "item"):  # Handle other numpy types
+            return obj.item()
+        return super().default(obj)
 
 def save_results(results, output_file):
     """Save results to file with fallback options."""
     try:
         # First attempt: Save as JSON
         with open(output_file, "w") as f:
-            json.dump(results, f, indent=2)
+            json.dump(results, f, indent=2, cls=ComplexEncoder)
         logging.info(f"Results saved to {output_file} in JSON format")
     except (TypeError, ValueError) as e:
         logging.warning(f"JSON serialization failed: {e}. Trying pickle...")
@@ -88,36 +66,33 @@ def save_results(results, output_file):
                     f.write(f"{key}: {value}\n")
             logging.info(f"Results saved to {txt_file} in text format")
 
-
 def main():
     """Main function."""
-    args = parse_args()
+    args = get_args()
 
     # Read input
-    if os.path.isfile(args.input):
-        atoms = xyz2atoms(args.input)
+    if os.path.isfile(args.xyz):
+        atoms = xyz2atoms(args.xyz)
     else:
         # Assume input is SMILES string
         from iqc.asetools import get_rdmol_from_smiles, ase2rdkit2
 
-        rdmol = get_rdmol_from_smiles(args.input, optimize=True)
+        rdmol = get_rdmol_from_smiles(args.xyz, optimize=True)
         atoms = ase2rdkit2(rdmol)
 
     # Run calculation based on task
     if args.task == "single":
         atoms, results = run_single_point(atoms)
     elif args.task == "opt":
-        atoms, results = run_optimization(atoms, fmax=args.fmax)
+        atoms, results = run_optimization(atoms)
     elif args.task == "vib":
         atoms, results = run_vibrations(atoms)
     else:  # thermo
-        atoms, results = run_thermo(
-            atoms, fmax=args.fmax, ignore_imag_modes=args.ignore_imag
-        )
+        atoms, results = run_thermo(atoms)
 
     # Save results
-    save_results(results, args.output)
-
+    output_file = f"results_{args.task}.json"
+    save_results(results, output_file)
 
 if __name__ == "__main__":
     main()

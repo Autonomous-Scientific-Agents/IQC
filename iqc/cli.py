@@ -45,5 +45,13 @@ def get_args():
         default="xyz",
         help="Path for an .xyz file or a directory containing .xyz files",
     )
+    parser.add_argument(
+        "-t",
+        "--task",
+        type=str,
+        choices=["single", "opt", "vib", "thermo"],
+        default="thermo",
+        help="Calculation task to perform (default: thermo)",
+    )
 
     return parser.parse_args()
