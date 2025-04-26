@@ -1,5 +1,4 @@
-"""Command line interface for IQC.
-"""
+"""Command line interface for IQC."""
 
 import argparse
 import os
@@ -60,6 +59,18 @@ def get_args():
         choices=["mace", "xtb", "emt"],
         default="mace",
         help="ASE calculator to use (default: mace)",
+    )
+    parser.add_argument(
+        "-p",
+        "--params",
+        type=str,
+        default=None,
+        help="Path to YAML file with calculator and optimization parameters.",
+    )
+    parser.add_argument(
+        "--ignore-imag",
+        help="Ignore imaginary modes in thermochemistry (can also be set in param file)",
+        action="store_true",
     )
 
     return parser.parse_args()

@@ -936,9 +936,9 @@ def run_vibrations(
 def run_optimization(
     atoms,
     calculator=None,
-    fmax=0.01,
+    fmax=0.001,
     unique_name="",
-    max_steps=200,
+    max_steps=500,
 ):
     """
     Run geometry optimization for an ASE Atoms object.
@@ -957,6 +957,8 @@ def run_optimization(
     """
     calc, results = _prepare_calculation(atoms, calculator, unique_name)
     logging.info(f"Starting geometry optimization for {unique_name} with {calc.name}")
+    # Log optimization parameters
+    logging.debug(f"Optimization parameters: fmax={fmax}, max_steps={max_steps}")
     error = None
 
     # Add optimization-specific fields
@@ -1016,9 +1018,10 @@ def run_optimization(
 def run_thermo(
     atoms,
     calculator=None,
-    fmax=0.01,
+    fmax=0.01,  # Keep fmax for direct call, but will be overwritten by opt_params
     ignore_imag_modes=True,
     unique_name="",
+    **opt_params,  # Accept optimization parameters
 ):
     """
     Run thermochemistry calculations for an ASE Atoms object.
@@ -1026,9 +1029,10 @@ def run_thermo(
     Args:
         atoms (ase.Atoms): ASE Atoms object
         calculator (ase.calculators.calculator.Calculator, optional): Calculator instance. Defaults to None (uses get_calculator).
-        fmax (float): Maximum force for geometry optimization
+        fmax (float): Maximum force for geometry optimization (can be overridden by opt_params).
         ignore_imag_modes (bool): Whether to ignore imaginary vibrational modes
         unique_name (str): Unique name for the molecule
+        **opt_params: Additional keyword arguments passed to run_optimization.
 
     Returns:
         tuple: A tuple containing the thermochemistry results and a dictionary with calculated properties
@@ -1040,15 +1044,24 @@ def run_thermo(
         f"Starting thermochemistry calculation for {unique_name} with {calc.name}"
     )
 
-    # First optimize the geometry using the obtained calculator
+    # Prepare optimization arguments, merging defaults, fmax, and **opt_params
+    # **opt_params will override fmax if 'fmax' is present in it
+    current_opt_params = {"fmax": fmax}  # Start with default/passed fmax
+    current_opt_params.update(opt_params)  # Update with params from file
+
+    # First optimize the geometry using the obtained calculator and combined parameters
     atoms, opt_results = run_optimization(
-        atoms, calculator=calc, fmax=fmax, unique_name=unique_name
+        atoms,
+        calculator=calc,
+        unique_name=unique_name,
+        **current_opt_params,  # Pass combined optimization params
     )
     if opt_results["error"] is not None:
         logging.error("Optimization failed, cannot proceed with thermochemistry.")
         return None, opt_results
 
     # Then run vibrational analysis using the same calculator
+    # If vib params were added, they could be passed here similarly
     atoms, vib_results = run_vibrations(atoms, calculator=calc, unique_name=unique_name)
     if vib_results["error"] is not None:
         logging.error(
@@ -1064,14 +1077,15 @@ def run_thermo(
 
     try:
         start_time = time.time()
-        # Get energies directly from vib object (which uses the atoms object)
-        vib_energies = vib_results.get(
-            "vib_energies", None
-        )  # Assuming run_vibrations adds this
+        # Get energies directly from vib_results dictionary
+        vib_energies = vib_results.get("vib_energies", None)
         if vib_energies is None:
-            # Recalculate if needed, or use frequencies (less accurate for ZPE)
-            vib = Vibrations(atoms)  # Re-initialize if needed
-            vib_energies = vib.get_energies()  # eV
+            # This case indicates an issue in run_vibrations not storing energies
+            logging.error(
+                "Vibrational energies not found in vibration results. Cannot calculate thermo properties."
+            )
+            results["error"] = "Missing vibrational energies for thermochemistry."
+            return None, results
 
         thermo = IdealGasThermo(
             vib_energies=vib_energies,

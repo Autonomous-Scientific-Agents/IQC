@@ -6,6 +6,7 @@ import sys
 import glob
 from datetime import datetime
 from pathlib import Path
+import yaml  # Import YAML
 
 import numpy as np
 from ase.io import read
@@ -89,100 +90,116 @@ def main():
 
     # Get command line arguments
     args = get_args()
-
-    # Initialize the calculator based on CLI argument
-    # Do this early so any initialization errors are caught before file processing
-    try:
-        calculator = get_calculator(name=args.calculator)
-    except RuntimeError as e:
-        logging.error(f"Failed to initialize calculator: {e}")
-        comm.Abort(1)  # Abort MPI if calculator fails
-        sys.exit(1)  # Exit if not running under MPI
-
-    # Set up logging (after calculator init which might log warnings)
-    # Get the root logger instance
+    # --- Logging Setup --- (Remains mostly the same)
     logger = logging.getLogger()
-    # Determine the log level from arguments, defaulting to INFO
     log_level_name = args.loglevel.upper()
     log_level = getattr(logging, log_level_name, logging.INFO)
-    # Set the determined level on the root logger
     logger.setLevel(log_level)
-
-    # Define the desired formatter
     formatter = logging.Formatter(
         "IQC %(levelname)s: %(asctime)s - Rank %(mpi_rank)s - %(message)s"
     )
-
-    # Ensure at least one handler is configured and set the formatter
     if not logger.hasHandlers():
-        # If no handlers exist, create a default StreamHandler
-        handler = logging.StreamHandler(sys.stdout)  # Log to stdout
-        handler.setFormatter(formatter)  # Apply formatter to the new handler
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(formatter)
         logger.addHandler(handler)
     else:
-        # If handlers already exist, apply the formatter to all of them
         for handler in logger.handlers:
             handler.setFormatter(formatter)
-
-    # Add MPI rank to the log record attributes for the formatter
     old_factory = logging.getLogRecordFactory()
 
     def record_factory(*args, **kwargs):
         record = old_factory(*args, **kwargs)
-        record.mpi_rank = rank  # Add rank info
+        record.mpi_rank = rank
         return record
 
     logging.setLogRecordFactory(record_factory)
-
     logging.debug(f"Number of MPI ranks: {size}.")
+    # --- Load Parameters from File ---
+    params = {}
+    if args.params and os.path.isfile(args.params):
+        try:
+            with open(args.params, "r") as f:
+                params = yaml.safe_load(f)
+            if rank == 0:
+                logging.info(f"Loaded parameters from {args.params}")
+                logging.debug(f"Parameters: {params}")
 
+        except Exception as e:
+            logging.error(f"Error loading parameters from {args.params}: {e}")
+            # Decide if execution should stop if params file is bad
+            comm.Abort(1)
+            sys.exit(1)
+    elif args.params:
+        if rank == 0:
+            logging.warning(
+                f"Parameter file specified ({args.params}) but not found. Using defaults."
+            )
+
+    # Extract specific parameter sections, defaulting to empty dicts
+    calc_params = params.get("calculator_params", {})
+    opt_params = params.get("optimization_params", {})
+    # Example for future: thermo_params = params.get('thermo_params', {})
+
+    # Determine calculator name: CLI > Param file > Default ('mace')
+    calculator_name = args.calculator or params.get("calculator", "mace")
+
+    # Initialize the calculator
+    try:
+        calculator = get_calculator(name=calculator_name, **calc_params)
+    except RuntimeError as e:
+        logging.error(f"Failed to initialize calculator '{calculator_name}': {e}")
+        comm.Abort(1)
+        sys.exit(1)
+
+    # --- File Processing --- (Remains mostly the same)
     if rank == 0:
-        # Check if args.xyz is a file or directory
         if os.path.isdir(args.xyz):
             xyz_dir = args.xyz
             xyz_files = glob.glob(os.path.join(xyz_dir, "*.xyz"))
         elif os.path.isfile(args.xyz):
             xyz_files = [args.xyz]
         else:
-            raise FileNotFoundError(f"Path {args.xyz} does not exist")
+            # Handle non-existent path before bcast
+            logging.error(
+                f"Input path {args.xyz} does not exist or is not a file/directory."
+            )
+            xyz_files = []  # Ensure empty list is broadcast
+            # Optionally abort MPI here if input is critical
+            # comm.Abort(1)
+            # sys.exit(1)
+
         number_of_files = len(xyz_files)
-        logging.info(f"Found {number_of_files} .xyz file(s).")
+        if number_of_files == 0:
+            logging.warning(f"No .xyz files found in {args.xyz}. Exiting.")
+        else:
+            logging.info(f"Found {number_of_files} .xyz file(s).")
 
     xyz_files = comm.bcast(xyz_files if rank == 0 else None, root=0)
     number_of_files = len(xyz_files)
     if number_of_files == 0:
-        raise FileNotFoundError(f"No .xyz files found in directory: {args.xyz}")
+        # All ranks should exit if no files
+        logging.info("No files to process. Exiting.")
+        sys.exit(0)
 
     start_index, end_index = get_start_end(comm, number_of_files)
     logging.debug(f"Processing files from index {start_index} to {end_index}.")
+    # ---------------------
 
     for file in xyz_files[start_index:end_index]:
         time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_name = (
-            f"{os.path.splitext(os.path.basename(file))[0]}_{rank}_{time_stamp}"
-        )
-        logging.info(f"Processing file: {file}")
+        base_name = os.path.splitext(os.path.basename(file))[0]
+        unique_name = f"{base_name}_{rank}_{time_stamp}"
+        logging.info(f"Processing file: {file} with unique ID: {unique_name}")
 
         # Read input
         try:
-            if os.path.isfile(file):
-                atoms = get_atoms_from_xyz(file)
-            else:
-                # Assume input is SMILES string
-                from iqc.asetools import get_rdmol_from_smiles, ase2rdkit2
-
-                rdmol = get_rdmol_from_smiles(file, optimize=True)
-                atoms = ase2rdkit2(rdmol)
+            atoms = get_atoms_from_xyz(file)
         except ValueError as e:
-            logging.error(
-                f"Rank {rank} encountered an error reading file {file}: {e}. Skipping this file."
-            )
-            continue  # Skip to the next file
+            logging.error(f"Error reading file {file}: {e}. Skipping.")
+            continue
         except Exception as e:
-            logging.error(
-                f"Rank {rank} encountered an unexpected error processing file {file}: {e}. Skipping this file."
-            )
-            continue  # Skip to the next file
+            logging.error(f"Unexpected error processing file {file}: {e}. Skipping.")
+            continue
 
         results = {
             "xyz_file": file,
@@ -193,36 +210,55 @@ def main():
         }
 
         try:
-            # Run calculation based on task using the selected calculator
+            # Run calculation based on task using the selected calculator and parameters
             if args.task == "single":
                 atoms, task_results = run_single_point(
                     atoms=atoms, calculator=calculator, unique_name=unique_name
                 )
             elif args.task == "opt":
+                # Pass optimization parameters from file
                 atoms, task_results = run_optimization(
-                    atoms=atoms, calculator=calculator, unique_name=unique_name
+                    atoms=atoms,
+                    calculator=calculator,
+                    unique_name=unique_name,
+                    **opt_params,
                 )
             elif args.task == "vib":
+                # Pass vibration parameters if added to config later
+                # vib_params = params.get('vibration_params', {})
                 atoms, task_results = run_vibrations(
-                    atoms=atoms, calculator=calculator, unique_name=unique_name
+                    atoms=atoms,
+                    calculator=calculator,
+                    unique_name=unique_name,
+                    # **vib_params
                 )
             else:  # thermo
+                # Pass optimization and thermo parameters
+                # thermo_params = params.get('thermo_params', {})
+                # Decide priority for ignore_imag: CLI flag or param file?
+                # Here, CLI flag takes precedence if set.
+                ignore_imag = (
+                    args.ignore_imag
+                )  # or thermo_params.get('ignore_imag_modes', args.ignore_imag)
                 atoms, task_results = run_thermo(
-                    atoms=atoms, calculator=calculator, unique_name=unique_name
+                    atoms=atoms,
+                    calculator=calculator,
+                    unique_name=unique_name,
+                    ignore_imag_modes=ignore_imag,
+                    **opt_params,  # Pass opt_params to run_thermo
                 )
 
-            for key, val in task_results.items():
-                results[key] = val
-            logging.debug(
-                f"Rank {rank} completed {args.task} calculations for file: {file}"
-            )
+            # Merge task results into main results dict
+            results.update(task_results)
+            logging.debug(f"Completed {args.task} calculations for file: {file}")
         except Exception as e:
             results[f"{args.task}_error"] = str(e)
-            logging.error(f"Rank {rank} encountered an error: {e}")
+            logging.error(f"Task '{args.task}' failed for {file}: {e}", exc_info=True)
 
         # Save results
-        output_file = f"{unique_name}_{args.task}_{time_stamp}.json"
+        output_file = f"{base_name}_{args.task}_{time_stamp}_{rank}.json"
         save_results(results, output_file)
+        logging.info(f"Results saved to {output_file}")
 
 
 if __name__ == "__main__":
