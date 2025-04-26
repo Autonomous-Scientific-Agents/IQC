@@ -1,0 +1,32 @@
+# Example IQC Configuration File
+
+# --- Calculator Settings ---
+# Specify the calculator name ('mace', 'xtb', 'emt')
+calculator: mace
+
+# Parameters specific to the chosen calculator
+calculator_params:
+  model: small          # For MACE: 'small', 'medium', 'large'
+  dispersion: False      # For MACE: Use dispersion correction (requires DFTD4)
+  default_dtype: float64 # For MACE: Precision ('float32' or 'float64')
+  device: cpu           # For MACE: 'cpu' or 'cuda'
+  # method: GFN2-xTB    # For XTB: e.g., 'GFN2-xTB', 'GFN1-xTB'
+  # accuracy: 0.5       # For XTB: Lower values are more accurate
+
+# --- Optimization Settings ---
+# Parameters passed to the ASE optimizer (e.g., BFGS)
+optimization_params:
+  fmax: 0.0001       # Convergence criterion: Max force [eV/Angstrom]
+  max_steps: 500    # Maximum number of optimization steps
+  # trajectory: opt.traj # Optional: File to save optimization trajectory
+  # logfile: opt.log     # Optional: File to log optimizer steps
+
+# --- Thermochemistry Settings (Example) ---
+# Parameters specific to the thermo task
+# thermo_params:
+#  ignore_imag_modes: false # Overrides --ignore-imag CLI flag if needed (current logic uses CLI flag)
+
+# --- Vibration Settings (Example) ---
+# Parameters specific to the vib task
+# vibration_params:
+#  delta: 0.005      # Finite difference step size
