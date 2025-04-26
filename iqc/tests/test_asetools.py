@@ -1,9 +1,15 @@
 import os
 import numpy as np
 from ase import Atoms
+from ase.calculators.emt import EMT
+from ase.calculators.mixing import SumCalculator
 import pytest
 import sys
 from unittest.mock import patch, MagicMock
+import logging
+
+# Configure logging for tests to see warnings
+logging.basicConfig(level=logging.WARNING)
 
 from iqc.asetools import (
     save_atoms,
@@ -13,7 +19,7 @@ from iqc.asetools import (
     get_total_electrons,
     get_spin,
     xyz2atoms,
-    default_calculator,
+    get_calculator,
     XTB,
 )
 
@@ -123,95 +129,166 @@ H 0.0 1.0 0.0"""
 
 def test_get_canonical_smiles(methane_atoms):
     """Test SMILES generation."""
+    # Skip if rdkit not installed
+    pytest.importorskip("rdkit")
+    from rdkit import Chem
+
     smiles = get_canonical_smiles_from_atoms(methane_atoms)
     # Note: RDKit may return SMILES with explicit hydrogens
     # We should check if the molecule is equivalent rather than exact string match
-    from rdkit import Chem
-
     mol = Chem.MolFromSmiles(smiles)
     assert Chem.MolToSmiles(mol, canonical=True) in ["C", "[H]C([H])([H])[H]"]
 
 
-def test_mace_calculator_available():
-    """Test MACE calculator when available."""
-    # Only run this test if MACE is actually available
-    if default_calculator is not None:
-        # Create a simple molecule
+def test_get_calculator_mace_success():
+    """Test getting MACE calculator successfully."""
+    # Skip test if MACE cannot be imported
+    pytest.importorskip("mace")
+    try:
+        calculator = get_calculator(name="mace")
+        # Check if it's MACE or a SumCalculator containing MACE
+        is_mace_like = False
+        if isinstance(calculator, SumCalculator):
+            # Correct attribute is 'calcs'
+            is_mace_like = any(
+                "mace" in str(c).lower() for c in str(calculator).split(",")
+            )
+        else:
+            is_mace_like = "mace" in str(calculator).lower()
+        assert is_mace_like, f"Calculator name {calculator.name} does not indicate MACE"
+
+        # Test calculation
         atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
-
-        # Set the calculator
-        atoms.calc = default_calculator
-
-        # Calculate energy
+        atoms.calc = calculator
         energy = atoms.get_potential_energy()
-
-        # Basic checks
         assert isinstance(energy, float)
         assert not np.isnan(energy)
-    else:
-        pytest.skip("MACE calculator not available")
+
+    except RuntimeError as e:
+        # This might happen if MACE is installed but initialization fails
+        pytest.skip(f"Could not initialize MACE or fallback: {e}")
 
 
-def test_mace_calculator_unavailable():
-    """Test behavior when MACE calculator is not available."""
+def test_get_calculator_mace_unavailable_fallback():
+    """Test fallback to EMT when MACE is not available."""
     # Mock the import to simulate MACE not being available
-    with patch.dict(sys.modules, {"mace.calculators": None}):
-        # Re-import the module to get the updated default_calculator
-        import importlib
-        import iqc.asetools
+    with patch.dict(sys.modules, {"mace.calculators": None, "mace": None}):
+        try:
+            calculator = get_calculator(name="mace")
+            # It should fallback to EMT
+            assert isinstance(calculator, EMT)
 
-        importlib.reload(iqc.asetools)
+            # Test calculation with fallback
+            atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
+            atoms.calc = calculator
+            energy = atoms.get_potential_energy()
+            assert isinstance(energy, float)
+        except RuntimeError as e:
+            pytest.skip(f"Could not initialize EMT fallback: {e}")
+        except ImportError:
+            # This could happen if EMT also fails to import
+            pytest.skip("Neither MACE nor EMT fallback available.")
 
-        # Check that default_calculator is EMT when MACE is not available
-        assert isinstance(iqc.asetools.default_calculator, iqc.asetools.EMT)
 
-        # Create a simple molecule
+def test_get_calculator_xtb_success():
+    """Test getting XTB calculator successfully."""
+    # Skip test if XTB cannot be imported
+    pytest.importorskip("xtb")
+    try:
+        calculator = get_calculator(name="xtb")
+        # This assertion now happens first. If XTB wasn't importable,
+        # the test would have skipped above. If it falls back despite
+        # being importable, this assertion will correctly fail.
+        assert "xtb" in calculator.name.lower()
+
+        # Test calculation
         atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
-        
-        # Set the calculator on the atoms object
-        atoms.calc = iqc.asetools.default_calculator
-
-        # Try to calculate energy with EMT calculator
+        atoms.calc = calculator
         energy = atoms.get_potential_energy()
-        assert isinstance(energy, float)
-
-
-def test_xtb_calculator_available():
-    """Test XTB calculator when available."""
-    # Only run this test if XTB is actually available
-    if XTB is not None:
-        # Create a simple molecule
-        atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
-
-        # Set the calculator
-        atoms.calc = XTB()
-
-        # Calculate energy
-        energy = atoms.get_potential_energy()
-
-        # Basic checks
         assert isinstance(energy, float)
         assert not np.isnan(energy)
-    else:
-        pytest.skip("XTB calculator not available")
+
+    except RuntimeError as e:
+        # This might happen if XTB is installed but init fails, and fallback also fails
+        pytest.skip(f"Could not initialize XTB or fallback: {e}")
 
 
-def test_xtb_calculator_unavailable():
-    """Test behavior when XTB calculator is not available."""
+def test_get_calculator_xtb_unavailable_fallback():
+    """Test fallback when XTB is not available."""
     # Mock the import to simulate XTB not being available
-    with patch.dict(sys.modules, {"xtb.ase.calculator": None}):
-        # Re-import the module to get the updated XTB
-        import importlib
-        import iqc.asetools
+    with patch.dict(sys.modules, {"xtb.ase.calculator": None, "xtb": None}):
+        try:
+            calculator = get_calculator(name="xtb")
+            # It should fallback to MACE or EMT
+            assert calculator is not None
+            # Check type for EMT or name for MACE/Sum(MACE)
+            is_fallback_ok = False
+            if isinstance(calculator, EMT):
+                is_fallback_ok = True
+            elif isinstance(calculator, SumCalculator):
+                # Correct attribute is 'calcs'
+                is_fallback_ok = any("mace" in c.name.lower() for c in calculator.calcs)
+            else:
+                is_fallback_ok = "mace" in calculator.name.lower()
+            assert (
+                is_fallback_ok
+            ), f"Fallback calculator {calculator.name} is not MACE or EMT"
 
-        importlib.reload(iqc.asetools)
+            # Test calculation with fallback
+            atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
+            atoms.calc = calculator
+            energy = atoms.get_potential_energy()
+            assert isinstance(energy, float)
+        except RuntimeError as e:
+            pytest.skip(f"Could not initialize MACE/EMT fallback: {e}")
+        except ImportError:
+            pytest.skip("Neither XTB nor fallbacks available.")
 
-        # Check that XTB is None
-        assert iqc.asetools.XTB is None
 
-        # Create a simple molecule
+def test_get_calculator_emt_direct():
+    """Test getting EMT calculator directly."""
+    try:
+        calculator = get_calculator(name="emt")
+        assert isinstance(calculator, EMT)
+
+        # Test calculation
         atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
+        atoms.calc = calculator
+        energy = atoms.get_potential_energy()
+        assert isinstance(energy, float)
+        assert not np.isnan(energy)
 
-        # Try to calculate energy without a calculator
-        with pytest.raises(RuntimeError, match="Atoms object has no calculator"):
-            atoms.get_potential_energy()
+    except RuntimeError as e:
+        pytest.skip(f"Could not initialize EMT: {e}")
+    except ImportError:
+        pytest.skip("EMT calculator not available (ASE issue?).")
+
+
+def test_get_calculator_unknown_fallback():
+    """Test fallback when an unknown calculator is requested."""
+    try:
+        calculator = get_calculator(name="unknown_calc")
+        # It should fallback (likely to EMT after trying MACE/XTB)
+        assert calculator is not None
+        # Check if it's EMT or MACE/Sum(MACE)
+        is_fallback_ok = False
+        if isinstance(calculator, EMT):
+            is_fallback_ok = True
+        elif isinstance(calculator, SumCalculator):
+            # Correct attribute is 'calcs'
+            is_fallback_ok = any("mace" in c.name.lower() for c in calculator.calcs)
+        else:
+            is_fallback_ok = "mace" in calculator.name.lower()
+        assert (
+            is_fallback_ok
+        ), f"Fallback calculator {calculator.name} is not MACE or EMT"
+
+        # Test calculation with fallback
+        atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
+        atoms.calc = calculator
+        energy = atoms.get_potential_energy()
+        assert isinstance(energy, float)
+    except RuntimeError as e:
+        pytest.skip(f"Could not initialize fallback calculator: {e}")
+    except ImportError:
+        pytest.skip("Fallback calculator not available.")

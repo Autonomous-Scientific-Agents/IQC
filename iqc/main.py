@@ -22,13 +22,27 @@ from iqc.asetools import (
 from iqc.cli import get_args
 from iqc.mpitools import get_start_end
 
+
 class ComplexEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, complex):
             return {"real": obj.real, "imag": obj.imag}
-        elif isinstance(obj, (np.int_, np.intc, np.intp, np.int8,
-                            np.int16, np.int32, np.int64, np.uint8,
-                            np.uint16, np.uint32, np.uint64)):
+        elif isinstance(
+            obj,
+            (
+                np.int_,
+                np.intc,
+                np.intp,
+                np.int8,
+                np.int16,
+                np.int32,
+                np.int64,
+                np.uint8,
+                np.uint16,
+                np.uint32,
+                np.uint64,
+            ),
+        ):
             return int(obj)
         elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
             return float(obj)
@@ -39,6 +53,7 @@ class ComplexEncoder(json.JSONEncoder):
         elif hasattr(obj, "item"):  # Handle other numpy types
             return obj.item()
         return super().default(obj)
+
 
 def save_results(results, output_file):
     """Save results to file with fallback options."""
@@ -64,6 +79,7 @@ def save_results(results, output_file):
                     f.write(f"{key}: {value}\n")
             logging.info(f"Results saved to {txt_file} in text format")
 
+
 def main():
     """Main function."""
     # Initialize MPI
@@ -80,8 +96,8 @@ def main():
         calculator = get_calculator(name=args.calculator)
     except RuntimeError as e:
         logging.error(f"Failed to initialize calculator: {e}")
-        comm.Abort(1) # Abort MPI if calculator fails
-        sys.exit(1)   # Exit if not running under MPI
+        comm.Abort(1)  # Abort MPI if calculator fails
+        sys.exit(1)  # Exit if not running under MPI
 
     # Set up logging (after calculator init which might log warnings)
     # Get the root logger instance
@@ -93,25 +109,29 @@ def main():
     logger.setLevel(log_level)
 
     # Define the desired formatter
-    formatter = logging.Formatter("IQC %(levelname)s: %(asctime)s - Rank %(mpi_rank)s - %(message)s")
-    
+    formatter = logging.Formatter(
+        "IQC %(levelname)s: %(asctime)s - Rank %(mpi_rank)s - %(message)s"
+    )
+
     # Ensure at least one handler is configured and set the formatter
     if not logger.hasHandlers():
         # If no handlers exist, create a default StreamHandler
-        handler = logging.StreamHandler(sys.stdout) # Log to stdout
-        handler.setFormatter(formatter) # Apply formatter to the new handler
+        handler = logging.StreamHandler(sys.stdout)  # Log to stdout
+        handler.setFormatter(formatter)  # Apply formatter to the new handler
         logger.addHandler(handler)
     else:
         # If handlers already exist, apply the formatter to all of them
         for handler in logger.handlers:
             handler.setFormatter(formatter)
-    
+
     # Add MPI rank to the log record attributes for the formatter
     old_factory = logging.getLogRecordFactory()
+
     def record_factory(*args, **kwargs):
         record = old_factory(*args, **kwargs)
-        record.mpi_rank = rank # Add rank info
+        record.mpi_rank = rank  # Add rank info
         return record
+
     logging.setLogRecordFactory(record_factory)
 
     logging.debug(f"Number of MPI ranks: {size}.")
@@ -134,9 +154,7 @@ def main():
         raise FileNotFoundError(f"No .xyz files found in directory: {args.xyz}")
 
     start_index, end_index = get_start_end(comm, number_of_files)
-    logging.debug(
-        f"Processing files from index {start_index} to {end_index}."
-    )
+    logging.debug(f"Processing files from index {start_index} to {end_index}.")
 
     for file in xyz_files[start_index:end_index]:
         time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -144,7 +162,7 @@ def main():
             f"{os.path.splitext(os.path.basename(file))[0]}_{rank}_{time_stamp}"
         )
         logging.info(f"Processing file: {file}")
-        
+
         # Read input
         try:
             if os.path.isfile(file):
@@ -152,14 +170,19 @@ def main():
             else:
                 # Assume input is SMILES string
                 from iqc.asetools import get_rdmol_from_smiles, ase2rdkit2
+
                 rdmol = get_rdmol_from_smiles(file, optimize=True)
                 atoms = ase2rdkit2(rdmol)
         except ValueError as e:
-            logging.error(f"Rank {rank} encountered an error reading file {file}: {e}. Skipping this file.")
+            logging.error(
+                f"Rank {rank} encountered an error reading file {file}: {e}. Skipping this file."
+            )
             continue  # Skip to the next file
         except Exception as e:
-            logging.error(f"Rank {rank} encountered an unexpected error processing file {file}: {e}. Skipping this file.")
-            continue # Skip to the next file
+            logging.error(
+                f"Rank {rank} encountered an unexpected error processing file {file}: {e}. Skipping this file."
+            )
+            continue  # Skip to the next file
 
         results = {
             "xyz_file": file,
@@ -172,17 +195,27 @@ def main():
         try:
             # Run calculation based on task using the selected calculator
             if args.task == "single":
-                atoms, task_results = run_single_point(atoms, calculator, unique_name)
+                atoms, task_results = run_single_point(
+                    atoms=atoms, calculator=calculator, unique_name=unique_name
+                )
             elif args.task == "opt":
-                atoms, task_results = run_optimization(atoms, calculator, unique_name)
+                atoms, task_results = run_optimization(
+                    atoms=atoms, calculator=calculator, unique_name=unique_name
+                )
             elif args.task == "vib":
-                atoms, task_results = run_vibrations(atoms, calculator, unique_name)
+                atoms, task_results = run_vibrations(
+                    atoms=atoms, calculator=calculator, unique_name=unique_name
+                )
             else:  # thermo
-                atoms, task_results = run_thermo(atoms, calculator, unique_name)
-            
+                atoms, task_results = run_thermo(
+                    atoms=atoms, calculator=calculator, unique_name=unique_name
+                )
+
             for key, val in task_results.items():
                 results[key] = val
-            logging.debug(f"Rank {rank} completed {args.task} calculations for file: {file}")
+            logging.debug(
+                f"Rank {rank} completed {args.task} calculations for file: {file}"
+            )
         except Exception as e:
             results[f"{args.task}_error"] = str(e)
             logging.error(f"Rank {rank} encountered an error: {e}")
@@ -190,6 +223,7 @@ def main():
         # Save results
         output_file = f"{unique_name}_{args.task}_{time_stamp}.json"
         save_results(results, output_file)
+
 
 if __name__ == "__main__":
     main()

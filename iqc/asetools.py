@@ -3,14 +3,6 @@ import logging
 import os
 import time
 from datetime import datetime
-
-# Library modules should not configure logging.
-# Let the main application handle configuration.
-# # Configure logging first
-# logging.basicConfig(
-#     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-# )
-
 import numpy as np
 from ase import Atoms, build
 from ase.calculators.emt import EMT
@@ -31,36 +23,6 @@ except ImportError:
         "XTB calculator not available. Install with 'pip install xtb' if you need quantum chemistry calculations with XTB."
     )
 
-default_calculator = None
-try:
-    from mace.calculators import mace_mp
-
-    try:
-        default_calculator = mace_mp(
-            model="medium", dispersion=True, default_dtype="float32", device="cpu"
-        )
-    except RuntimeError as e:
-        logging.warning(
-            f"MACE calculator initialization failed: {str(e)}. Install required dependencies if you need MACE calculations."
-        )
-        default_calculator = None
-except ImportError:
-    logging.warning(
-        "MACE calculator not available. Install with 'pip install mace' if you need machine learning-based quantum chemistry calculations."
-    )
-
-# Fallback to EMT if no other calculator is available
-if default_calculator is None:
-    try:
-        from ase.calculators.emt import EMT
-
-        default_calculator = EMT()
-        logging.info("Using EMT calculator as default.")
-    except ImportError:
-        logging.warning(
-            "No calculator available. Please install at least one of: mace, xtb, or ase[calculators]"
-        )
-
 
 def get_calculator(name="mace", **kwargs):
     """Initializes and returns the specified ASE calculator.
@@ -76,57 +38,85 @@ def get_calculator(name="mace", **kwargs):
     """
     name = name.lower()
     calculator = None
-    
+
     if name == "mace":
         try:
             from mace.calculators import mace_mp
+
             mace_kwargs = {
                 "model": "medium",
                 "dispersion": True,
-                "default_dtype": "float32",
+                "default_dtype": "float64",
                 "device": "cpu",
-                **kwargs
+                **kwargs,
             }
-            calculator = mace_mp(**mace_kwargs)
-            logging.info(f"Using MACE calculator with arguments: {mace_kwargs}")
+            try:
+                # Attempt with specified/default dispersion
+                calculator = mace_mp(**mace_kwargs)
+                logging.info(f"Using MACE calculator with arguments: {mace_kwargs}")
+            except Exception as e:
+                # Try without dispersion if the first attempt failed
+                logging.warning(
+                    f"Failed to initialize MACE with dispersion={mace_kwargs.get('dispersion')}: {str(e)}. Trying with dispersion=False."
+                )
+                mace_kwargs["dispersion"] = False
+                calculator = mace_mp(**mace_kwargs)
+                logging.info(f"Using MACE calculator with arguments: {mace_kwargs}")
         except ImportError:
-            logging.warning("MACE not found. Install with 'pip install mace'. Falling back to EMT.")
+            logging.warning(
+                "MACE not found. Install with 'pip install mace'. Falling back to EMT."
+            )
         except RuntimeError as e:
             logging.warning(f"MACE initialization failed: {e}. Falling back to EMT.")
-            
+
     elif name == "xtb":
         try:
             from xtb.ase.calculator import XTB
+
             xtb_kwargs = {"method": "GFN2-xTB", **kwargs}
             calculator = XTB(**xtb_kwargs)
             logging.info(f"Using XTB calculator with arguments: {xtb_kwargs}")
         except ImportError:
-            logging.warning("XTB not found. Install with 'pip install xtb-python'. Falling back to EMT.")
+            logging.warning(
+                "XTB not found. Install with 'pip install xtb-python'. Falling back to EMT."
+            )
         except Exception as e:
             logging.warning(f"XTB initialization failed: {e}. Falling back to EMT.")
-            
+
     elif name == "emt":
         try:
             from ase.calculators.emt import EMT
+
             calculator = EMT(**kwargs)
             logging.info(f"Using EMT calculator with arguments: {kwargs}")
         except ImportError:
-            logging.warning("EMT not found, but it's usually built-in with ASE. Problem with ASE install? Returning None.")
-            return None # Should not happen if ASE is installed
-            
+            # This case should ideally not happen if ASE is installed correctly
+            logging.warning(
+                "EMT not found, but it's usually built-in with ASE. Problem with ASE install? Returning None."
+            )
+            return None
+
     else:
         logging.warning(f"Unknown calculator '{name}'. Falling back to EMT.")
 
     # Fallback to EMT if the requested calculator failed or was unknown
     if calculator is None:
+        logging.warning(
+            f"Calculator '{name}' failed or not found. Attempting fallback to EMT."
+        )
         try:
             from ase.calculators.emt import EMT
+
             calculator = EMT()
             logging.info("Using EMT calculator as fallback.")
         except ImportError:
-            logging.error("Fallback EMT calculator could not be imported. No calculator available.")
-            raise RuntimeError("No suitable ASE calculator found or could be initialized.")
-            
+            logging.error(
+                "Fallback EMT calculator could not be imported. No calculator available."
+            )
+            raise RuntimeError(
+                "No suitable ASE calculator found or could be initialized."
+            )
+
     return calculator
 
 
@@ -769,13 +759,14 @@ def get_inchikey(atoms):
 atoms2inchikey = get_inchikey
 
 
-def _prepare_calculation(atoms, calculator, unique_name=""):
+def _prepare_calculation(atoms, calculator=None, unique_name=""):
     """
     Prepare atoms and calculator for a calculation.
 
     Args:
         atoms (ase.Atoms): ASE Atoms object
         calculator (ase.calculators.calculator.Calculator): The calculator instance to use.
+                                                            If None, get_calculator() is called.
         unique_name (str): Unique name for the molecule
 
     Returns:
@@ -784,8 +775,14 @@ def _prepare_calculation(atoms, calculator, unique_name=""):
     if unique_name == "":
         unique_name = get_inchikey(atoms)
 
+    # Get calculator if not provided
     if calculator is None:
-        raise ValueError("Calculator cannot be None.")
+        logging.debug("No calculator provided, getting default.")
+        calculator = get_calculator()
+
+    if calculator is None:
+        # This should not happen if get_calculator raises RuntimeError correctly
+        raise ValueError("Failed to obtain a valid calculator.")
 
     calc = calculator
 
@@ -802,7 +799,11 @@ def _prepare_calculation(atoms, calculator, unique_name=""):
 
     # Set calculator and get initial energy
     atoms.calc = calc
-    initial_energy = atoms.get_potential_energy()
+    try:
+        initial_energy = atoms.get_potential_energy()
+    except Exception as e:
+        logging.error(f"Failed to get initial potential energy with {calc.name}: {e}")
+        raise
 
     # Prepare results dictionary
     results = {
@@ -816,6 +817,7 @@ def _prepare_calculation(atoms, calculator, unique_name=""):
         "initial_sym_number": initial_sym_number,
         "initial_energy_eV": initial_energy,
         "error": None,
+        "calculator_name": calc.name,
     }
 
     return calc, results
@@ -823,7 +825,7 @@ def _prepare_calculation(atoms, calculator, unique_name=""):
 
 def run_single_point(
     atoms,
-    calculator,
+    calculator=None,
     unique_name="",
 ):
     """
@@ -831,20 +833,21 @@ def run_single_point(
 
     Args:
         atoms (ase.Atoms): ASE Atoms object
-        calculator (ase.calculators.calculator.Calculator): Calculator instance.
+        calculator (ase.calculators.calculator.Calculator, optional): Calculator instance. Defaults to None (uses get_calculator).
         unique_name (str): Unique name for the molecule
 
     Returns:
         tuple: A tuple containing the atoms and a dictionary with calculated properties
     """
-    logging.debug(f"Starting single point energy calculation")
+    logging.info(f"Starting single point calculation for {unique_name}")
 
     calc, results = _prepare_calculation(atoms, calculator, unique_name)
     error = None
 
     try:
         start_time = time.time()
-        energy = atoms.get_potential_energy()
+        # Energy is already calculated in _prepare_calculation
+        energy = results["initial_energy_eV"]
         forces = atoms.get_forces()
         results["calc_time"] = (time.time() - start_time) * 1000
         results["energy_eV"] = energy
@@ -857,12 +860,13 @@ def run_single_point(
         results["error"] = error
         logging.error(error)
 
+    logging.info(f"Single point calculation for {unique_name} completed")
     return atoms, results
 
 
 def run_vibrations(
     atoms,
-    calculator,
+    calculator=None,
     unique_name="",
     indices=None,
     delta=0.01,
@@ -872,7 +876,7 @@ def run_vibrations(
 
     Args:
         atoms (ase.Atoms): ASE Atoms object
-        calculator (ase.calculators.calculator.Calculator): Calculator instance.
+        calculator (ase.calculators.calculator.Calculator, optional): Calculator instance. Defaults to None (uses get_calculator).
         unique_name (str): Unique name for the molecule
         indices (list): List of atom indices to include in vibration calculation
         delta (float): Displacement for finite difference calculation
@@ -880,22 +884,46 @@ def run_vibrations(
     Returns:
         tuple: A tuple containing the atoms and a dictionary with calculated properties
     """
-    logging.info(f"Starting vibrational analysis for {unique_name} with {calculator.name}")
-
     calc, results = _prepare_calculation(atoms, calculator, unique_name)
+    logging.info(f"Starting vibrational analysis for {unique_name} with {calc.name}")
     error = None
 
     try:
         start_time = time.time()
         vib = Vibrations(atoms, name=f"vib_{unique_name}", indices=indices, delta=delta)
         vib.run()
+        vib_data = vib.get_vibrations()  # Get the VibrationsData object
         results["vib_time"] = (time.time() - start_time) * 1000
-        results["frequencies_cm^-1"] = vib.get_frequencies().tolist()
-        results["modes"] = vib.get_modes().tolist()
-        results["number_of_imaginary"] = len(
-            [f for f in results["frequencies_cm^-1"] if f < 0]
+
+        # Get frequencies and energies from vib_data
+        frequencies = vib_data.get_frequencies()  # cm^-1
+        vib_energies = vib_data.get_energies()  # eV
+
+        results["frequencies_cm^-1"] = (
+            frequencies.tolist() if hasattr(frequencies, "tolist") else frequencies
         )
+        results["vib_energies"] = (
+            vib_energies.tolist() if hasattr(vib_energies, "tolist") else vib_energies
+        )  # Store energies for thermo
+
+        # We don't store the raw modes as they are complex and large
+        results["modes"] = "Modes not saved (complex data)"
+
+        # Calculate number of imaginary frequencies
+        results["number_of_imaginary"] = len(
+            [
+                f
+                for f in results["frequencies_cm^-1"]
+                if isinstance(f, complex) or (isinstance(f, (int, float)) and f < 0)
+            ]
+        )
+
         logging.debug(f"Vibrational analysis completed in {results['vib_time']} ms")
+    except AttributeError as ae:
+        # Catch specific errors related to missing methods
+        error = f"Error accessing vibration data (possibly ASE version issue?): {ae}"
+        results["error"] = error
+        logging.error(error)
     except Exception as e:
         error = f"Error in vibrational analysis: {e}"
         results["error"] = error
@@ -907,19 +935,17 @@ def run_vibrations(
 
 def run_optimization(
     atoms,
-    calculator,
+    calculator=None,
     fmax=0.01,
     unique_name="",
     max_steps=200,
-    trajectory=None,
-    logfile=None,
 ):
     """
     Run geometry optimization for an ASE Atoms object.
 
     Args:
         atoms (ase.Atoms): ASE Atoms object
-        calculator (ase.calculators.calculator.Calculator): Calculator instance.
+        calculator (ase.calculators.calculator.Calculator, optional): Calculator instance. Defaults to None (uses get_calculator).
         fmax (float): Maximum force for geometry optimization
         unique_name (str): Unique name for the molecule
         max_steps (int): Maximum number of optimization steps
@@ -929,9 +955,8 @@ def run_optimization(
     Returns:
         tuple: A tuple containing the optimized atoms and a dictionary with calculated properties
     """
-    logging.info(f"Starting geometry optimization for {unique_name} with {calculator.name}")
-
     calc, results = _prepare_calculation(atoms, calculator, unique_name)
+    logging.info(f"Starting geometry optimization for {unique_name} with {calc.name}")
     error = None
 
     # Add optimization-specific fields
@@ -950,8 +975,14 @@ def run_optimization(
     )
 
     try:
+        # Ensure atoms positions and cell are float64 before optimization
+        # This can help prevent type mismatches within the optimizer
+        atoms.positions = atoms.positions.astype(np.float64)
+        if atoms.pbc.any():  # Check if periodic boundary conditions are set
+            atoms.cell = atoms.cell.astype(np.float64)
+
         start_time = time.time()
-        dyn = BFGS(atoms, trajectory=trajectory, logfile=logfile)
+        dyn = BFGS(atoms)
         converged = dyn.run(fmax=fmax, steps=max_steps)
         results["opt_time"] = (time.time() - start_time) * 1000
         results["opt_steps"] = dyn.get_number_of_steps()
@@ -960,8 +991,16 @@ def run_optimization(
         logging.debug(f"Optimization completed in {results['opt_time']} ms")
     except Exception as e:
         error = f"Error in optimization: {e}"
+        # Add more context to the error log
+        logging.error(
+            f"Optimization failed for {unique_name} using {calc.name}. Error: {e}"
+        )
+        if "did not contain a loop with signature matching types" in str(e):
+            logging.error(
+                "Potential type mismatch detected. Check calculator dtype and input geometry precision."
+            )
         results["error"] = error
-        logging.error(error)
+        # No need to log again here, already logged above
 
     if error is None:
         results["opt_smiles"] = atoms2smiles(atoms)
@@ -976,7 +1015,7 @@ def run_optimization(
 
 def run_thermo(
     atoms,
-    calculator,
+    calculator=None,
     fmax=0.01,
     ignore_imag_modes=True,
     unique_name="",
@@ -986,7 +1025,7 @@ def run_thermo(
 
     Args:
         atoms (ase.Atoms): ASE Atoms object
-        calculator (ase.calculators.calculator.Calculator): Calculator instance.
+        calculator (ase.calculators.calculator.Calculator, optional): Calculator instance. Defaults to None (uses get_calculator).
         fmax (float): Maximum force for geometry optimization
         ignore_imag_modes (bool): Whether to ignore imaginary vibrational modes
         unique_name (str): Unique name for the molecule
@@ -994,17 +1033,30 @@ def run_thermo(
     Returns:
         tuple: A tuple containing the thermochemistry results and a dictionary with calculated properties
     """
-    logging.info(f"Starting thermochemistry calculation for {unique_name} with {calculator.name}")
 
-    # First optimize the geometry
-    atoms, opt_results = run_optimization(atoms, calculator, fmax, unique_name)
+    # Get calculator first (will use default if None)
+    calc = get_calculator() if calculator is None else calculator
+    logging.info(
+        f"Starting thermochemistry calculation for {unique_name} with {calc.name}"
+    )
+
+    # First optimize the geometry using the obtained calculator
+    atoms, opt_results = run_optimization(
+        atoms, calculator=calc, fmax=fmax, unique_name=unique_name
+    )
     if opt_results["error"] is not None:
+        logging.error("Optimization failed, cannot proceed with thermochemistry.")
         return None, opt_results
 
-    # Then run vibrational analysis
-    atoms, vib_results = run_vibrations(atoms, calculator, unique_name)
+    # Then run vibrational analysis using the same calculator
+    atoms, vib_results = run_vibrations(atoms, calculator=calc, unique_name=unique_name)
     if vib_results["error"] is not None:
-        return None, vib_results
+        logging.error(
+            "Vibrational analysis failed, cannot proceed with thermochemistry."
+        )
+        # Combine results to show both opt and vib info, even if vib failed
+        results = {**opt_results, **vib_results}
+        return None, results
 
     # Combine results
     results = {**opt_results, **vib_results}
@@ -1012,13 +1064,22 @@ def run_thermo(
 
     try:
         start_time = time.time()
+        # Get energies directly from vib object (which uses the atoms object)
+        vib_energies = vib_results.get(
+            "vib_energies", None
+        )  # Assuming run_vibrations adds this
+        if vib_energies is None:
+            # Recalculate if needed, or use frequencies (less accurate for ZPE)
+            vib = Vibrations(atoms)  # Re-initialize if needed
+            vib_energies = vib.get_energies()  # eV
+
         thermo = IdealGasThermo(
-            vib_energies=vib_results["modes"],
+            vib_energies=vib_energies,
             geometry="nonlinear",
             atoms=atoms,
             potentialenergy=atoms.get_potential_energy(),
             spin=get_spin(atoms),
-            symmetrynumber=get_external_symmetry_factor(atoms),
+            symmetrynumber=results.get("opt_sym_number", 1),  # Use optimized symmetry
             ignore_imag_modes=ignore_imag_modes,
         )
         results["thermo_time"] = (time.time() - start_time) * 1000
