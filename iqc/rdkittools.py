@@ -32,22 +32,72 @@ def xyz_to_mol(
     Chem.Mol
     """
     mol = None
+
+    # Validate input
+    if not isinstance(xyz_text, str) or not xyz_text.strip():
+        print("Error: XYZ text must be a non-empty string")
+        return None
+
     try:
+        # Normalize line endings to avoid platform-specific issues
+        xyz_text = xyz_text.replace("\r\n", "\n").replace("\r", "\n")
+
+        # Ensure the XYZ text is properly formatted
+        lines = xyz_text.strip().split("\n")
+        if len(lines) < 2:
+            print("Error: XYZ text must have at least 2 lines")
+            return None
+
+        try:
+            # First line should be a number (atom count)
+            atom_count = int(lines[0].strip())
+            if atom_count <= 0:
+                print(f"Error: Invalid atom count: {atom_count}")
+                return None
+
+            # Verify we have the expected number of lines
+            # format: <atom count>\n<comment>\n<atom_1>\n...<atom_n>
+            if len(lines) < atom_count + 2:
+                print(
+                    f"Error: XYZ text has {len(lines)} lines, expected at least {atom_count + 2}"
+                )
+                return None
+        except ValueError:
+            print(f"Error: First line should be a valid integer, got: {lines[0]}")
+            return None
+
+        # Create the molecule from the XYZ block
         mol = Chem.MolFromXYZBlock(xyz_text)
+
     except Exception as e:
         print(f"Error converting XYZ to RDKit molecule: {e}")
         return None
+
+    if mol is None:
+        print("Error: RDKit failed to create molecule from XYZ block")
+        return None
+
     if determine_bonds:
-        rdDetermineBonds.DetermineBonds(mol, charge=charge)
+        try:
+            rdDetermineBonds.DetermineBonds(mol, charge=charge)
+        except Exception as e:
+            print(f"Error determining bonds: {e}")
+            # Continue even if bond determination fails
+
     if detect_problems:
-        problems = Chem.DetectChemistryProblems(mol)
-        if problems:
-            print(f"Problems with the molecule: {problems}")
+        try:
+            problems = Chem.DetectChemistryProblems(mol)
+            if problems:
+                print(f"Problems with the molecule: {problems}")
+        except Exception as e:
+            print(f"Error detecting chemistry problems: {e}")
+
     if sanitize:
         try:
             Chem.SanitizeMol(mol)
         except Exception as e:
             print(f"Error sanitizing RDKit molecule: {e}")
+
     return mol
 
 
@@ -94,7 +144,12 @@ def get_inchi(mol: Chem.Mol) -> str:
     return Chem.MolToInchi(mol)
 
 
-def get_smiles(mol: Chem.Mol, remove_hydrogens: bool = True, kekulize: bool = True, isomeric: bool = True) -> str:
+def get_smiles(
+    mol: Chem.Mol,
+    remove_hydrogens: bool = True,
+    kekulize: bool = True,
+    isomeric: bool = True,
+) -> str:
     """Get the SMILES of a molecule.
     Parameters
     ----------
