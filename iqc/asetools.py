@@ -569,30 +569,25 @@ def ase_atoms_to_tuple(atoms):
 atoms2tuple = ase_atoms_to_tuple
 
 
-def get_external_symmetry_factor(atoms):
+def get_symmetry_info(atoms):
     """
-    Calculate the external symmetry factor for an ASE Atoms object.
-    If automol is not available, returns a default value of 1.
+    Calculate symmetry information for an ASE Atoms object using pymatgen and spglib.
 
     Args:
         atoms (ase.Atoms): ASE Atoms object
 
     Returns:
-        int: External symmetry factor
+        tuple: (str, int): (Point group symbol, rotational symmetry number)
     """
-    try:
-        import automol
+    from pymatgen.symmetry.analyzer import PointGroupAnalyzer
+    from pymatgen.io.ase import AseAtomsAdaptor
 
-        geo = atoms2tuple(atoms)
-        return automol.geom.external_symmetry_factor(geo)
-    except ImportError:
-        logging.warning("automol module not found. Using default symmetry factor of 1.")
-        return 1
-    except Exception as e:
-        logging.warning(
-            f"Error calculating symmetry factor: {e}. Using default value of 1."
-        )
-        return 1
+    aaa = AseAtomsAdaptor()
+    molecule = aaa.get_molecule(atoms)
+    pga = PointGroupAnalyzer(molecule)
+    symmetrynumber = pga.get_rotational_symmetry_number()
+    pointgroup = pga.get_pointgroup()
+    return (pointgroup, symmetrynumber)
 
 
 def ase_to_rdkit_mol(atoms):
@@ -790,7 +785,7 @@ def _prepare_calculation(atoms, calculator=None, unique_name=""):
     initial_smiles = atoms2smiles(atoms)
     initial_xyz = atoms2xyz(atoms)
     try:
-        initial_sym_number = get_external_symmetry_factor(atoms)
+        initial_sym, initial_sym_number = get_symmetry_info(atoms)
     except Exception as e:
         logging.warning(
             f"Error getting symmetry number: {e}. Using default value of 1."
@@ -814,6 +809,7 @@ def _prepare_calculation(atoms, calculator=None, unique_name=""):
         "unique_name": unique_name,
         "initial_smiles": initial_smiles,
         "initial_xyz": initial_xyz,
+        "initial_symmetry": str(initial_sym),
         "initial_sym_number": initial_sym_number,
         "initial_energy_eV": initial_energy,
         "error": None,
@@ -909,12 +905,13 @@ def run_vibrations(
         # We don't store the raw modes as they are complex and large
         results["modes"] = "Modes not saved (complex data)"
 
-        # Calculate number of imaginary frequencies
+        # Calculate number of imaginary frequencies (negative real numbers)
+        # Ensure we are only checking real numbers (floats or ints)
         results["number_of_imaginary"] = len(
             [
                 f
                 for f in results["frequencies_cm^-1"]
-                if isinstance(f, complex) or (isinstance(f, (int, float)) and f < 0)
+                if isinstance(f, (float, int)) and f < 0.0
             ]
         )
 
@@ -939,6 +936,7 @@ def run_optimization(
     fmax=0.001,
     unique_name="",
     max_steps=500,
+    trajectory=None,
 ):
     """
     Run geometry optimization for an ASE Atoms object.
@@ -1003,12 +1001,13 @@ def run_optimization(
             )
         results["error"] = error
         # No need to log again here, already logged above
-
     if error is None:
+        opt_sym, opt_sym_number = get_symmetry_info(atoms)
         results["opt_smiles"] = atoms2smiles(atoms)
         results["opt_energy_eV"] = atoms.get_potential_energy()
         results["opt_xyz"] = atoms2xyz(atoms)
-        results["opt_sym_number"] = get_external_symmetry_factor(atoms)
+        results["opt_sym"] = str(opt_sym)
+        results["opt_sym_number"] = opt_sym_number
         results["smiles_changed"] = results["initial_smiles"] != results["opt_smiles"]
 
     logging.info(f"Geometry optimization for {unique_name} completed")
