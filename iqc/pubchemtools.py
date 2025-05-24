@@ -68,7 +68,7 @@ def get_iupac_name(cid: str) -> str:
     compound = get_compound_from_cid(cid)
     if compound and hasattr(compound, "iupac_name") and compound.iupac_name:
         return compound.iupac_name
-    return ""
+    return "Not available"
 
 
 def get_iupac_names(cids: Sequence[str]) -> List[str]:
