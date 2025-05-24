@@ -9,7 +9,6 @@ from pathlib import Path
 import yaml  # Import YAML
 
 import numpy as np
-from ase.io import read
 from mpi4py import MPI
 
 from iqc.asetools import (
@@ -20,6 +19,7 @@ from iqc.asetools import (
     get_atoms_from_xyz,
     get_calculator,
 )
+from iqc.xyztools import count_xyz_frames
 from iqc.cli import get_args
 from iqc.mpitools import get_start_end
 
@@ -138,7 +138,8 @@ def main():
     # Extract specific parameter sections, defaulting to empty dicts
     calc_params = params.get("calculator_params", {})
     opt_params = params.get("optimization_params", {})
-    # Example for future: thermo_params = params.get('thermo_params', {})
+    vib_params = params.get("vibration_params", {})
+    thermo_params = params.get("thermo_params", {})
 
     # Determine calculator name: CLI > Param file > Default ('mace')
     calculator_name = args.calculator or params.get("calculator", "mace")
@@ -151,58 +152,72 @@ def main():
         comm.Abort(1)
         sys.exit(1)
 
-    # --- File Processing --- (Remains mostly the same)
     if rank == 0:
         if os.path.isdir(args.xyz):
             xyz_dir = args.xyz
             xyz_files = glob.glob(os.path.join(xyz_dir, "*.xyz"))
+            number_of_xyz = len(xyz_files)
         elif os.path.isfile(args.xyz):
             xyz_files = [args.xyz]
+            try:
+                number_of_xyz = count_xyz_frames(args.xyz)
+            except Exception as e:
+                logging.error(f"Error counting .xyz files in {args.xyz}: {e}")
+                comm.Abort(1)
+                sys.exit(1)
         else:
             # Handle non-existent path before bcast
             logging.error(
                 f"Input path {args.xyz} does not exist or is not a file/directory."
             )
             xyz_files = []  # Ensure empty list is broadcast
-            # Optionally abort MPI here if input is critical
-            # comm.Abort(1)
-            # sys.exit(1)
+            comm.Abort(1)
+            sys.exit(1)
 
         number_of_files = len(xyz_files)
         if number_of_files == 0:
-            logging.warning(f"No .xyz files found in {args.xyz}. Exiting.")
+            logging.error(f"No .xyz files found in {args.xyz}. Exiting.")
+            comm.Abort(1)
+            sys.exit(1)
         else:
             logging.info(f"Found {number_of_files} .xyz file(s).")
+            logging.info(f"Number of configurations: {number_of_xyz}")
 
     xyz_files = comm.bcast(xyz_files if rank == 0 else None, root=0)
+    number_of_xyz = comm.bcast(number_of_xyz if rank == 0 else None, root=0)
     number_of_files = len(xyz_files)
-    if number_of_files == 0:
-        # All ranks should exit if no files
-        logging.info("No files to process. Exiting.")
-        sys.exit(0)
 
-    start_index, end_index = get_start_end(comm, number_of_files)
+    start_index, end_index = get_start_end(comm, number_of_xyz)
     logging.debug(f"Processing files from index {start_index} to {end_index}.")
     # ---------------------
 
-    for file in xyz_files[start_index:end_index]:
+    for xyz_index in range(start_index, end_index):
+        if number_of_files > 1:
+            xyz_file = xyz_files[xyz_index]
+        else:  # only one file
+            xyz_file = xyz_files[0]
         time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_name = os.path.splitext(os.path.basename(file))[0]
-        unique_name = f"{base_name}_{rank}_{time_stamp}"
-        logging.info(f"Processing file: {file} with unique ID: {unique_name}")
+        base_name = os.path.splitext(os.path.basename(xyz_file))[0]
+        unique_name = f"{base_name}_{xyz_index}_{rank}_{time_stamp}"
+        logging.info(f"Processing file: {xyz_file} with unique ID: {unique_name}")
 
         # Read input
         try:
-            atoms = get_atoms_from_xyz(file)
+            if number_of_files > 1:
+                atoms = get_atoms_from_xyz(xyz_file)
+            else:
+                atoms = get_atoms_from_xyz(xyz_file, index=xyz_index)
         except ValueError as e:
-            logging.error(f"Error reading file {file}: {e}. Skipping.")
+            logging.error(f"Error reading file {xyz_file}: {e}. Skipping.")
             continue
         except Exception as e:
-            logging.error(f"Unexpected error processing file {file}: {e}. Skipping.")
+            logging.error(
+                f"Unexpected error processing file {xyz_file}: {e}. Skipping."
+            )
             continue
 
         results = {
-            "xyz_file": file,
+            "xyz_file": xyz_file,
             "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "mpi_size": size,
             "mpi_rank": rank,
@@ -230,7 +245,8 @@ def main():
                     atoms=atoms,
                     calculator=calculator,
                     unique_name=unique_name,
-                    # **vib_params
+                    **opt_params,
+                    **vib_params,
                 )
             else:  # thermo
                 # Pass optimization and thermo parameters
@@ -245,20 +261,23 @@ def main():
                     calculator=calculator,
                     unique_name=unique_name,
                     ignore_imag_modes=ignore_imag,
-                    **opt_params,  # Pass opt_params to run_thermo
+                    **opt_params,
+                    **vib_params,
+                    **thermo_params,
                 )
 
             # Merge task results into main results dict
             results.update(task_results)
-            logging.debug(f"Completed {args.task} calculations for file: {file}")
+            logging.debug(f"Completed {args.task} calculations for file: {xyz_file}")
         except Exception as e:
             results[f"{args.task}_error"] = str(e)
-            logging.error(f"Task '{args.task}' failed for {file}: {e}", exc_info=True)
+            logging.error(
+                f"Task '{args.task}' failed for {xyz_file}: {e}", exc_info=True
+            )
 
         # Save results
         output_file = f"{base_name}_{args.task}_{time_stamp}_{rank}.json"
         save_results(results, output_file)
-        logging.info(f"Results saved to {output_file}")
 
 
 if __name__ == "__main__":
