@@ -13,6 +13,7 @@ from ase.vibrations import Vibrations
 from ase.visualize import view
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdmolops
+from io import StringIO
 
 # Optional dependencies with informative messages
 XTB = None
@@ -893,8 +894,9 @@ def run_vibrations(
 
         # Get frequencies and energies from vib_data
         frequencies = vib_data.get_frequencies()  # cm^-1
+        logging.debug(f"Frequencies in cm^-1: {frequencies}")
         vib_energies = vib_data.get_energies()  # eV
-
+        logging.debug(f"Vibrational energies in eV: {vib_energies}")
         results["frequencies_cm^-1"] = (
             frequencies.tolist() if hasattr(frequencies, "tolist") else frequencies
         )
@@ -902,20 +904,14 @@ def run_vibrations(
             vib_energies.tolist() if hasattr(vib_energies, "tolist") else vib_energies
         )  # Store energies for thermo
 
-        # We don't store the raw modes as they are complex and large
-        results["modes"] = "Modes not saved (complex data)"
-
         # Calculate number of imaginary frequencies (negative real numbers)
         # Ensure we are only checking real numbers (floats or ints)
         results["number_of_imaginary"] = len(
-            [
-                f
-                for f in results["frequencies_cm^-1"]
-                if isinstance(f, (float, int)) and f < 0.0
-            ]
+            [f for f in vib_energies if abs(f.imag) > 1.0e-8]
         )
 
         logging.debug(f"Vibrational analysis completed in {results['vib_time']} ms")
+        logging.debug(vib.summary())
     except AttributeError as ae:
         # Catch specific errors related to missing methods
         error = f"Error accessing vibration data (possibly ASE version issue?): {ae}"
@@ -1017,7 +1013,7 @@ def run_optimization(
 def run_thermo(
     atoms,
     calculator=None,
-    fmax=0.01,  # Keep fmax for direct call, but will be overwritten by opt_params
+    fmax=0.01,
     ignore_imag_modes=True,
     unique_name="",
     **opt_params,  # Accept optimization parameters
@@ -1073,6 +1069,7 @@ def run_thermo(
     # Combine results
     results = {**opt_results, **vib_results}
     error = None
+    thermo = None
 
     try:
         start_time = time.time()
@@ -1086,9 +1083,18 @@ def run_thermo(
             results["error"] = "Missing vibrational energies for thermochemistry."
             return None, results
 
+        # Check for imaginary frequencies if not ignoring them
+        if not ignore_imag_modes:
+            n_imag = vib_results.get("number_of_imaginary", 0)
+            if n_imag > 0:
+                error = f"Imaginary vibrational energies are present: ({n_imag} imaginary modes)."
+                results["error"] = error
+                logging.error(error)
+                return None, results
+
         thermo = IdealGasThermo(
             vib_energies=vib_energies,
-            geometry="nonlinear",
+            geometry=get_geometry_type(atoms),
             atoms=atoms,
             potentialenergy=atoms.get_potential_energy(),
             spin=get_spin(atoms),
@@ -1107,37 +1113,50 @@ def run_thermo(
         error = f"Error in thermochemistry calculations: {e}"
         results["error"] = error
         logging.error(error)
+        logging.error(
+            f"Number of imaginary modes: {vib_results.get('number_of_imaginary')}"
+        )
+        return None, results
 
     logging.info(f"Thermochemistry calculation for {unique_name} completed")
     return thermo, results
 
 
-def get_atoms_from_xyz(xyz, parallel=False):
+def get_atoms_from_xyz(xyz, parallel=False, index=-1):
     """
     Generate ASE Atoms object from XYZ input.
 
     Args:
         xyz (str): Either path to an XYZ file or XYZ content as string
-
+        parallel (bool): Whether to use parallel reading
+        index (int): Index of the configuration to read
     Returns:
         ase.Atoms: ASE Atoms object
     """
     logging.debug(f"Reading atoms from XYZ input: {xyz}")
-    # Check if input is a file path
     if os.path.isfile(xyz):
-        atoms = read(xyz, format="xyz", parallel=parallel)
+        atoms = read(xyz, format="xyz", parallel=parallel, index=index)
+    elif isinstance(xyz, str):
+        atoms = read(StringIO(xyz), format="xyz", parallel=parallel, index=index)
     else:
-        # Assume input is XYZ string content
-        # Create temporary file to use ASE's read functionality
-        import tempfile
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".xyz") as tmp:
-            tmp.write(xyz)
-            tmp.flush()
-            atoms = read(tmp.name, format="xyz", parallel=parallel)
-
+        logging.error(f"Invalid input type for ase.io.read: {type(xyz)}")
+        return None
     logging.debug(f"Successfully read atoms from {xyz}")
     return atoms
 
 
 xyz2atoms = get_atoms_from_xyz
+
+
+def get_geometry_type(atoms):
+    """Return the geometry type (monatomic, linear, nonlinear) of the atoms object"""
+    if len(atoms) == 1:
+        return "monatomic"
+    elif len(atoms) == 2:
+        return "linear"
+    else:
+        symmetry, symmetry_number = get_symmetry_info(atoms)
+        if "*" in symmetry:
+            return "linear"
+        else:
+            return "nonlinear"
