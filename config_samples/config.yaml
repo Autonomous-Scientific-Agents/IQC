@@ -21,12 +21,12 @@ optimization_params:
   # trajectory: opt.traj # Optional: File to save optimization trajectory
   # logfile: opt.log     # Optional: File to log optimizer steps
 
-# --- Thermochemistry Settings (Example) ---
-# Parameters specific to the thermo task
-# thermo_params:
-#  ignore_imag_modes: false # Overrides --ignore-imag CLI flag if needed (current logic uses CLI flag)
-
 # --- Vibration Settings (Example) ---
 # Parameters specific to the vib task
-# vibration_params:
-#  delta: 0.005      # Finite difference step size
+vibration_params:
+  delta: 0.005      # Finite difference step size
+
+# --- Thermochemistry Settings (Example) ---
+# Parameters specific to the thermo task
+thermo_params:
+ ignore_imag_modes: false # Overrides --ignore-imag CLI flag if needed (current logic uses CLI flag)
