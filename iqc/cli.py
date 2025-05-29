@@ -45,6 +45,18 @@ def get_args():
         help="Path for an .xyz file or a directory containing .xyz files",
     )
     parser.add_argument(
+        "--min-natom",
+        type=int,
+        default=None,
+        help="Minimum number of atoms for filtering molecules",
+    )
+    parser.add_argument(
+        "--max-natom",
+        type=int,
+        default=None,
+        help="Maximum number of atoms for filtering molecules",
+    )
+    parser.add_argument(
         "-t",
         "--task",
         type=str,
