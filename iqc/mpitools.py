@@ -4,7 +4,22 @@ import os
 
 def get_mpi_rank(comm=None):
     """
-    Return mpi rank (int) if defined as an environment variable
+    Return mpi rank (int) if defined as an environment variable.
+
+    Parameters
+    ----------
+    comm : MPI.Comm, optional
+        MPI communicator object, by default None
+
+    Returns
+    -------
+    int
+        The MPI rank of the current process
+
+    Raises
+    ------
+    TypeError
+        If comm is provided but not an MPI.Comm object
     """
     if comm is not None and not isinstance(comm, MPI.Comm):
         raise TypeError("comm must be an MPI communicator object")
@@ -22,7 +37,17 @@ def get_mpi_rank(comm=None):
 
 def get_mpi_size(default=1):
     """
-    Return mpi size (int) if defined as an environment variable
+    Return mpi size (int) if defined as an environment variable.
+
+    Parameters
+    ----------
+    default : int, optional
+        Default size to return if MPI is not available, by default 1
+
+    Returns
+    -------
+    int
+        The total number of MPI processes
     """
     if os.getenv("PMI_SIZE") is not None:
         size = int(os.getenv("PMI_SIZE"))
@@ -41,10 +66,26 @@ def get_mpi_size(default=1):
 
 def get_mpi_local_rank(default=0):
     """
-    Return mpi local rank as an integer if defined as an environment variable
-    https://www.open-mpi.org/faq/?category=running#mpi-environmental-variables
+    Return mpi local rank as an integer if defined as an environment variable.
+
     The relative rank of this process on this node within its job.
-    For example, if four processes in a job share a node, they will each be given a local rank ranging from 0 to 3.
+    For example, if four processes in a job share a node, they will each be given
+    a local rank ranging from 0 to 3.
+
+    Parameters
+    ----------
+    default : int, optional
+        Default rank to return if not in MPI environment, by default 0
+
+    Returns
+    -------
+    int
+        The local rank of the current process
+
+    Notes
+    -----
+    See https://www.open-mpi.org/faq/?category=running#mpi-environmental-variables
+    for more information about MPI environment variables.
     """
     if os.getenv("OMPI_COMM_WORLD_LOCAL_RANK") is not None:
         rank = int(os.getenv("OMPI_COMM_WORLD_LOCAL_RANK"))
@@ -55,9 +96,24 @@ def get_mpi_local_rank(default=0):
 
 def get_mpi_local_size(default=1):
     """
-    Return mpi local size as an integer if defined as an environment variable
-    https://www.open-mpi.org/faq/?category=running#mpi-environmental-variables
+    Return mpi local size as an integer if defined as an environment variable.
+
     The number of processes on this node within its job.
+
+    Parameters
+    ----------
+    default : int, optional
+        Default size to return if not in MPI environment, by default 1
+
+    Returns
+    -------
+    int
+        The number of processes on the current node
+
+    Notes
+    -----
+    See https://www.open-mpi.org/faq/?category=running#mpi-environmental-variables
+    for more information about MPI environment variables.
     """
     if os.getenv("OMPI_COMM_WORLD_LOCAL_SIZE") is not None:
         size = int(os.getenv("OMPI_COMM_WORLD_LOCAL_SIZE"))
@@ -69,7 +125,15 @@ def get_mpi_local_size(default=1):
 def get_ppn():
     """
     Return number of processors per node.
-    For alternative solutions:
+
+    Returns
+    -------
+    int
+        Number of CPUs available on the current node
+
+    Notes
+    -----
+    For alternative solutions, see:
     https://stackoverflow.com/questions/1006289/how-to-find-out-the-number-of-cpus-using-python
     """
     from os import cpu_count
@@ -79,7 +143,16 @@ def get_ppn():
 
 def get_total_memory():
     """
-    Return totol physical memory in MB as an integer.
+    Return total physical memory in MB as an integer.
+
+    Returns
+    -------
+    int
+        Total physical memory in megabytes (MB)
+
+    Notes
+    -----
+    Requires psutil package. If not available, returns 0 and logs a debug message.
     """
     m = 0
     try:
@@ -97,23 +170,23 @@ def get_total_memory():
 
 def get_start_end(comm, N):
     """
-    Distribute N consecutive items (rows of a matrix, blocks of a 1D array)
-    as evenly as possible over a given communicator.
+    Distribute N consecutive items as evenly as possible over a given communicator.
+
     Uneven workload (differs by at most 1) is assigned to the initial ranks.
 
     Parameters
     ----------
-    comm : MPI communicator
-        The MPI communicator.
+    comm : MPI.Comm
+        The MPI communicator
     N : int
-        Total number of items to be distributed.
+        Total number of items to be distributed
 
     Returns
     -------
     start_index : int
-        Index of the first local item.
+        Index of the first local item
     end_index : int
-        Index of the last local item (exclusive).
+        Index of the last local item (exclusive)
 
     Notes
     -----
