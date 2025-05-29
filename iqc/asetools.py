@@ -912,6 +912,7 @@ def run_vibrations(
 
         logging.debug(f"Vibrational analysis completed in {results['vib_time']} ms")
         logging.debug(vib.summary())
+        vib.clean()
     except AttributeError as ae:
         # Catch specific errors related to missing methods
         error = f"Error accessing vibration data (possibly ASE version issue?): {ae}"
