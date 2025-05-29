@@ -189,7 +189,6 @@ def main():
 
     start_index, end_index = get_start_end(comm, number_of_xyz)
     logging.debug(f"Processing files from index {start_index} to {end_index}.")
-    # ---------------------
 
     for xyz_index in range(start_index, end_index):
         if number_of_files > 1:
@@ -276,7 +275,7 @@ def main():
             )
 
         # Save results
-        output_file = f"{base_name}_{args.task}_{time_stamp}_{rank}.json"
+        output_file = f"{unique_name}_{args.task}_{time_stamp}_{rank}.json"
         save_results(results, output_file)
 
 
