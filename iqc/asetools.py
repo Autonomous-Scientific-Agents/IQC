@@ -1000,7 +1000,12 @@ def run_optimization(
         results["error"] = error
         # No need to log again here, already logged above
     if error is None:
-        opt_sym, opt_sym_number = get_symmetry_info(atoms)
+        try:
+            opt_sym, opt_sym_number = get_symmetry_info(atoms)
+        except Exception as e:
+            logging.error(f"Error getting symmetry info: {e}")
+            opt_sym = "C1"
+            opt_sym_number = 1
         results["opt_smiles"] = atoms2smiles(atoms)
         results["opt_energy_eV"] = atoms.get_potential_energy()
         results["opt_xyz"] = atoms2xyz(atoms)
