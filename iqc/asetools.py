@@ -791,6 +791,7 @@ def _prepare_calculation(atoms, calculator=None, unique_name=""):
         logging.warning(
             f"Error getting symmetry number: {e}. Using default value of 1."
         )
+        initial_sym = "C1"  # Default point group
         initial_sym_number = 1
 
     # Set calculator and get initial energy
