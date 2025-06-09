@@ -127,8 +127,9 @@ def main():
         except Exception as e:
             logging.error(f"Error loading parameters from {args.params}: {e}")
             # Decide if execution should stop if params file is bad
-            comm.Abort(1)
             sys.exit(1)
+            comm.Abort(1)
+
     elif args.params:
         if rank == 0:
             logging.warning(
@@ -150,7 +151,6 @@ def main():
     except RuntimeError as e:
         logging.error(f"Failed to initialize calculator '{calculator_name}': {e}")
         comm.Abort(1)
-        sys.exit(1)
 
     if rank == 0:
         if os.path.isdir(args.xyz):
@@ -164,7 +164,6 @@ def main():
             except Exception as e:
                 logging.error(f"Error counting .xyz files in {args.xyz}: {e}")
                 comm.Abort(1)
-                sys.exit(1)
         else:
             # Handle non-existent path before bcast
             logging.error(
@@ -172,13 +171,11 @@ def main():
             )
             xyz_files = []  # Ensure empty list is broadcast
             comm.Abort(1)
-            sys.exit(1)
 
         number_of_files = len(xyz_files)
         if number_of_files == 0:
             logging.error(f"No .xyz files found in {args.xyz}. Exiting.")
             comm.Abort(1)
-            sys.exit(1)
         else:
             logging.info(f"Found {number_of_files} .xyz file(s).")
             logging.info(f"Number of configurations: {number_of_xyz}")

@@ -161,10 +161,8 @@ def get_total_memory():
         mem = virtual_memory()  # In bytes
         m = mem.total >> 20  # Using bit shift to get in MB
         # m = mem.total >> 30 # Using bit shift to get in GB
-    except:
-        logging.debug(
-            "psutil not found! Cannot get memory information. You can install psutil with: \n pip install psutil"
-        )
+    except Exception as e:
+        print(f"Error getting total memory: {e}")
     return m
 
 
@@ -192,8 +190,8 @@ def get_start_end(comm, N):
     -----
     Indices are zero-based.
     """
-    total_processes = comm.size
-    rank = comm.rank
+    total_processes = get_mpi_size(comm)
+    rank = get_mpi_rank(comm)
 
     # Compute workload distribution
     items_per_process, remainder = divmod(N, total_processes)
