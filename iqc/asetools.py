@@ -840,7 +840,7 @@ def run_single_point(
     logging.info(f"Starting single point calculation for {unique_name}")
 
     calc, results = _prepare_calculation(atoms, calculator, unique_name)
-    error = None
+    error = ""
 
     try:
         start_time = time.time()
@@ -854,77 +854,11 @@ def run_single_point(
             f"Single point calculation completed in {results['calc_time']} ms"
         )
     except Exception as e:
-        error = f"Error in single point calculation: {e}"
-        results["error"] = error
+        error = f"Error in single point calculation: {e}\n"
+        results["error"] += error
         logging.error(error)
 
     logging.info(f"Single point calculation for {unique_name} completed")
-    return atoms, results
-
-
-def run_vibrations(
-    atoms,
-    calculator=None,
-    unique_name="",
-    indices=None,
-    delta=0.01,
-):
-    """
-    Run vibrational frequency calculations for an ASE Atoms object.
-
-    Args:
-        atoms (ase.Atoms): ASE Atoms object
-        calculator (ase.calculators.calculator.Calculator, optional): Calculator instance. Defaults to None (uses get_calculator).
-        unique_name (str): Unique name for the molecule
-        indices (list): List of atom indices to include in vibration calculation
-        delta (float): Displacement for finite difference calculation
-
-    Returns:
-        tuple: A tuple containing the atoms and a dictionary with calculated properties
-    """
-    calc, results = _prepare_calculation(atoms, calculator, unique_name)
-    logging.info(f"Starting vibrational analysis for {unique_name} with {calc.name}")
-    error = None
-
-    try:
-        start_time = time.time()
-        vib = Vibrations(atoms, name=f"vib_{unique_name}", indices=indices, delta=delta)
-        vib.run()
-        vib_data = vib.get_vibrations()  # Get the VibrationsData object
-        results["vib_time"] = (time.time() - start_time) * 1000
-
-        # Get frequencies and energies from vib_data
-        frequencies = vib_data.get_frequencies()  # cm^-1
-        logging.debug(f"Frequencies in cm^-1: {frequencies}")
-        vib_energies = vib_data.get_energies()  # eV
-        logging.debug(f"Vibrational energies in eV: {vib_energies}")
-        results["frequencies_cm^-1"] = (
-            frequencies.tolist() if hasattr(frequencies, "tolist") else frequencies
-        )
-        results["vib_energies"] = (
-            vib_energies.tolist() if hasattr(vib_energies, "tolist") else vib_energies
-        )  # Store energies for thermo
-
-        # Calculate number of imaginary frequencies (negative real numbers)
-        # Ensure we are only checking real numbers (floats or ints)
-        results["number_of_imaginary"] = len(
-            [f for f in vib_energies if abs(f.imag) > 1.0e-8]
-        )
-
-        logging.debug(f"Vibrational analysis completed in {results['vib_time']} ms")
-        logging.debug(vib.summary())
-        vib.clean()
-    except AttributeError as ae:
-        # Catch specific errors related to missing methods
-        error = f"Error accessing vibration data (possibly ASE version issue?): {ae}"
-        results["error"] = error
-        logging.error(error)
-    except Exception as e:
-        error = f"Error in vibrational analysis: {e}"
-        results["error"] = error
-        logging.error(error)
-
-    logging.info(f"Vibrational analysis for {unique_name} completed")
     return atoms, results
 
 
@@ -955,7 +889,7 @@ def run_optimization(
     logging.info(f"Starting geometry optimization for {unique_name} with {calc.name}")
     # Log optimization parameters
     logging.debug(f"Optimization parameters: fmax={fmax}, max_steps={max_steps}")
-    error = None
+    error = ""
 
     # Add optimization-specific fields
     results.update(
@@ -1017,13 +951,123 @@ def run_optimization(
     return atoms, results
 
 
+def run_vibrations(
+    atoms,
+    calculator=None,
+    optimize=True,
+    unique_name="",
+    indices=None,
+    fmax=0.01,
+    delta=0.01,
+    max_trans_rot=40,
+    max_vib_imag=40,
+    **params,
+):
+    """
+    Run vibrational frequency calculations for an ASE Atoms object.
+
+    Args:
+        atoms (ase.Atoms): ASE Atoms object
+        calculator (ase.calculators.calculator.Calculator, optional): Calculator instance. Defaults to None (uses get_calculator).
+        unique_name (str): Unique name for the molecule
+        indices (list): List of atom indices to include in vibration calculation
+        fmax (float): Maximum force for geometry optimization
+        delta (float): Displacement for finite difference calculation
+        max_trans (float): Max abs. value in cm-1 for translation modes
+        max_rot (float): Max abs. value in cm-1 for rotation modes
+        max_vib_imag (float): Max abs. value for the imaginary part in cm-1 for vibrational modes
+
+    Returns:
+        tuple: A tuple containing the atoms and a dictionary with calculated properties
+    """
+    error = ""
+    results = {"error": ""}  # Initialize results dictionary with error field
+
+    if calculator is None:
+        if atoms.calc is None:
+            calc, calc_results = _prepare_calculation(atoms, calculator, unique_name)
+            results.update(calc_results)  # Update results with calculator results
+        else:
+            # use the calculator from the atoms object
+            calc = atoms.calc
+    else:
+        calc = calculator
+    logging.debug(
+        f"Starting vibrational calculations for {unique_name} with {str(calc)}"
+    )
+    if optimize:
+        atoms, opt_results = run_optimization(
+            atoms,
+            calculator=calc,
+            unique_name=unique_name,
+            fmax=fmax,
+            **params,
+        )
+        if opt_results.get("error"):  # Use get() to safely check for error
+            results["error"] += opt_results["error"]  # Append optimization error
+            logging.error("Optimization failed, cannot proceed with vibrations.")
+            return None, results
+    else:
+        logging.warning(
+            "No optimization requested, using given geometry for the vibrations."
+        )
+
+    try:
+        start_time = time.time()
+        vib = Vibrations(atoms, name=f"vib_{unique_name}", indices=indices, delta=delta)
+        vib.run()
+        vib_data = vib.get_vibrations()  # Get the VibrationsData object
+        results["vib_time"] = (time.time() - start_time) * 1000
+
+        # Get frequencies and energies from vib_data
+        frequencies = vib_data.get_frequencies()  # cm^-1
+        logging.debug(f"Frequencies in cm^-1: {frequencies}")
+        vib_energies = vib_data.get_energies()  # eV
+        logging.debug(f"Vibrational energies in eV: {vib_energies}")
+        results["frequencies_cm^-1"] = (
+            frequencies.tolist() if hasattr(frequencies, "tolist") else frequencies
+        )
+        results["vib_energies"] = (
+            vib_energies.tolist() if hasattr(vib_energies, "tolist") else vib_energies
+        )  # Store energies for thermo
+        nrot = 3
+        if get_geometry_type(atoms) == "linear":
+            nrot = 2
+        # Check translational and rotational modes
+        if np.any(np.abs(frequencies[: 3 + nrot]) > max_trans_rot):
+            logging.error(
+                f"Translational or rotational modes are too high: {frequencies[:3+nrot]}"
+            )
+            results["error"] += "Translational or rotational modes are too high\n"
+        img_freqs = [f for f in frequencies[3 + nrot :] if abs(f.imag) > max_vib_imag]
+        results["number_of_imaginary"] = len(img_freqs)
+        results["vibrational_frequencies_cm^-1"] = [
+            f.real for f in frequencies[3 + nrot :]
+        ]
+
+        logging.debug(f"Vibrational analysis completed in {results['vib_time']} ms")
+        logging.debug(vib.summary())
+        vib.clean()
+    except AttributeError as ae:
+        # Catch specific errors related to missing methods
+        error = f"Error accessing vibration data (possibly ASE version issue?): {ae}\n"
+        results["error"] += error
+        logging.error(error)
+    except Exception as e:
+        error = f"Error in vibrational analysis: {e}\n"
+        results["error"] += error
+        logging.error(error)
+
+    logging.info(f"Vibrational analysis for {unique_name} completed")
+    return atoms, results
+
+
 def run_thermo(
     atoms,
     calculator=None,
-    fmax=0.01,
     ignore_imag_modes=True,
     unique_name="",
-    **opt_params,  # Accept optimization parameters
+    **params,
 ):
     """
     Run thermochemistry calculations for an ASE Atoms object.
@@ -1031,7 +1075,6 @@ def run_thermo(
     Args:
         atoms (ase.Atoms): ASE Atoms object
         calculator (ase.calculators.calculator.Calculator, optional): Calculator instance. Defaults to None (uses get_calculator).
-        fmax (float): Maximum force for geometry optimization (can be overridden by opt_params).
         ignore_imag_modes (bool): Whether to ignore imaginary vibrational modes
         unique_name (str): Unique name for the molecule
         **opt_params: Additional keyword arguments passed to run_optimization.
@@ -1040,59 +1083,36 @@ def run_thermo(
         tuple: A tuple containing the thermochemistry results and a dictionary with calculated properties
     """
 
-    # Get calculator first (will use default if None)
-    calc = get_calculator() if calculator is None else calculator
-    logging.info(
-        f"Starting thermochemistry calculation for {unique_name} with {calc.name}"
-    )
-
-    # Prepare optimization arguments, merging defaults, fmax, and **opt_params
-    # **opt_params will override fmax if 'fmax' is present in it
-    current_opt_params = {"fmax": fmax}  # Start with default/passed fmax
-    current_opt_params.update(opt_params)  # Update with params from file
-
-    # First optimize the geometry using the obtained calculator and combined parameters
-    atoms, opt_results = run_optimization(
+    atoms, results = run_vibrations(
         atoms,
-        calculator=calc,
+        calculator=calculator,
+        optimize=True,
         unique_name=unique_name,
-        **current_opt_params,  # Pass combined optimization params
+        **params,
     )
-    if opt_results["error"] is not None:
-        logging.error("Optimization failed, cannot proceed with thermochemistry.")
-        return None, opt_results
-
-    # Then run vibrational analysis using the same calculator
-    # If vib params were added, they could be passed here similarly
-    atoms, vib_results = run_vibrations(atoms, calculator=calc, unique_name=unique_name)
-    if vib_results["error"] is not None:
+    if results["error"]:
         logging.error(
-            "Vibrational analysis failed, cannot proceed with thermochemistry."
+            "Vibrational analysis failed, cannot proceed with thermochemistry.\n"
         )
-        # Combine results to show both opt and vib info, even if vib failed
-        results = {**opt_results, **vib_results}
         return None, results
 
-    # Combine results
-    results = {**opt_results, **vib_results}
-    error = None
     thermo = None
 
     try:
         start_time = time.time()
         # Get energies directly from vib_results dictionary
-        vib_energies = vib_results.get("vib_energies", None)
+        vib_energies = results.get("vib_energies", None)
         if vib_energies is None:
             # This case indicates an issue in run_vibrations not storing energies
             logging.error(
                 "Vibrational energies not found in vibration results. Cannot calculate thermo properties."
             )
-            results["error"] = "Missing vibrational energies for thermochemistry."
+            results["error"] += "Missing vibrational energies for thermochemistry."
             return None, results
 
         # Check for imaginary frequencies if not ignoring them
         if not ignore_imag_modes:
-            n_imag = vib_results.get("number_of_imaginary", 0)
+            n_imag = results.get("number_of_imaginary", 0)
             if n_imag > 0:
                 error = f"Imaginary vibrational energies are present: ({n_imag} imaginary modes)."
                 results["error"] = error

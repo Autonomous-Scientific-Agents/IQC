@@ -25,6 +25,8 @@ optimization_params:
 # Parameters specific to the vib task
 vibration_params:
   delta: 0.005      # Finite difference step size
+  max_trans_rot: 40     # Max abs. value in cm-1 for translation or rotatioanal modes
+  max_vib_imag: 40       # Max abs. value for the imaginary part in cm-1 for vibrational modes
 
 # --- Thermochemistry Settings (Example) ---
 # Parameters specific to the thermo task

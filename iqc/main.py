@@ -243,9 +243,9 @@ def main():
                 atoms, task_results = run_vibrations(
                     atoms=atoms,
                     calculator=calculator,
+                    optimize=True,
                     unique_name=unique_name,
-                    **opt_params,
-                    **vib_params,
+                    **params,
                 )
             else:  # thermo
                 # Pass optimization and thermo parameters
@@ -260,9 +260,7 @@ def main():
                     calculator=calculator,
                     unique_name=unique_name,
                     ignore_imag_modes=ignore_imag,
-                    **opt_params,
-                    **vib_params,
-                    **thermo_params,
+                    **params,
                 )
 
             # Merge task results into main results dict
