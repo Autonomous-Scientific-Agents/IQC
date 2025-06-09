@@ -3,6 +3,7 @@ Tools for working with RDKit.
 """
 
 from rdkit import Chem
+from rdkit.Chem import AllChem
 from rdkit.Chem import rdDetermineBonds
 from rdkit.Chem import Descriptors
 import re  # Import the re module for regular expressions
@@ -411,3 +412,44 @@ def get_png(mol: Chem.Mol):
     bytes
     """
     return Chem.Draw.MolToImage(mol)
+
+
+def smiles_to_mol(smiles: str) -> Chem.Mol:
+    """Get the molecule from a SMILES string.
+    Parameters
+    ----------
+    smilest : str
+        The SMILES string to get the molecule of.
+    Returns
+    -------
+    Chem.Mol
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    # Add hydrogens
+    mol = Chem.AddHs(mol)
+
+    # Generate 3D coordinates
+    try:
+        AllChem.EmbedMolecule(mol, randomSeed=42)
+        # Optimize the molecule
+        AllChem.MMFFOptimizeMolecule(mol)
+    except Exception as e:
+        print(f"Error during 3D embedding/optimization: {e}")
+        return None
+
+    return mol
+
+
+def get_mol_from_xyz_file(xyz_file: str) -> Chem.Mol:
+    """Get the molecule from an XYZ file.
+    Parameters
+    ----------
+    xyz_file : str
+        The XYZ file to get the molecule of.
+    Returns
+    -------
+    Chem.Mol
+    """
+    with open(xyz_file, "r") as file:
+        xyz_text = file.read()
+    return xyz_to_mol(xyz_text)
