@@ -13,7 +13,7 @@ from typing import (
 import mmap
 from dataclasses import dataclass, field
 import pathlib
-
+import pandas as pd
 from typing import Union
 import pathlib
 import io
@@ -138,7 +138,7 @@ def inspect_xyz(
     """
     if not want_counts and not want_frames:
         return XYZStats(count_xyz_frames(path), None, None)
-    
+
     n_frames = 0
     counts: List[int] = [] if want_counts else None  # type: ignore
     frames: List[str] = [] if want_frames else None  # type: ignore
@@ -366,3 +366,61 @@ def get_xyz_atom_counts(filename: str) -> List[int]:
     """Get list of atom counts for each configuration"""
     return XYZReader(filename).get_atom_counts()
 
+
+def xyz_to_dataframe(path: Union[str, pathlib.Path]) -> pd.DataFrame:
+    """
+    Convert XYZ file(s) to a pandas DataFrame.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Path to either a single XYZ file or a directory containing XYZ files.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with columns:
+        - number_of_atoms: int
+        - comment: str
+        - xyz_string: str (complete XYZ frame as string)
+    """
+    if isinstance(path, str):
+        path = pathlib.Path(path)
+
+    # Handle single file
+    if path.is_file():
+        reader = XYZReader(str(path))
+        data = []
+        for config in reader.iter_configurations():
+            xyz_str = f"{config.num_atoms}\n{config.comment}"
+            for atom in config.atoms:
+                xyz_str += f"\n{atom[0]} {atom[1]:.6f} {atom[2]:.6f} {atom[3]:.6f}"
+            data.append(
+                {
+                    "number_of_atoms": config.num_atoms,
+                    "comment": config.comment,
+                    "xyz_string": xyz_str,
+                }
+            )
+        return pd.DataFrame(data)
+
+    # Handle directory
+    elif path.is_dir():
+        data = []
+        for xyz_file in path.glob("*.xyz"):
+            reader = XYZReader(str(xyz_file))
+            for config in reader.iter_configurations():
+                xyz_str = f"{config.num_atoms}\n{config.comment}"
+                for atom in config.atoms:
+                    xyz_str += f"\n{atom[0]} {atom[1]:.6f} {atom[2]:.6f} {atom[3]:.6f}"
+                data.append(
+                    {
+                        "number_of_atoms": config.num_atoms,
+                        "comment": config.comment,
+                        "xyz_string": xyz_str,
+                    }
+                )
+        return pd.DataFrame(data)
+
+    else:
+        raise ValueError(f"Path {path} does not exist or is not a file/directory")
