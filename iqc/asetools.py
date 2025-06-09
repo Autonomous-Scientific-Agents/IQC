@@ -988,15 +988,24 @@ def run_vibrations(
         "error": "",
     }  # Initialize results dictionary with warning and error fields
 
-    if calculator is None:
-        if atoms.calc is None:
-            calc, calc_results = _prepare_calculation(atoms, calculator, unique_name)
-            results.update(calc_results)  # Update results with calculator results
+    try:
+        if calculator is None:
+            if atoms.calc is None:
+                calc, calc_results = _prepare_calculation(
+                    atoms, calculator, unique_name
+                )
+                results.update(calc_results)  # Update results with calculator results
+            else:
+                # use the calculator from the atoms object
+                calc = atoms.calc
         else:
-            # use the calculator from the atoms object
-            calc = atoms.calc
-    else:
-        calc = calculator
+            calc = calculator
+    except Exception as e:
+        error = f"Error in calculator preparation: {e}"
+        results["error"] += error
+        logging.error(error)
+        return None, results
+
     logging.debug(
         f"Starting vibrational calculations for {unique_name} with {str(calc)}"
     )
@@ -1193,10 +1202,10 @@ def is_linear_by_inertia(atoms, tol=1e-3):
     Returns:
     bool : True if molecule is linear, False otherwise.
     """
-    moments = atoms.get_moments_of_inertia()
-    # Linear molecule will have two near-zero values
-    near_zero = [m < tol for m in moments]
-    return near_zero.count(True) >= 2
+    moments = sorted(atoms.get_moments_of_inertia())  # ascending order
+    if moments[0] > tol:
+        return False  # First moment should be (near) zero
+    return abs(moments[1] - moments[2]) / max(moments[1], moments[2]) < tol
 
 
 def get_geometry_type(atoms):
