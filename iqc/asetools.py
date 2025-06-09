@@ -580,15 +580,19 @@ def get_symmetry_info(atoms):
     Returns:
         tuple: (str, int): (Point group symbol, rotational symmetry number)
     """
-    from pymatgen.symmetry.analyzer import PointGroupAnalyzer
-    from pymatgen.io.ase import AseAtomsAdaptor
+    try:
+        from pymatgen.symmetry.analyzer import PointGroupAnalyzer
+        from pymatgen.io.ase import AseAtomsAdaptor
 
-    aaa = AseAtomsAdaptor()
-    molecule = aaa.get_molecule(atoms)
-    pga = PointGroupAnalyzer(molecule)
-    symmetrynumber = pga.get_rotational_symmetry_number()
-    pointgroup = pga.get_pointgroup()
-    return (pointgroup, symmetrynumber)
+        aaa = AseAtomsAdaptor()
+        molecule = aaa.get_molecule(atoms)
+        pga = PointGroupAnalyzer(molecule)
+        symmetrynumber = pga.get_rotational_symmetry_number()
+        pointgroup = pga.get_pointgroup()
+        return (pointgroup, symmetrynumber)
+    except Exception as e:
+        logging.warning(f"Error getting symmetry info: {e}")
+        return ("C1", 1)
 
 
 def ase_to_rdkit_mol(atoms):
@@ -799,7 +803,7 @@ def _prepare_calculation(atoms, calculator=None, unique_name=""):
     try:
         initial_energy = atoms.get_potential_energy()
     except Exception as e:
-        logging.error(f"Failed to get initial potential energy with {calc.name}: {e}")
+        logging.error(f"Failed to get initial potential energy with {str(calc)}: {e}")
         raise
 
     # Prepare results dictionary
@@ -814,8 +818,9 @@ def _prepare_calculation(atoms, calculator=None, unique_name=""):
         "initial_symmetry": str(initial_sym),
         "initial_sym_number": initial_sym_number,
         "initial_energy_eV": initial_energy,
-        "error": None,
-        "calculator_name": calc.name,
+        "warnings": [],
+        "error": "",
+        "calculator_name": str(calc),
     }
 
     return calc, results
@@ -840,7 +845,6 @@ def run_single_point(
     logging.info(f"Starting single point calculation for {unique_name}")
 
     calc, results = _prepare_calculation(atoms, calculator, unique_name)
-    error = ""
 
     try:
         start_time = time.time()
@@ -886,10 +890,9 @@ def run_optimization(
         tuple: A tuple containing the optimized atoms and a dictionary with calculated properties
     """
     calc, results = _prepare_calculation(atoms, calculator, unique_name)
-    logging.info(f"Starting geometry optimization for {unique_name} with {calc.name}")
+    logging.info(f"Starting geometry optimization for {unique_name} with {str(calc)}")
     # Log optimization parameters
     logging.debug(f"Optimization parameters: fmax={fmax}, max_steps={max_steps}")
-    error = ""
 
     # Add optimization-specific fields
     results.update(
@@ -925,7 +928,7 @@ def run_optimization(
         error = f"Error in optimization: {e}"
         # Add more context to the error log
         logging.error(
-            f"Optimization failed for {unique_name} using {calc.name}. Error: {e}"
+            f"Optimization failed for {unique_name} using {str(calc)}. Error: {e}"
         )
         if "did not contain a loop with signature matching types" in str(e):
             logging.error(
@@ -933,11 +936,11 @@ def run_optimization(
             )
         results["error"] = error
         # No need to log again here, already logged above
-    if error is None:
+    if not results["error"]:
         try:
             opt_sym, opt_sym_number = get_symmetry_info(atoms)
         except Exception as e:
-            logging.error(f"Error getting symmetry info: {e}")
+            logging.warning(f"Error getting symmetry info: {e}")
             opt_sym = "C1"
             opt_sym_number = 1
         results["opt_smiles"] = atoms2smiles(atoms)
@@ -959,8 +962,8 @@ def run_vibrations(
     indices=None,
     fmax=0.01,
     delta=0.01,
-    max_trans_rot=40,
-    max_vib_imag=40,
+    max_trans_rot=100,
+    max_vib_imag=50,
     **params,
 ):
     """
@@ -980,8 +983,10 @@ def run_vibrations(
     Returns:
         tuple: A tuple containing the atoms and a dictionary with calculated properties
     """
-    error = ""
-    results = {"error": ""}  # Initialize results dictionary with error field
+    results = {
+        "warnings": [],
+        "error": "",
+    }  # Initialize results dictionary with warning and error fields
 
     if calculator is None:
         if atoms.calc is None:
@@ -1031,14 +1036,14 @@ def run_vibrations(
             vib_energies.tolist() if hasattr(vib_energies, "tolist") else vib_energies
         )  # Store energies for thermo
         nrot = 3
-        if get_geometry_type(atoms) == "linear":
+        if is_linear_by_inertia(atoms):
             nrot = 2
         # Check translational and rotational modes
         if np.any(np.abs(frequencies[: 3 + nrot]) > max_trans_rot):
-            logging.error(
+            logging.warning(
                 f"Translational or rotational modes are too high: {frequencies[:3+nrot]}"
             )
-            results["error"] += "Translational or rotational modes are too high\n"
+            results["warnings"].append("Translational or rotational modes are too high")
         img_freqs = [f for f in frequencies[3 + nrot :] if abs(f.imag) > max_vib_imag]
         results["number_of_imaginary"] = len(img_freqs)
         results["vibrational_frequencies_cm^-1"] = [
@@ -1141,7 +1146,7 @@ def run_thermo(
         results["error"] = error
         logging.error(error)
         logging.error(
-            f"Number of imaginary modes: {vib_results.get('number_of_imaginary')}"
+            f"Number of imaginary modes: {results.get('number_of_imaginary')}"
         )
         return None, results
 
@@ -1173,6 +1178,25 @@ def get_atoms_from_xyz(xyz, parallel=False, index=-1):
 
 
 xyz2atoms = get_atoms_from_xyz
+
+
+def is_linear_by_inertia(atoms, tol=1e-3):
+    """
+    Determine if a molecule is linear by checking its moments of inertia.
+
+    Parameters:
+    atoms : ase.Atoms
+        The molecule to check.
+    tol : float
+        Tolerance for treating a moment of inertia as zero.
+
+    Returns:
+    bool : True if molecule is linear, False otherwise.
+    """
+    moments = atoms.get_moments_of_inertia()
+    # Linear molecule will have two near-zero values
+    near_zero = [m < tol for m in moments]
+    return near_zero.count(True) >= 2
 
 
 def get_geometry_type(atoms):
