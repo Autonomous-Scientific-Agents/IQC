@@ -215,3 +215,102 @@ def get_start_end(comm, N):
         end_index = start_index + items_per_process
 
     return start_index, end_index
+
+
+if __name__ == "__main__":
+    """
+    Test suite for mpitools.
+
+    This block serves as a test suite for the functions in this module.
+    To run this test, you need mpi4py installed and you should execute it
+    with mpiexec.
+
+    For example:
+        mpiexec -n 4 python iqc/mpitools.py
+    """
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
+    # All printing is done from rank 0 to avoid jumbled output.
+    if rank == 0:
+        print(f"\n--- Testing mpitools on {size} MPI processes ---")
+        print("=" * 50)
+
+    # --- Test get_mpi_rank and get_mpi_size ---
+    if rank == 0:
+        print("\nTesting get_mpi_rank() and get_mpi_size()...")
+    # Each rank prepares its own information string
+    info_str = (
+        f"  Rank {rank}: get_mpi_rank() -> {get_mpi_rank()}, "
+        f"get_mpi_size() -> {get_mpi_size()}"
+    )
+    # Gather all strings to rank 0
+    all_info = comm.gather(info_str, root=0)
+    if rank == 0:
+        for info in all_info:
+            print(info)
+
+    info_str_comm = (
+        f"  Rank {rank}: get_mpi_rank(comm) -> {get_mpi_rank(comm)}, "
+        f"get_mpi_size(comm) -> {get_mpi_size(comm)}"
+    )
+    all_info_comm = comm.gather(info_str_comm, root=0)
+    if rank == 0:
+        for info in all_info_comm:
+            print(info)
+
+    # --- Test get_mpi_local_rank and get_mpi_local_size ---
+    if rank == 0:
+        print("\nTesting get_mpi_local_rank() and get_mpi_local_size()...")
+        print("  (Note: these depend on environment variables set by the MPI launcher)")
+    local_info_str = (
+        f"  Rank {rank}: get_mpi_local_rank() -> {get_mpi_local_rank()}, "
+        f"get_mpi_local_size() -> {get_mpi_local_size()}"
+    )
+    all_local_info = comm.gather(local_info_str, root=0)
+    if rank == 0:
+        for info in all_local_info:
+            print(info)
+
+    # --- Test get_ppn and get_total_memory (on rank 0) ---
+    comm.barrier()
+    if rank == 0:
+        print("\nTesting get_ppn() and get_total_memory() on rank 0...")
+        print(f"  get_ppn() -> {get_ppn()}")
+        print(f"  get_total_memory() -> {get_total_memory()} MB")
+
+    # --- Test get_start_end ---
+    if rank == 0:
+        print("\nTesting get_start_end(comm, N)...")
+
+    # Case 1: N is a multiple of size
+    N1 = 16
+    if rank == 0:
+        print(f"\n  Case 1: Distributing N={N1} items (evenly)")
+    start1, end1 = get_start_end(comm, N1)
+    workload1 = end1 - start1
+    workload_info1 = f"  Rank {rank}: start={start1}, end={end1}, workload={workload1}"
+    all_workload_info1 = comm.gather(workload_info1, root=0)
+    if rank == 0:
+        for info in all_workload_info1:
+            print(info)
+
+    # Case 2: N is not a multiple of size
+    if size > 1:
+        N2 = 19
+        if rank == 0:
+            print(f"\n  Case 2: Distributing N={N2} items (unevenly)")
+        start2, end2 = get_start_end(comm, N2)
+        workload2 = end2 - start2
+        workload_info2 = (
+            f"  Rank {rank}: start={start2}, end={end2}, workload={workload2}"
+        )
+        all_workload_info2 = comm.gather(workload_info2, root=0)
+        if rank == 0:
+            for info in all_workload_info2:
+                print(info)
+
+    if rank == 0:
+        print("\n" + "=" * 50)
+        print("--- mpitools testing complete ---")
