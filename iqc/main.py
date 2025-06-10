@@ -7,10 +7,7 @@ import glob
 from datetime import datetime
 from pathlib import Path
 import yaml  # Import YAML
-
 import numpy as np
-from mpi4py import MPI
-
 from iqc.asetools import (
     run_optimization,
     run_single_point,
@@ -18,7 +15,10 @@ from iqc.asetools import (
     run_vibrations,
     get_atoms_from_xyz,
     get_calculator,
+    get_ase_version,
 )
+from mpi4py import MPI
+
 from iqc.xyztools import count_xyz_frames
 from iqc.cli import get_args
 from iqc.mpitools import get_start_end
@@ -218,6 +218,7 @@ def main():
             "mpi_size": size,
             "mpi_rank": rank,
             "hostname": os.uname().nodename,
+            "ase_version": get_ase_version(),
         }
 
         try:

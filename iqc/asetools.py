@@ -25,6 +25,13 @@ except ImportError:
     )
 
 
+def get_ase_version():
+    """
+    Returns the version of the ASE library.
+    """
+    return ase.__version__
+
+
 def get_calculator(name="mace", **kwargs):
     """Initializes and returns the specified ASE calculator.
 
