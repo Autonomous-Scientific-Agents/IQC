@@ -299,8 +299,8 @@ def main():
         logging.debug(f"Starting to combine JSON files")
 
         # Combine all JSON files into a single JSONL file
-        jsonl_file = os.path.join(dir_name, f"combined_results_{time_stamp}.jsonl")
-        json_files = glob.glob(os.path.join(dir_name, f"*_{time_stamp}_*.json"))
+        jsonl_file = f"iqc_{task}_results_{time_stamp}.jsonl"
+        json_files = glob.glob(f"*_{task}_*.json", recursive=True)
 
         with open(jsonl_file, "w") as outfile:
             for json_file in json_files:
