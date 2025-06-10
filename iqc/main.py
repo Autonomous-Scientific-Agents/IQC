@@ -10,6 +10,7 @@ import yaml  # Import YAML
 import numpy as np
 import ase  # just to disable parallel features of ASE, import it before mpi initialization
 import ase.parallel as asepar
+import time
 
 asepar.world = asepar.DummyMPI()
 from iqc.asetools import (
@@ -91,6 +92,7 @@ def main():
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
+    start_time = time.time()
 
     # Get command line arguments
     args = get_args()
@@ -190,7 +192,7 @@ def main():
 
     start_index, end_index = get_start_end(comm, number_of_xyz)
     logging.debug(f"Processing files from index {start_index} to {end_index}.")
-
+    logging.info(f"Initialization time: {time.time() - start_time} seconds.")
     for xyz_index in range(start_index, end_index):
         if number_of_files > 1:
             xyz_file = xyz_files[xyz_index]
@@ -277,6 +279,8 @@ def main():
         # Save results
         output_file = f"{unique_name}_{args.task}_{time_stamp}_{rank}.json"
         save_results(results, output_file)
+
+    logging.info(f"Total time: {time.time() - start_time} seconds.")
 
 
 if __name__ == "__main__":
