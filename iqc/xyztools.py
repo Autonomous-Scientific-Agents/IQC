@@ -424,3 +424,51 @@ def xyz_to_dataframe(path: Union[str, pathlib.Path]) -> pd.DataFrame:
 
     else:
         raise ValueError(f"Path {path} does not exist or is not a file/directory")
+
+
+def dataframe_to_xyz(
+    df: pd.DataFrame,
+    path: Union[str, pathlib.Path],
+    xyz_column: Optional[str] = None,
+):
+    """
+    Writes an XYZ file from a pandas DataFrame.
+
+    The DataFrame must contain a column with XYZ frame strings.
+    This function searches for a column named 'xyz_string' or 'xyz' by default.
+    The column name can be specified with the `xyz_column` parameter.
+
+    Each entry in the column is treated as a single XYZ frame. This function
+    ensures frames are properly separated by newlines in the output file.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame containing the XYZ data.
+    path : str or pathlib.Path
+        Path for the output XYZ file.
+    xyz_column : str, optional
+        Name of the column with XYZ frame strings. If not provided,
+        the function searches for 'xyz_string' and then 'xyz'.
+    """
+    if xyz_column is None:
+        if "xyz_string" in df.columns:
+            xyz_column = "xyz_string"
+        elif "xyz" in df.columns:
+            xyz_column = "xyz"
+        else:
+            raise ValueError(
+                "DataFrame must contain a column with XYZ frame data. "
+                "Specify `xyz_column`, or use 'xyz_string' or 'xyz' as column name."
+            )
+    elif xyz_column not in df.columns:
+        raise ValueError(f"Specified column '{xyz_column}' not found in DataFrame.")
+
+    # A generator expression is memory-efficient.
+    # strip() handles frames with or without trailing newlines.
+    content = "\n".join(str(frame).strip() for frame in df[xyz_column])
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+        if content:
+            f.write("\n")
