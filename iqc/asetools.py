@@ -859,7 +859,7 @@ def run_single_point(
         # Energy is already calculated in _prepare_calculation
         energy = results["initial_energy_eV"]
         forces = atoms.get_forces()
-        results["calc_time"] = (time.time() - start_time)
+        results["calc_time"] = time.time() - start_time
         results["energy_eV"] = energy
         results["forces"] = forces.tolist()
         logging.debug(
@@ -927,7 +927,7 @@ def run_optimization(
         start_time = time.time()
         dyn = BFGS(atoms)
         converged = dyn.run(fmax=fmax, steps=max_steps)
-        results["opt_time"] = (time.time() - start_time)
+        results["opt_time"] = time.time() - start_time
         results["opt_steps"] = dyn.get_number_of_steps()
         results["opt_converged"] = converged
         results["opt_forces"] = atoms.get_forces().tolist()
@@ -967,6 +967,7 @@ def run_vibrations(
     calculator=None,
     optimize=True,
     unique_name="",
+    vib_dir=None,
     indices=None,
     fmax=0.01,
     delta=0.01,
@@ -981,6 +982,7 @@ def run_vibrations(
         atoms (ase.Atoms): ASE Atoms object
         calculator (ase.calculators.calculator.Calculator, optional): Calculator instance. Defaults to None (uses get_calculator).
         unique_name (str): Unique name for the molecule
+        vib_dir (str, optional): Directory to store vibration files. Defaults to None.
         indices (list): List of atom indices to include in vibration calculation
         fmax (float): Maximum force for geometry optimization
         delta (float): Displacement for finite difference calculation
@@ -1036,10 +1038,14 @@ def run_vibrations(
 
     try:
         start_time = time.time()
-        vib = Vibrations(atoms, name=f"vib_{unique_name}", indices=indices, delta=delta)
+        vib_name = f"tmp_vib_{unique_name}"
+        if vib_dir:
+            os.makedirs(vib_dir, exist_ok=True)
+            vib_name = os.path.join(vib_dir, vib_name)
+        vib = Vibrations(atoms, name=vib_name, indices=indices, delta=delta)
         vib.run()
         vib_data = vib.get_vibrations()  # Get the VibrationsData object
-        results["vib_time"] = (time.time() - start_time)
+        results["vib_time"] = time.time() - start_time
 
         # Get frequencies and energies from vib_data
         frequencies = vib_data.get_frequencies()  # cm^-1
@@ -1067,7 +1073,9 @@ def run_vibrations(
             f.real for f in frequencies[3 + nrot :]
         ]
 
-        logging.debug(f"Vibrational analysis completed in {results['vib_time']} seconds.")
+        logging.debug(
+            f"Vibrational analysis completed in {results['vib_time']} seconds."
+        )
         logging.debug(vib.summary())
         vib.clean()
     except AttributeError as ae:
@@ -1150,7 +1158,7 @@ def run_thermo(
             symmetrynumber=results.get("opt_sym_number", 1),  # Use optimized symmetry
             ignore_imag_modes=ignore_imag_modes,
         )
-        results["thermo_time"] = (time.time() - start_time)
+        results["thermo_time"] = time.time() - start_time
         results["G_eV"] = thermo.get_gibbs_energy(temperature=298.15, pressure=101325.0)
         results["H_eV"] = thermo.get_enthalpy(temperature=298.15)
         results["S_eV/K"] = thermo.get_entropy(temperature=298.15, pressure=101325.0)

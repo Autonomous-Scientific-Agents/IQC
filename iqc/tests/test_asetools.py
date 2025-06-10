@@ -398,14 +398,15 @@ def test_get_symmetry_info():
         assert sym_number == 1
 
 
-def test_run_vibrations_error_handling():
+def test_run_vibrations_error_handling(tmp_path):
     """Test error handling in run_vibrations."""
     # Create a simple molecule
     h2 = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
+    vib_dir = tmp_path / "vib"
 
     # Test with invalid calculator
     with patch("iqc.asetools.get_calculator", side_effect=Exception("Test error")):
-        atoms, results = run_vibrations(h2, calculator=None)
+        atoms, results = run_vibrations(h2, calculator=None, vib_dir=vib_dir)
         assert atoms is None
         assert "error" in results
         assert "Test error" in results["error"]
@@ -413,7 +414,7 @@ def test_run_vibrations_error_handling():
     # Test with optimization failure
     with patch("iqc.asetools.run_optimization") as mock_opt:
         mock_opt.return_value = (h2, {"error": "Optimization failed"})
-        atoms, results = run_vibrations(h2, optimize=True)
+        atoms, results = run_vibrations(h2, optimize=True, vib_dir=vib_dir)
         assert atoms is None
         assert "error" in results
         assert "Optimization failed" in results["error"]
@@ -422,12 +423,12 @@ def test_run_vibrations_error_handling():
     with patch(
         "ase.vibrations.Vibrations.run", side_effect=Exception("Vibration failed")
     ):
-        atoms, results = run_vibrations(h2, optimize=False)
+        atoms, results = run_vibrations(h2, optimize=False, vib_dir=vib_dir)
         assert "error" in results
         assert "Vibration failed" in results["error"]
 
 
-def test_run_vibrations_warnings():
+def test_run_vibrations_warnings(tmp_path):
     """Test warning handling in run_vibrations."""
     # Create a linear molecule with high translational/rotational modes
     co2 = Atoms(
@@ -436,6 +437,7 @@ def test_run_vibrations_warnings():
         cell=[10, 10, 10],
         pbc=False,
     )
+    vib_dir = tmp_path / "vib"
 
     # Mock the vibrations calculation to return high frequencies
     with patch("ase.vibrations.Vibrations.get_vibrations") as mock_vib:
@@ -446,7 +448,9 @@ def test_run_vibrations_warnings():
             [0.1, 0.1, 0.1, 0.05, 0.05, 0.05, 0.025, 0.025, 0.025]
         )
 
-        atoms, results = run_vibrations(co2, optimize=False, max_trans_rot=50)
+        atoms, results = run_vibrations(
+            co2, optimize=False, max_trans_rot=50, vib_dir=vib_dir
+        )
         assert "warnings" in results
         assert len(results["warnings"]) > 0
         assert any(
@@ -455,17 +459,18 @@ def test_run_vibrations_warnings():
         )
 
 
-def test_run_thermo_error_handling():
+def test_run_thermo_error_handling(tmp_path):
     """Test error handling in run_thermo."""
     # Create a simple molecule
     h2 = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
+    vib_dir = tmp_path / "vib"
 
     # Test with vibration calculation failure
     with patch(
         "iqc.asetools.run_vibrations",
         return_value=(None, {"error": "Vibration failed"}),
     ):
-        thermo, results = run_thermo(h2)
+        thermo, results = run_thermo(h2, vib_dir=vib_dir)
         assert results["error"] == "Vibration failed"
 
     # Test with imaginary modes
@@ -478,7 +483,7 @@ def test_run_thermo_error_handling():
                 "error": "",
             },
         )
-        thermo, results = run_thermo(h2, ignore_imag_modes=False)
+        thermo, results = run_thermo(h2, ignore_imag_modes=False, vib_dir=vib_dir)
         assert "error" in results
         assert "imaginary" in results["error"].lower()
 
@@ -487,6 +492,6 @@ def test_run_thermo_error_handling():
         "ase.thermochemistry.IdealGasThermo.get_gibbs_energy",
         side_effect=Exception("Thermo failed"),
     ):
-        thermo, results = run_thermo(h2)
+        thermo, results = run_thermo(h2, vib_dir=vib_dir)
         assert "error" in results
         assert "Thermo failed" in results["error"]
