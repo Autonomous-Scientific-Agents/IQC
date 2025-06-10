@@ -20,6 +20,7 @@ from iqc.asetools import (
     get_spin,
     xyz2atoms,
     get_calculator,
+    get_ase_version,
     XTB,
     is_linear_by_inertia,
     get_symmetry_info,
@@ -129,6 +130,32 @@ H 0.0 1.0 0.0"""
     assert len(atoms) == 3
     assert atoms.get_chemical_symbols() == ["O", "H", "H"]
     assert atoms.positions.shape == (3, 3)
+
+
+def test_get_ase_version():
+    """Test getting ASE version."""
+    import ase
+
+    version = get_ase_version()
+
+    # Check that a version string is returned
+    assert isinstance(version, str)
+    assert len(version) > 0
+
+    # Check that it matches the actual ASE version
+    assert version == ase.__version__
+
+    # Check that version follows semantic versioning pattern (roughly)
+    # Version should have at least one dot (e.g., "3.22.1")
+    assert "." in version
+
+    # Check that it contains only valid version characters
+    # (digits, dots, letters, hyphens are typical in version strings)
+    import re
+
+    assert re.match(
+        r"^[0-9]+\.[0-9]+", version
+    ), f"Version '{version}' doesn't start with major.minor format"
 
 
 def test_get_canonical_smiles(methane_atoms):

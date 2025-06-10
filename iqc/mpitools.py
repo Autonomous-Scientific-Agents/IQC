@@ -4,64 +4,74 @@ import os
 
 def get_mpi_rank(comm=None):
     """
-    Return mpi rank (int) if defined as an environment variable.
+    Return mpi rank (int) if defined as an environment variable or from communicator.
 
-    Parameters
-    ----------
-    comm : MPI.Comm, optional
-        MPI communicator object, by default None
+    Priority:
+    1. From `comm` object if provided.
+    2. From environment variables (PMI_RANK, PMI_ID, OMPI_COMM_WORLD_RANK).
+    3. From `MPI.COMM_WORLD` as a final fallback.
 
-    Returns
-    -------
-    int
-        The MPI rank of the current process
-
-    Raises
-    ------
-    TypeError
-        If comm is provided but not an MPI.Comm object
+    Returns 0 if MPI is not available and no environment variables are set.
     """
-    if comm is not None and not isinstance(comm, MPI.Comm):
-        raise TypeError("comm must be an MPI communicator object")
-
-    if os.getenv("PMI_RANK") is not None:
-        rank = int(os.getenv("PMI_RANK"))
-    elif os.getenv("PMI_ID") is not None:
-        rank = int(os.getenv("PMI_ID"))
-    elif os.getenv("OMPI_COMM_WORLD_RANK") is not None:
-        rank = int(os.getenv("OMPI_COMM_WORLD_RANK"))
-    else:
-        rank = MPI.COMM_WORLD.Get_rank()
-    return rank
-
-
-def get_mpi_size(default=1):
-    """
-    Return mpi size (int) if defined as an environment variable.
-
-    Parameters
-    ----------
-    default : int, optional
-        Default size to return if MPI is not available, by default 1
-
-    Returns
-    -------
-    int
-        The total number of MPI processes
-    """
-    if os.getenv("PMI_SIZE") is not None:
-        size = int(os.getenv("PMI_SIZE"))
-    elif os.getenv("OMPI_COMM_WORLD_SIZE") is not None:
-        size = int(os.getenv("OMPI_COMM_WORLD_SIZE"))
-    else:
+    # 1. Use comm object if provided
+    if comm is not None:
         try:
-            from mpi4py import MPI
+            # Check if it's a valid communicator
+            if hasattr(comm, "Get_rank") and callable(comm.Get_rank):
+                return comm.Get_rank()
+        except Exception:
+            # If Get_rank fails, proceed to other methods
+            pass
 
-            comm = MPI.COMM_WORLD
-            size = comm.Get_size()
-        except:
-            size = default
-    return size
+    # 2. Check environment variables
+    env_vars = ["PMI_RANK", "PMI_ID", "OMPI_COMM_WORLD_RANK"]
+    for var in env_vars:
+        if os.getenv(var) is not None:
+            return int(os.getenv(var))
+
+    # 3. Use global MPI as a fallback
+    try:
+        from mpi4py import MPI
+
+        return MPI.COMM_WORLD.Get_rank()
+    except ImportError:
+        return 0  # Default rank if MPI is not available
+
+
+def get_mpi_size(comm=None, default=1):
+    """
+    Return mpi size (int) if defined as an environment variable or from communicator.
+
+    Priority:
+    1. From `comm` object if provided.
+    2. From environment variables (PMI_SIZE, OMPI_COMM_WORLD_SIZE).
+    3. From `MPI.COMM_WORLD` as a final fallback.
+
+    Returns `default` if MPI is not available and no environment variables are set.
+    """
+    # 1. Use comm object if provided
+    if comm is not None:
+        try:
+            # Check if it's a valid communicator
+            if hasattr(comm, "Get_size") and callable(comm.Get_size):
+                return comm.Get_size()
+        except Exception:
+            # If Get_size fails, proceed to other methods
+            pass
+
+    # 2. Check environment variables
+    env_vars = ["PMI_SIZE", "OMPI_COMM_WORLD_SIZE"]
+    for var in env_vars:
+        if os.getenv(var) is not None:
+            return int(os.getenv(var))
+
+    # 3. Use global MPI as a fallback
+    try:
+        from mpi4py import MPI
+
+        return MPI.COMM_WORLD.Get_size()
+    except ImportError:
+        return default  # Default size if MPI is not available
 
 
 def get_mpi_local_rank(default=0):

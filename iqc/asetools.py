@@ -4,6 +4,7 @@ import os
 import time
 from datetime import datetime
 import numpy as np
+import ase
 from ase import Atoms, build
 from ase.calculators.emt import EMT
 from ase.io import read, write
