@@ -8,6 +8,10 @@ from datetime import datetime
 from pathlib import Path
 import yaml  # Import YAML
 import numpy as np
+import ase  # just to disable parallel features of ASE, import it before mpi initialization
+import ase.parallel as asepar
+
+asepar.world = asepar.DummyMPI()
 from iqc.asetools import (
     run_optimization,
     run_single_point,
