@@ -141,13 +141,17 @@ def main():
             logging.warning(
                 f"Parameter file specified ({args.params}) but not found. Using defaults."
             )
-
+    task = args.task
     # Extract specific parameter sections, defaulting to empty dicts
     calc_params = params.get("calculator_params", {})
     opt_params = params.get("optimization_params", {})
     vib_params = params.get("vibration_params", {})
     thermo_params = params.get("thermo_params", {})
-
+    opt_params = {**calc_params, **opt_params}
+    vib_params = {**opt_params, **vib_params}
+    thermo_params = {**vib_params, **thermo_params}
+    if rank == 0:
+        logging.info(f"All parameters: {params}")
     # Determine calculator name: CLI > Param file > Default ('mace')
     calculator_name = args.calculator or params.get("calculator", "mace")
 
@@ -157,7 +161,10 @@ def main():
     except RuntimeError as e:
         logging.error(f"Failed to initialize calculator '{calculator_name}': {e}")
         comm.Abort(1)
-
+    time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dir_name = f"{'tmp'}_{task}_{rank}_{time_stamp}"
+    logging.debug(f"Creating directory: {dir_name}")
+    os.makedirs(dir_name, exist_ok=True)
     if rank == 0:
         if os.path.isdir(args.xyz):
             xyz_dir = args.xyz
@@ -229,11 +236,11 @@ def main():
 
         try:
             # Run calculation based on task using the selected calculator and parameters
-            if args.task == "single":
+            if task == "single":
                 atoms, task_results = run_single_point(
                     atoms=atoms, calculator=calculator, unique_name=unique_name
                 )
-            elif args.task == "opt":
+            elif task == "opt":
                 # Pass optimization parameters from file
                 atoms, task_results = run_optimization(
                     atoms=atoms,
@@ -241,15 +248,16 @@ def main():
                     unique_name=unique_name,
                     **opt_params,
                 )
-            elif args.task == "vib":
+            elif task == "vib":
                 # Pass vibration parameters if added to config later
                 # vib_params = params.get('vibration_params', {})
+                vib_params["vib_dir"] = dir_name
                 atoms, task_results = run_vibrations(
                     atoms=atoms,
                     calculator=calculator,
                     optimize=True,
                     unique_name=unique_name,
-                    **params,
+                    **vib_params,
                 )
             else:  # thermo
                 # Pass optimization and thermo parameters
@@ -259,28 +267,59 @@ def main():
                 ignore_imag = (
                     args.ignore_imag
                 )  # or thermo_params.get('ignore_imag_modes', args.ignore_imag)
+                thermo_params["vib_dir"] = dir_name
                 atoms, task_results = run_thermo(
                     atoms=atoms,
                     calculator=calculator,
                     unique_name=unique_name,
                     ignore_imag_modes=ignore_imag,
-                    **params,
+                    **thermo_params,
                 )
 
             # Merge task results into main results dict
             results.update(task_results)
-            logging.debug(f"Completed {args.task} calculations for file: {xyz_file}")
+            logging.debug(f"Completed {task} calculations for file: {xyz_file}")
         except Exception as e:
-            results[f"{args.task}_error"] = str(e)
-            logging.error(
-                f"Task '{args.task}' failed for {xyz_file}: {e}", exc_info=True
-            )
+            results[f"{task}_error"] = str(e)
+            logging.error(f"Task '{task}' failed for {xyz_file}: {e}", exc_info=True)
 
         # Save results
-        output_file = f"{unique_name}_{args.task}_{time_stamp}_{rank}.json"
+        output_file = f"{unique_name}_{task}_{time_stamp}_{rank}.json"
+        output_file = os.path.join(dir_name, output_file)
         save_results(results, output_file)
 
+    # Wait for all processes to finish before combining files
+    barrier_start = time.time()
+    logging.debug(f"Waiting for all processes to finish before combining files.")
+    comm.Barrier()
+    logging.debug(f"Took { time.time() - barrier_start:.2f} seconds")
+
+    if rank == 0:
+        combine_start = time.time()
+        logging.debug(f"Starting to combine JSON files")
+
+        # Combine all JSON files into a single JSONL file
+        jsonl_file = os.path.join(dir_name, f"combined_results_{time_stamp}.jsonl")
+        json_files = glob.glob(os.path.join(dir_name, f"*_{time_stamp}_*.json"))
+
+        with open(jsonl_file, "w") as outfile:
+            for json_file in json_files:
+                with open(json_file, "r") as infile:
+                    data = json.load(infile)
+                    json.dump(data, outfile)
+                    outfile.write("\n")
+
+        combine_end = time.time()
+        logging.debug(
+            f"Finished combining JSON files at {combine_end:.2f}s (took {combine_end - combine_start:.2f}s)"
+        )
+        logging.info(f"Combined results saved to {jsonl_file}")
+
+    # Final barrier to ensure all processes complete
+    comm.Barrier()
+
     logging.info(f"Total time: {time.time() - start_time} seconds.")
+    return 0
 
 
 if __name__ == "__main__":
