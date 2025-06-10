@@ -1129,14 +1129,14 @@ def run_thermo(
             logging.error(
                 "Vibrational energies not found in vibration results. Cannot calculate thermo properties."
             )
-            results["error"] += "Missing vibrational energies for thermochemistry."
+            results["error"] += "Missing vibrational energies for thermochemistry.\n"
             return None, results
 
         # Check for imaginary frequencies if not ignoring them
         if not ignore_imag_modes:
             n_imag = results.get("number_of_imaginary", 0)
             if n_imag > 0:
-                error = f"Imaginary vibrational energies are present: ({n_imag} imaginary modes)."
+                error = f"Imaginary vibrational energies are present: ({n_imag} imaginary modes).\n"
                 results["error"] = error
                 logging.error(error)
                 return None, results
@@ -1159,12 +1159,9 @@ def run_thermo(
             f"Thermochemistry calculations completed in {results['thermo_time']} ms"
         )
     except Exception as e:
-        error = f"Error in thermochemistry calculations: {e}"
-        results["error"] = error
+        error = f"Error in thermochemistry calculations: {e}\n"
+        results["error"] += error
         logging.error(error)
-        logging.error(
-            f"Number of imaginary modes: {results.get('number_of_imaginary')}"
-        )
         return None, results
 
     logging.info(f"Thermochemistry calculation for {unique_name} completed")
