@@ -300,8 +300,8 @@ def main():
 
         # Combine all JSON files into a single JSONL file
         jsonl_file = f"iqc_{task}_results_{time_stamp}.jsonl"
-        json_files = glob.glob(f"*_{task}_*.json", recursive=True)
-
+        json_files = glob.glob(os.path.join("tmp*", f"*_{task}_*.json"), recursive=True)
+        logging.debug(f"Found {len(json_files)} JSON files to combine.")
         with open(jsonl_file, "w") as outfile:
             for json_file in json_files:
                 with open(json_file, "r") as infile:
@@ -311,14 +311,11 @@ def main():
 
         combine_end = time.time()
         logging.debug(
-            f"Finished combining JSON files at {combine_end:.2f}s (took {combine_end - combine_start:.2f}s)"
+            f"Finished combining JSON files in {combine_end - combine_start:.2f} seconds"
         )
         logging.info(f"Combined results saved to {jsonl_file}")
+        logging.info(f"Total time: {time.time() - start_time} seconds.")
 
-    # Final barrier to ensure all processes complete
-    comm.Barrier()
-
-    logging.info(f"Total time: {time.time() - start_time} seconds.")
     return 0
 
 
