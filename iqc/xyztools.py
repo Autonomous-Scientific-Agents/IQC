@@ -8,14 +8,11 @@ from typing import (
     Any,
     Union,
     Iterator,
-    Optional,
 )
 import mmap
 from dataclasses import dataclass, field
 import pathlib
 import pandas as pd
-from typing import Union
-import pathlib
 import io
 
 
