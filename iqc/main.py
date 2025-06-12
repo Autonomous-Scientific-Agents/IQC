@@ -7,11 +7,12 @@ import glob
 from datetime import datetime
 from pathlib import Path
 import yaml  # Import YAML
-
 import numpy as np
-from ase.io import read
-from mpi4py import MPI
+import ase  # just to disable parallel features of ASE, import it before mpi initialization
+import ase.parallel as asepar
+import time
 
+asepar.world = asepar.DummyMPI()
 from iqc.asetools import (
     run_optimization,
     run_single_point,
@@ -19,7 +20,11 @@ from iqc.asetools import (
     run_vibrations,
     get_atoms_from_xyz,
     get_calculator,
+    get_ase_version,
 )
+from mpi4py import MPI
+
+from iqc.xyztools import count_xyz_frames
 from iqc.cli import get_args
 from iqc.mpitools import get_start_end
 
@@ -87,6 +92,7 @@ def main():
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
+    start_time = time.time()
 
     # Get command line arguments
     args = get_args()
@@ -127,19 +133,25 @@ def main():
         except Exception as e:
             logging.error(f"Error loading parameters from {args.params}: {e}")
             # Decide if execution should stop if params file is bad
-            comm.Abort(1)
             sys.exit(1)
+            comm.Abort(1)
+
     elif args.params:
         if rank == 0:
             logging.warning(
                 f"Parameter file specified ({args.params}) but not found. Using defaults."
             )
-
+    task = args.task
     # Extract specific parameter sections, defaulting to empty dicts
     calc_params = params.get("calculator_params", {})
     opt_params = params.get("optimization_params", {})
-    # Example for future: thermo_params = params.get('thermo_params', {})
-
+    vib_params = params.get("vibration_params", {})
+    thermo_params = params.get("thermo_params", {})
+    opt_params = {**calc_params, **opt_params}
+    vib_params = {**opt_params, **vib_params}
+    thermo_params = {**vib_params, **thermo_params}
+    if rank == 0:
+        logging.info(f"All parameters: {params}")
     # Determine calculator name: CLI > Param file > Default ('mace')
     calculator_name = args.calculator or params.get("calculator", "mace")
 
@@ -149,73 +161,86 @@ def main():
     except RuntimeError as e:
         logging.error(f"Failed to initialize calculator '{calculator_name}': {e}")
         comm.Abort(1)
-        sys.exit(1)
-
-    # --- File Processing --- (Remains mostly the same)
+    time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dir_name = f"{'tmp'}_{task}_{rank}_{time_stamp}"
+    logging.debug(f"Creating directory: {dir_name}")
+    os.makedirs(dir_name, exist_ok=True)
     if rank == 0:
         if os.path.isdir(args.xyz):
             xyz_dir = args.xyz
             xyz_files = glob.glob(os.path.join(xyz_dir, "*.xyz"))
+            number_of_xyz = len(xyz_files)
         elif os.path.isfile(args.xyz):
             xyz_files = [args.xyz]
+            try:
+                number_of_xyz = count_xyz_frames(args.xyz)
+            except Exception as e:
+                logging.error(f"Error counting .xyz files in {args.xyz}: {e}")
+                comm.Abort(1)
         else:
             # Handle non-existent path before bcast
             logging.error(
                 f"Input path {args.xyz} does not exist or is not a file/directory."
             )
             xyz_files = []  # Ensure empty list is broadcast
-            # Optionally abort MPI here if input is critical
-            # comm.Abort(1)
-            # sys.exit(1)
+            comm.Abort(1)
 
         number_of_files = len(xyz_files)
         if number_of_files == 0:
-            logging.warning(f"No .xyz files found in {args.xyz}. Exiting.")
+            logging.error(f"No .xyz files found in {args.xyz}. Exiting.")
+            comm.Abort(1)
         else:
             logging.info(f"Found {number_of_files} .xyz file(s).")
+            logging.info(f"Number of configurations: {number_of_xyz}")
 
     xyz_files = comm.bcast(xyz_files if rank == 0 else None, root=0)
+    number_of_xyz = comm.bcast(number_of_xyz if rank == 0 else None, root=0)
     number_of_files = len(xyz_files)
-    if number_of_files == 0:
-        # All ranks should exit if no files
-        logging.info("No files to process. Exiting.")
-        sys.exit(0)
 
-    start_index, end_index = get_start_end(comm, number_of_files)
+    start_index, end_index = get_start_end(comm, number_of_xyz)
     logging.debug(f"Processing files from index {start_index} to {end_index}.")
-    # ---------------------
-
-    for file in xyz_files[start_index:end_index]:
+    logging.info(f"Initialization time: {time.time() - start_time} seconds.")
+    for xyz_index in range(start_index, end_index):
+        if number_of_files > 1:
+            xyz_file = xyz_files[xyz_index]
+        else:  # only one file
+            xyz_file = xyz_files[0]
         time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_name = os.path.splitext(os.path.basename(file))[0]
-        unique_name = f"{base_name}_{rank}_{time_stamp}"
-        logging.info(f"Processing file: {file} with unique ID: {unique_name}")
+        base_name = os.path.splitext(os.path.basename(xyz_file))[0]
+        unique_name = f"{base_name}_{xyz_index}_{rank}_{time_stamp}"
+        logging.info(f"Processing file: {xyz_file} with unique ID: {unique_name}")
 
         # Read input
         try:
-            atoms = get_atoms_from_xyz(file)
+            if number_of_files > 1:
+                atoms = get_atoms_from_xyz(xyz_file)
+            else:
+                atoms = get_atoms_from_xyz(xyz_file, index=xyz_index)
         except ValueError as e:
-            logging.error(f"Error reading file {file}: {e}. Skipping.")
+            logging.error(f"Error reading file {xyz_file}: {e}. Skipping.")
             continue
         except Exception as e:
-            logging.error(f"Unexpected error processing file {file}: {e}. Skipping.")
+            logging.error(
+                f"Unexpected error processing file {xyz_file}: {e}. Skipping."
+            )
             continue
 
         results = {
-            "xyz_file": file,
+            "xyz_file": xyz_file,
             "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "mpi_size": size,
             "mpi_rank": rank,
             "hostname": os.uname().nodename,
+            "ase_version": get_ase_version(),
         }
 
         try:
             # Run calculation based on task using the selected calculator and parameters
-            if args.task == "single":
+            if task == "single":
                 atoms, task_results = run_single_point(
                     atoms=atoms, calculator=calculator, unique_name=unique_name
                 )
-            elif args.task == "opt":
+            elif task == "opt":
                 # Pass optimization parameters from file
                 atoms, task_results = run_optimization(
                     atoms=atoms,
@@ -223,14 +248,16 @@ def main():
                     unique_name=unique_name,
                     **opt_params,
                 )
-            elif args.task == "vib":
+            elif task == "vib":
                 # Pass vibration parameters if added to config later
                 # vib_params = params.get('vibration_params', {})
+                vib_params["vib_dir"] = dir_name
                 atoms, task_results = run_vibrations(
                     atoms=atoms,
                     calculator=calculator,
+                    optimize=True,
                     unique_name=unique_name,
-                    # **vib_params
+                    **vib_params,
                 )
             else:  # thermo
                 # Pass optimization and thermo parameters
@@ -240,25 +267,56 @@ def main():
                 ignore_imag = (
                     args.ignore_imag
                 )  # or thermo_params.get('ignore_imag_modes', args.ignore_imag)
+                thermo_params["vib_dir"] = dir_name
                 atoms, task_results = run_thermo(
                     atoms=atoms,
                     calculator=calculator,
                     unique_name=unique_name,
                     ignore_imag_modes=ignore_imag,
-                    **opt_params,  # Pass opt_params to run_thermo
+                    **thermo_params,
                 )
 
             # Merge task results into main results dict
             results.update(task_results)
-            logging.debug(f"Completed {args.task} calculations for file: {file}")
+            logging.debug(f"Completed {task} calculations for file: {xyz_file}")
         except Exception as e:
-            results[f"{args.task}_error"] = str(e)
-            logging.error(f"Task '{args.task}' failed for {file}: {e}", exc_info=True)
+            results[f"{task}_error"] = str(e)
+            logging.error(f"Task '{task}' failed for {xyz_file}: {e}", exc_info=True)
 
         # Save results
-        output_file = f"{base_name}_{args.task}_{time_stamp}_{rank}.json"
+        output_file = f"{unique_name}_{task}_{time_stamp}_{rank}.json"
+        output_file = os.path.join(dir_name, output_file)
         save_results(results, output_file)
-        logging.info(f"Results saved to {output_file}")
+
+    # Wait for all processes to finish before combining files
+    barrier_start = time.time()
+    logging.debug(f"Waiting for all processes to finish before combining files.")
+    comm.Barrier()
+    logging.debug(f"Took { time.time() - barrier_start:.2f} seconds")
+
+    if rank == 0:
+        combine_start = time.time()
+        logging.debug(f"Starting to combine JSON files")
+
+        # Combine all JSON files into a single JSONL file
+        jsonl_file = f"iqc_{task}_results_{time_stamp}.jsonl"
+        json_files = glob.glob(os.path.join("tmp*", f"*_{task}_*.json"), recursive=True)
+        logging.debug(f"Found {len(json_files)} JSON files to combine.")
+        with open(jsonl_file, "w") as outfile:
+            for json_file in json_files:
+                with open(json_file, "r") as infile:
+                    data = json.load(infile)
+                    json.dump(data, outfile)
+                    outfile.write("\n")
+
+        combine_end = time.time()
+        logging.debug(
+            f"Finished combining JSON files in {combine_end - combine_start:.2f} seconds"
+        )
+        logging.info(f"Combined results saved to {jsonl_file}")
+        logging.info(f"Total time: {time.time() - start_time} seconds.")
+
+    return 0
 
 
 if __name__ == "__main__":

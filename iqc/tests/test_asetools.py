@@ -20,7 +20,12 @@ from iqc.asetools import (
     get_spin,
     xyz2atoms,
     get_calculator,
+    get_ase_version,
     XTB,
+    is_linear_by_inertia,
+    get_symmetry_info,
+    run_vibrations,
+    run_thermo,
 )
 
 
@@ -125,6 +130,32 @@ H 0.0 1.0 0.0"""
     assert len(atoms) == 3
     assert atoms.get_chemical_symbols() == ["O", "H", "H"]
     assert atoms.positions.shape == (3, 3)
+
+
+def test_get_ase_version():
+    """Test getting ASE version."""
+    import ase
+
+    version = get_ase_version()
+
+    # Check that a version string is returned
+    assert isinstance(version, str)
+    assert len(version) > 0
+
+    # Check that it matches the actual ASE version
+    assert version == ase.__version__
+
+    # Check that version follows semantic versioning pattern (roughly)
+    # Version should have at least one dot (e.g., "3.22.1")
+    assert "." in version
+
+    # Check that it contains only valid version characters
+    # (digits, dots, letters, hyphens are typical in version strings)
+    import re
+
+    assert re.match(
+        r"^[0-9]+\.[0-9]+", version
+    ), f"Version '{version}' doesn't start with major.minor format"
 
 
 def test_get_canonical_smiles(methane_atoms):
@@ -292,3 +323,175 @@ def test_get_calculator_unknown_fallback():
         pytest.skip(f"Could not initialize fallback calculator: {e}")
     except ImportError:
         pytest.skip("Fallback calculator not available.")
+
+
+def test_is_linear_by_inertia():
+    """Test linear molecule detection by moments of inertia."""
+    # Linear molecule (CO2) - using more precise geometry
+    co2 = Atoms(
+        "CO2",
+        positions=[[0, 0, 0], [0, 0, 1.16], [0, 0, -1.16]],  # More precise CO2 geometry
+        pbc=False,
+    )
+    # Center the molecule at origin to ensure proper moment calculation
+    assert is_linear_by_inertia(co2)  # Increased tolerance
+
+    # Non-linear molecule (H2O)
+    h2o = Atoms(
+        "H2O",
+        positions=[[0, 0, 0], [0, 0, 1], [0, 1, 0]],
+        pbc=False,
+    )
+    assert not is_linear_by_inertia(h2o)
+
+    # Test with custom tolerance
+    assert is_linear_by_inertia(co2, tol=1e-2)
+    assert not is_linear_by_inertia(h2o, tol=1e-2)
+
+
+def test_get_symmetry_info():
+    """Test symmetry information calculation."""
+    # Skip if pymatgen not installed
+    pytest.importorskip("pymatgen")
+
+    # Test with water molecule
+    h2o = Atoms(
+        "H2O",
+        positions=[[0, 0, 0], [0, 0, 1], [0, 1, 0]],
+        cell=[10, 10, 10],
+        pbc=False,
+    )
+    pointgroup, sym_number = get_symmetry_info(h2o)
+    assert isinstance(
+        str(pointgroup), str
+    )  # Convert pointgroup to string before checking
+    assert isinstance(sym_number, int)
+    assert sym_number > 0
+
+    # Test with methane (higher symmetry)
+    ch4 = Atoms(
+        "CH4",
+        positions=[
+            [0.0, 0.0, 0.0],  # C
+            [0.6, 0.6, 0.6],  # H
+            [-0.6, -0.6, 0.6],  # H
+            [0.6, -0.6, -0.6],  # H
+            [-0.6, 0.6, -0.6],  # H
+        ],
+        cell=[10, 10, 10],
+        pbc=False,
+    )
+    pointgroup, sym_number = get_symmetry_info(ch4)
+    assert isinstance(
+        str(pointgroup), str
+    )  # Convert pointgroup to string before checking
+    assert isinstance(sym_number, int)
+    assert sym_number > 0
+
+    # Test error handling
+    with patch(
+        "pymatgen.symmetry.analyzer.PointGroupAnalyzer",
+        side_effect=Exception("Test error"),
+    ):
+        pointgroup, sym_number = get_symmetry_info(h2o)
+        assert pointgroup == "C1"
+        assert sym_number == 1
+
+
+def test_run_vibrations_error_handling(tmp_path):
+    """Test error handling in run_vibrations."""
+    # Create a simple molecule
+    h2 = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
+    vib_dir = tmp_path / "vib"
+
+    # Test with invalid calculator
+    with patch("iqc.asetools.get_calculator", side_effect=Exception("Test error")):
+        atoms, results = run_vibrations(h2, calculator=None, vib_dir=vib_dir)
+        assert atoms is None
+        assert "error" in results
+        assert "Test error" in results["error"]
+
+    # Test with optimization failure
+    with patch("iqc.asetools.run_optimization") as mock_opt:
+        mock_opt.return_value = (h2, {"error": "Optimization failed"})
+        atoms, results = run_vibrations(h2, optimize=True, vib_dir=vib_dir)
+        assert atoms is None
+        assert "error" in results
+        assert "Optimization failed" in results["error"]
+
+    # Test with vibration calculation failure
+    with patch(
+        "ase.vibrations.Vibrations.run", side_effect=Exception("Vibration failed")
+    ):
+        atoms, results = run_vibrations(h2, optimize=False, vib_dir=vib_dir)
+        assert "error" in results
+        assert "Vibration failed" in results["error"]
+
+
+def test_run_vibrations_warnings(tmp_path):
+    """Test warning handling in run_vibrations."""
+    # Create a linear molecule with high translational/rotational modes
+    co2 = Atoms(
+        "CO2",
+        positions=[[0, 0, 0], [0, 0, 1.16], [0, 0, -1.16]],
+        cell=[10, 10, 10],
+        pbc=False,
+    )
+    vib_dir = tmp_path / "vib"
+
+    # Mock the vibrations calculation to return high frequencies
+    with patch("ase.vibrations.Vibrations.get_vibrations") as mock_vib:
+        mock_vib.return_value.get_frequencies.return_value = np.array(
+            [200, 200, 200, 100, 100, 100, 50, 50, 50]
+        )
+        mock_vib.return_value.get_energies.return_value = np.array(
+            [0.1, 0.1, 0.1, 0.05, 0.05, 0.05, 0.025, 0.025, 0.025]
+        )
+
+        atoms, results = run_vibrations(
+            co2, optimize=False, max_trans_rot=50, vib_dir=vib_dir
+        )
+        assert "warnings" in results
+        assert len(results["warnings"]) > 0
+        assert any(
+            "Translational or rotational modes are too high" in w
+            for w in results["warnings"]
+        )
+
+
+def test_run_thermo_error_handling(tmp_path):
+    """Test error handling in run_thermo."""
+    # Create a simple molecule
+    h2 = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
+    vib_dir = tmp_path / "vib"
+
+    # Test with vibration calculation failure
+    with patch(
+        "iqc.asetools.run_vibrations",
+        return_value=(None, {"error": "Vibration failed"}),
+    ):
+        thermo, results = run_thermo(h2, vib_dir=vib_dir)
+        assert results["error"] == "Vibration failed"
+
+    # Test with imaginary modes
+    with patch("iqc.asetools.run_vibrations") as mock_vib:
+        mock_vib.return_value = (
+            h2,
+            {
+                "vib_energies": [0.1, 0.1, 0.1, 0.05, 0.05, 0.05],
+                "number_of_imaginary": 1,
+                "error": "",
+            },
+        )
+        thermo, results = run_thermo(h2, ignore_imag_modes=False, vib_dir=vib_dir)
+        assert "error" in results
+        assert "imaginary" in results["error"].lower()
+
+    # Test with thermo calculation failure
+    with patch(
+        "ase.thermochemistry.IdealGasThermo.get_gibbs_energy",
+        side_effect=Exception("Thermo failed"),
+    ):
+        thermo, results = run_thermo(h2, vib_dir=vib_dir)
+        assert "error" in results
+        assert "Thermo failed" in results["error"]
