@@ -1,15 +1,11 @@
 # Use an official miniconda3 image as the base
 FROM continuumio/miniconda3:latest
 
-USER root
-
 RUN apt-get update && apt-get install -y \
     build-essential \
     mpich \
     libmpich-dev \
     && rm -rf /var/lib/apt/lists/*
-
-USER conda
 
 # Set working directory
 WORKDIR /app
