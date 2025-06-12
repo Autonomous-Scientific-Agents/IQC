@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <title>XYZ Molecule Viewer</title>
+  <!-- 3Dmol.js – lightweight in‑browser 3‑D molecular graphics -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/3Dmol/2.0.4/3Dmol-min.js"></script>
+  <style>
+    :root {
+      --card-bg: #ffffff;
+      --shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 1rem;
+      font-family: system-ui, Arial, sans-serif;
+      background: #f5f5f5;
+    }
+
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem 1rem;
+      margin-bottom: 1rem;
+    }
+
+    #viewer-container {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 1rem;
+    }
+
+    .viewer-card {
+      background: var(--card-bg);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* critical: give the viewer a positioned ancestor so its canvas
+       (created by 3Dmol and set to position:absolute) stays contained */
+    .viewer {
+      position: relative;
+      /* fixes overlapping canvases */
+      width: 100%;
+      height: 300px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+    }
+
+    .info {
+      margin-top: 0.5rem;
+      font-size: 0.9rem;
+      line-height: 1.4;
+    }
+
+    nav {
+      margin-top: 1rem;
+      text-align: center;
+    }
+
+    button {
+      background: #1976d2;
+      border: none;
+      color: #fff;
+      padding: 0.5rem 1rem;
+      border-radius: 4px;
+      cursor: pointer;
+      margin: 0 0.5rem;
+    }
+
+    button:disabled {
+      background: #9e9e9e;
+      cursor: default;
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <h1 style="margin:0 0.5rem 0 0">XYZ Molecule Viewer</h1>
+    <input type="file" id="fileInput" accept=".xyz" />
+    <label for="numStruct">Structures per page:</label>
+    <input type="number" id="numStruct" value="3" min="1" style="width: 60px" />
+    <label for="showInfo" style="margin-left: 1rem;">
+      <input type="checkbox" id="showInfo" checked> Show molecular info
+    </label>
+  </header>
+
+  <div id="viewer-container"></div>
+
+  <nav>
+    <button id="prevBtn">◀︎ Prev</button>
+    <span id="pageInfo"></span>
+    <button id="nextBtn">Next ▶︎</button>
+  </nav>
+
+  <script>
+    /* ------------------------------------------------------------------
+       Minimal periodic table data (extend as needed)                   */
+    const PERIODIC = {
+      H: { Z: 1, mass: 1.008 }, He: { Z: 2, mass: 4.0026 },
+      Li: { Z: 3, mass: 6.94 }, Be: { Z: 4, mass: 9.0122 },
+      B: { Z: 5, mass: 10.81 }, C: { Z: 6, mass: 12.011 },
+      N: { Z: 7, mass: 14.007 }, O: { Z: 8, mass: 15.999 },
+      F: { Z: 9, mass: 18.998 }, Ne: { Z: 10, mass: 20.18 },
+      Na: { Z: 11, mass: 22.990 }, Mg: { Z: 12, mass: 24.305 },
+      Al: { Z: 13, mass: 26.982 }, Si: { Z: 14, mass: 28.085 },
+      P: { Z: 15, mass: 30.974 }, S: { Z: 16, mass: 32.06 },
+      Cl: { Z: 17, mass: 35.45 }, Ar: { Z: 18, mass: 39.948 },
+      K: { Z: 19, mass: 39.098 }, Ca: { Z: 20, mass: 40.078 }
+    };
+
+    /* ------------------------------------------------------------------
+       State                                                             */
+    let structures = [];      // parsed structures {atoms, comment}
+    let currentPage = 0;
+
+    /* ------------------------------------------------------------------
+       DOM references & event wiring                                     */
+    const fileInput = document.getElementById('fileInput');
+    const prevBtn = document.getElementById('prevBtn');
+    const nextBtn = document.getElementById('nextBtn');
+    const pageInfo = document.getElementById('pageInfo');
+    const container = document.getElementById('viewer-container');
+    const showInfo = document.getElementById('showInfo');
+
+    fileInput.addEventListener('change', handleFile);
+    prevBtn.addEventListener('click', () => { currentPage--; render(); });
+    nextBtn.addEventListener('click', () => { currentPage++; render(); });
+    showInfo.addEventListener('change', render);
+
+    // Arrow‑key navigation
+    document.addEventListener('keydown', e => {
+      if (e.key === 'ArrowLeft' && !prevBtn.disabled) prevBtn.click();
+      if (e.key === 'ArrowRight' && !nextBtn.disabled) nextBtn.click();
+    });
+
+    /* ------------------------------------------------------------------
+       File handling                                                     */
+    function handleFile(evt) {
+      const file = evt.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = e => {
+        structures = parseXYZ(e.target.result);
+        currentPage = 0;
+        render();
+      };
+      reader.readAsText(file);
+    }
+
+    /* ------------------------------------------------------------------
+       XYZ parsing (supports multi‑structure files)                      */
+    function parseXYZ(text) {
+      const lines = text.trim().split(/\r?\n/);
+      let i = 0;
+      const result = [];
+      while (i < lines.length) {
+        const nat = parseInt(lines[i]);
+        if (isNaN(nat) || i + nat + 1 >= lines.length) break;
+        const comment = lines[i + 1];
+        const atoms = lines.slice(i + 2, i + 2 + nat).map(l => {
+          const [elem, x, y, z] = l.trim().split(/\s+/);
+          return { elem, x: +x, y: +y, z: +z };
+        });
+        result.push({ atoms, comment });
+        i += nat + 2;
+      }
+      return result;
+    }
+
+    function structToXYZ(struct) {
+      return `${struct.atoms.length}\n${struct.comment || ''}\n` +
+        struct.atoms.map(a => `${a.elem} ${a.x} ${a.y} ${a.z}`).join('\n');
+    }
+
+    /* ------------------------------------------------------------------
+       Rendering                                                         */
+    function render() {
+      const perPage = Math.max(1, +document.getElementById('numStruct').value || 1);
+      const first = currentPage * perPage;
+      const last = Math.min(first + perPage, structures.length);
+
+      // Guard against overflow
+      if (first >= structures.length) { currentPage = 0; return render(); }
+
+      prevBtn.disabled = first === 0;
+      nextBtn.disabled = last >= structures.length;
+      pageInfo.textContent = `${first + 1}–${last} / ${structures.length}`;
+
+      container.innerHTML = '';
+
+      for (let idx = first; idx < last; idx++) {
+        const card = document.createElement('div');
+        card.className = 'viewer-card';
+
+        const viewerDiv = document.createElement('div');
+        viewerDiv.className = 'viewer';
+        card.appendChild(viewerDiv);
+
+        if (showInfo.checked) {
+          const infoDiv = document.createElement('div');
+          infoDiv.className = 'info';
+          card.appendChild(infoDiv);
+          infoDiv.innerHTML = makeInfo(structures[idx]);
+        }
+
+        container.appendChild(card);
+
+        const viewer = $3Dmol.createViewer(viewerDiv, { backgroundColor: 'white' });
+        viewer.addModel(structToXYZ(structures[idx]), 'xyz');
+        viewer.setStyle({}, { stick: {} });
+        viewer.zoomTo();
+        viewer.render();
+      }
+    }
+
+    /* ------------------------------------------------------------------
+       Basic molecular info                                              */
+    function makeInfo(struct) {
+      const counts = {};
+      let mass = 0, electrons = 0;
+      let hasValidData = false;
+
+      struct.atoms.forEach(a => {
+        counts[a.elem] = (counts[a.elem] || 0) + 1;
+        if (PERIODIC[a.elem]) {
+          mass += PERIODIC[a.elem].mass;
+          electrons += PERIODIC[a.elem].Z;
+          hasValidData = true;
+        }
+      });
+
+      const formula = Object.keys(counts).sort().map(el => el + (counts[el] > 1 ? counts[el] : '')).join('');
+
+      let info = [];
+
+      if (formula) {
+        info.push(`<strong>Formula:</strong> ${formula}`);
+      }
+
+      if (struct.atoms.length > 0) {
+        info.push(`<strong>Atoms:</strong> ${struct.atoms.length}`);
+      }
+
+      if (hasValidData) {
+        info.push(`<strong>Electrons:</strong> ${electrons}`);
+        info.push(`<strong>Molar Mass:</strong> ${mass.toFixed(3)} g mol⁻¹`);
+      }
+
+      return info.length > 0 ? info.join('<br>') : '<em>No molecular information available</em>';
+    }
+  </script>
+</body>
+
+</html>

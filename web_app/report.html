@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>XYZ Report</title>
+<style>
+body{font-family:system-ui,Arial,sans-serif;margin:0;padding:1rem;background:#f5f5f5;}
+#viewer-container{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1rem;}
+.viewer-card{background:#fff;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,.1);padding:1rem;display:flex;flex-direction:column;}
+.viewer{position:relative;width:100%;height:300px;border:1px solid #ccc;border-radius:4px;}
+.info{margin-top:.5rem;font-size:.9rem;line-height:1.4;}
+</style>
+</head>
+<body>
+<h1>XYZ Report – benzene.xyz</h1>
+<div id="viewer-container"></div>
+<script id="data-json" type="application/json">[{"xyz": "12\nBenzene molecule\nC 0.0 1.395 0.0\nC 1.208 0.6975 0.0\nC 1.208 -0.6975 0.0\nC 0.0 -1.395 0.0\nC -1.208 -0.6975 0.0\nC -1.208 0.6975 0.0\nH 0.0 2.479 0.0\nH 2.147 1.2395 0.0\nH 2.147 -1.2395 0.0\nH 0.0 -2.479 0.0\nH -2.147 -1.2395 0.0\nH -2.147 1.2395 0.0", "infoHTML": "<strong>Comment:</strong> Benzene molecule<br>\n<strong>Atoms:</strong> 12<br>\n<strong>Formula (RDKit):</strong> C6H6<br>\n<strong>Formula (counted):</strong> C6H6<br>\n<strong>MW\u00a0(RDKit):</strong> 78.046950192<br>\n<strong>MW\u00a0(counted):</strong> 78.114<br>\n<strong>Electrons:</strong> 42<br>\n<strong>SMILES:</strong> [H][C]1[C]([H])[C]([H])[C]([H])[C]([H])[C]1[H]<br>\n<strong>InChI:</strong> InChI=1S/C6H6/c1-2-4-6-5-3-1/h1-6H<br>\n<strong>IUPAC:</strong> \u2014<br>"}]</script>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/3Dmol/2.0.4/3Dmol-min.js"></script>
+<script>
+(function(){
+  const structs = JSON.parse(document.getElementById('data-json').textContent);
+  const container = document.getElementById('viewer-container');
+  structs.forEach((s,idx)=>{
+    const card=document.createElement('div');card.className='viewer-card';
+    const vdiv=document.createElement('div');vdiv.className='viewer';card.appendChild(vdiv);
+    const info=document.createElement('div');info.className='info';card.appendChild(info);
+    container.appendChild(card);
+    const viewer=$3Dmol.createViewer(vdiv,{backgroundColor:'white'});
+    viewer.addModel(s.xyz,'xyz');viewer.setStyle({},{stick:{}});viewer.zoomTo();viewer.render();
+    info.innerHTML=s.infoHTML;
+  });
+})();
+</script>
+
+</body></html>
