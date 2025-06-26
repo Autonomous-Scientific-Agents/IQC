@@ -1031,6 +1031,7 @@ def run_vibrations(
             results["error"] += opt_results["error"]  # Append optimization error
             logging.error("Optimization failed, cannot proceed with vibrations.")
             return None, results
+        results.update(opt_results)
     else:
         logging.warning(
             "No optimization requested, using given geometry for the vibrations."

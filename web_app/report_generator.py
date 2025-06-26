@@ -52,6 +52,32 @@ PERIODIC = {
     "Ar": (18, 39.948),
     "K": (19, 39.098),
     "Ca": (20, 40.078),
+    "Sc": (21, 44.956),
+    "Ti": (22, 47.867),
+    "V": (23, 50.942),
+    "Cr": (24, 51.996),
+    "Mn": (25, 54.938),
+    "Fe": (26, 55.84),
+    "Co": (27, 58.933),
+    "Ni": (28, 58.693),
+    "Cu": (29, 63.55),
+    "Zn": (30, 65.4),
+    "Ga": (31, 69.723),
+    "Ge": (32, 72.63),
+    "As": (33, 74.922),
+    "Se": (34, 78.97),
+    "Br": (35, 79.90),
+    "Kr": (36, 83.80),
+    "Rb": (37, 85.468),
+    "Sr": (38, 87.62),
+    "Y": (39, 88.906),
+    "Zr": (40, 91.22),
+    "Nb": (41, 92.906),
+    "Mo": (42, 95.95),
+    "Tc": (43, 96.906),
+    "Ru": (44, 101.1),
+    "Rh": (45, 102.906),
+    "Pd": (46, 106.42),
 }
 
 # ---------------------------------------------------------------------------
@@ -103,7 +129,10 @@ def rdkit_descriptors(block):
         smiles = Chem.MolToSmiles(mol)
         inchi = Chem.MolToInchi(mol)
         mw = Descriptors.CalcExactMolWt(mol)
-        return {"smiles": smiles, "inchi": inchi, "mw": mw, "formula": formula}
+        num_bonds = Descriptors.NumBonds(mol)
+
+        return {"smiles": smiles, "inchi": inchi, "mw": mw, "formula": formula, "num_bonds": num_bonds}
+    
     except Exception:
         return {}
 
@@ -191,6 +220,7 @@ def build_report(xyz_path: Path, output: Path, with_pubchem: bool):
             f"""
             <strong>Comment:</strong> {html.escape(s['comment'])}<br>
             <strong>Atoms:</strong> {len(s['atoms'])}<br>
+            <strong>Number of Bonds:</strong> {rd.get('num_bonds','—')}<br>
             <strong>Formula (RDKit):</strong> {rd.get('formula') or '—'}<br>
             <strong>Formula (counted):</strong> {counts['formula_est']}<br>
             <strong>MW (RDKit):</strong> {rd.get('mw') or '—'}<br>
