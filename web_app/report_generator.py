@@ -129,7 +129,10 @@ def rdkit_descriptors(block):
         smiles = Chem.MolToSmiles(mol)
         inchi = Chem.MolToInchi(mol)
         mw = Descriptors.CalcExactMolWt(mol)
-        return {"smiles": smiles, "inchi": inchi, "mw": mw, "formula": formula}
+        num_bonds = Descriptors.NumBonds(mol)
+
+        return {"smiles": smiles, "inchi": inchi, "mw": mw, "formula": formula, "num_bonds": num_bonds}
+    
     except Exception:
         return {}
 
@@ -217,6 +220,7 @@ def build_report(xyz_path: Path, output: Path, with_pubchem: bool):
             f"""
             <strong>Comment:</strong> {html.escape(s['comment'])}<br>
             <strong>Atoms:</strong> {len(s['atoms'])}<br>
+            <strong>Number of Bonds:</strong> {rd.get('num_bonds','—')}<br>
             <strong>Formula (RDKit):</strong> {rd.get('formula') or '—'}<br>
             <strong>Formula (counted):</strong> {counts['formula_est']}<br>
             <strong>MW (RDKit):</strong> {rd.get('mw') or '—'}<br>
