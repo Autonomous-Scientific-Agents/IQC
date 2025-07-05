@@ -232,6 +232,8 @@ def main():
             "mpi_rank": rank,
             "hostname": os.uname().nodename,
             "ase_version": get_ase_version(),
+            "task": task,
+            "calculator": calculator_name,
         }
 
         try:
