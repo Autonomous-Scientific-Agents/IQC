@@ -831,7 +831,7 @@ def _prepare_calculation(atoms, calculator=None, unique_name=""):
         "warnings": [],
         "error": "",
         "calculator_name": str(calc),
-        "model": getattr(calc, "model_name", None),
+        "model": getattr(calc, "model_name", ""),
     }
 
     return calc, results

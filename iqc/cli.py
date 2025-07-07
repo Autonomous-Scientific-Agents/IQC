@@ -84,5 +84,12 @@ def get_args():
         help="Ignore imaginary modes in thermochemistry (can also be set in param file)",
         action="store_true",
     )
+    parser.add_argument(
+        "-d",
+        "--database",
+        type=str,
+        default=None,  
+        help="Path to insert data into SQLite database",
+    )
 
     return parser.parse_args()
