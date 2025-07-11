@@ -31,7 +31,6 @@ def get_args():
         help="Log file prefix, use none for logging to STDOUT, include DATE if you want a date stamp",
     )
     parser.add_argument(
-        "-s",
         "--scratch",
         type=str,
         default=os.getenv("TMPDIR", default="/tmp"),
@@ -82,6 +81,12 @@ def get_args():
     parser.add_argument(
         "--ignore-imag",
         help="Ignore imaginary modes in thermochemistry (can also be set in param file)",
+        action="store_true",
+    )
+    parser.add_argument(
+        "-s",
+        "--save",
+        help="Save trajectory and optimized structures to file",
         action="store_true",
     )
 

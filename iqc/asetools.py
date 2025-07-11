@@ -881,6 +881,7 @@ def run_optimization(
     unique_name="",
     max_steps=500,
     trajectory=None,
+    save_geometry=False,
 ):
     """
     Run geometry optimization for an ASE Atoms object.
@@ -892,7 +893,7 @@ def run_optimization(
         unique_name (str): Unique name for the molecule
         max_steps (int): Maximum number of optimization steps
         trajectory (str): Path to save trajectory file
-        logfile (str): Path to save log file
+        save_geometry (bool): Whether to save the final optimized geometry to xyz file
 
     Returns:
         tuple: A tuple containing the optimized atoms and a dictionary with calculated properties
@@ -914,6 +915,8 @@ def run_optimization(
             "opt_steps": 0,
             "opt_converged": False,
             "opt_forces": [],
+            "trajectory_file": trajectory if trajectory else "",
+            "optimized_geometry_file": "",
         }
     )
 
@@ -925,12 +928,16 @@ def run_optimization(
             atoms.cell = atoms.cell.astype(np.float64)
 
         start_time = time.time()
-        dyn = BFGS(atoms)
+        dyn = BFGS(atoms, trajectory=trajectory)
         converged = dyn.run(fmax=fmax, steps=max_steps)
         results["opt_time"] = time.time() - start_time
         results["opt_steps"] = dyn.get_number_of_steps()
         results["opt_converged"] = converged
         results["opt_forces"] = atoms.get_forces().tolist()
+
+        if trajectory:
+            logging.info(f"Optimization trajectory saved to {trajectory}")
+
         logging.debug(f"Optimization completed in {results['opt_time']} seconds.")
     except Exception as e:
         error = f"Error in optimization: {e}"
@@ -958,6 +965,16 @@ def run_optimization(
         results["opt_sym_number"] = opt_sym_number
         results["smiles_changed"] = results["initial_smiles"] != results["opt_smiles"]
 
+        # Save optimized geometry if requested and optimization converged
+        if save_geometry and results["opt_converged"]:
+            try:
+                geometry_file = f"{unique_name}_optimized.xyz"
+                write(geometry_file, atoms, format="xyz")
+                results["optimized_geometry_file"] = geometry_file
+                logging.info(f"Optimized geometry saved to {geometry_file}")
+            except Exception as e:
+                logging.warning(f"Failed to save optimized geometry: {e}")
+
     logging.info(f"Geometry optimization for {unique_name} completed")
     return atoms, results
 
@@ -973,6 +990,8 @@ def run_vibrations(
     delta=0.01,
     max_trans_rot=100,
     max_vib_imag=50,
+    trajectory=None,
+    save_geometry=False,
     **params,
 ):
     """
@@ -989,6 +1008,8 @@ def run_vibrations(
         max_trans (float): Max abs. value in cm-1 for translation modes
         max_rot (float): Max abs. value in cm-1 for rotation modes
         max_vib_imag (float): Max abs. value for the imaginary part in cm-1 for vibrational modes
+        trajectory (str): Path to save trajectory file during optimization
+        save_geometry (bool): Whether to save the final optimized geometry to xyz file
 
     Returns:
         tuple: A tuple containing the atoms and a dictionary with calculated properties
@@ -1025,6 +1046,8 @@ def run_vibrations(
             calculator=calc,
             unique_name=unique_name,
             fmax=fmax,
+            trajectory=trajectory,
+            save_geometry=save_geometry,
             **params,
         )
         if opt_results.get("error"):  # Use get() to safely check for error
@@ -1098,6 +1121,8 @@ def run_thermo(
     calculator=None,
     ignore_imag_modes=True,
     unique_name="",
+    trajectory=None,
+    save_geometry=False,
     **params,
 ):
     """
@@ -1108,6 +1133,8 @@ def run_thermo(
         calculator (ase.calculators.calculator.Calculator, optional): Calculator instance. Defaults to None (uses get_calculator).
         ignore_imag_modes (bool): Whether to ignore imaginary vibrational modes
         unique_name (str): Unique name for the molecule
+        trajectory (str): Path to save trajectory file during optimization
+        save_geometry (bool): Whether to save the final optimized geometry to xyz file
         **opt_params: Additional keyword arguments passed to run_optimization.
 
     Returns:
@@ -1119,6 +1146,8 @@ def run_thermo(
         calculator=calculator,
         optimize=True,
         unique_name=unique_name,
+        trajectory=trajectory,
+        save_geometry=save_geometry,
         **params,
     )
     if results["error"]:
