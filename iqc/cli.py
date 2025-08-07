@@ -31,7 +31,6 @@ def get_args():
         help="Log file prefix, use none for logging to STDOUT, include DATE if you want a date stamp",
     )
     parser.add_argument(
-        "-s",
         "--scratch",
         type=str,
         default=os.getenv("TMPDIR", default="/tmp"),
@@ -90,6 +89,10 @@ def get_args():
         type=str,
         default=None,  
         help="Path to insert data into SQLite database",
+        "-s",
+        "--save",
+        help="Save trajectory and optimized structures to file",
+        action="store_true",
     )
 
     return parser.parse_args()

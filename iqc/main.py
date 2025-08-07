@@ -257,21 +257,35 @@ def main():
                 )
             elif task == "opt":
                 # Pass optimization parameters from file
+                trajectory_file = None
+                save_geometry = False
+                if args.save:
+                    trajectory_file = f"{unique_name}_opt_trajectory.traj"
+                    save_geometry = True
                 atoms, task_results = run_optimization(
                     atoms=atoms,
                     calculator=calculator,
                     unique_name=unique_name,
+                    trajectory=trajectory_file,
+                    save_geometry=save_geometry,
                     **opt_params,
                 )
             elif task == "vib":
                 # Pass vibration parameters if added to config later
                 # vib_params = params.get('vibration_params', {})
                 vib_params["vib_dir"] = dir_name
+                trajectory_file = None
+                save_geometry = False
+                if args.save:
+                    trajectory_file = f"{unique_name}_vib_trajectory.traj"
+                    save_geometry = True
                 atoms, task_results = run_vibrations(
                     atoms=atoms,
                     calculator=calculator,
                     optimize=True,
                     unique_name=unique_name,
+                    trajectory=trajectory_file,
+                    save_geometry=save_geometry,
                     **vib_params,
                 )
             else:  # thermo
@@ -283,11 +297,18 @@ def main():
                     args.ignore_imag
                 )  # or thermo_params.get('ignore_imag_modes', args.ignore_imag)
                 thermo_params["vib_dir"] = dir_name
+                trajectory_file = None
+                save_geometry = False
+                if args.save:
+                    trajectory_file = f"{unique_name}_thermo_trajectory.traj"
+                    save_geometry = True
                 atoms, task_results = run_thermo(
                     atoms=atoms,
                     calculator=calculator,
                     unique_name=unique_name,
                     ignore_imag_modes=ignore_imag,
+                    trajectory=trajectory_file,
+                    save_geometry=save_geometry,
                     **thermo_params,
                 )
 
