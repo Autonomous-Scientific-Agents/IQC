@@ -95,7 +95,7 @@ def insert_jsonl_to_db(jsonl_file, db_path):
         for line in f:
             try:
                 insert_entry(line, db_path)
-                logging.info(f"Inserted entry from JSONL: {line}")
+                logging.debug(f"Inserted entry from JSONL: {line}")
             except Exception as e:
                 logging.error(f"Error inserting entry: {e}")
 
@@ -135,10 +135,12 @@ def main():
     logging.debug(f"Number of MPI ranks: {size}.")
     # --- Load Parameters from File ---
     params = {}
+    params_str = ""
     if args.params and os.path.isfile(args.params):
         try:
             with open(args.params, "r") as f:
-                params = yaml.safe_load(f)
+                params_str = f.read()
+                params = yaml.safe_load(params_str)
             if rank == 0:
                 logging.info(f"Loaded parameters from {args.params}")
                 logging.debug(f"Parameters: {params}")
@@ -247,6 +249,7 @@ def main():
             "ase_version": get_ase_version(),
             "task": task,
             "calculator": calculator_name,
+            "params": params_str,
         }
 
         try:

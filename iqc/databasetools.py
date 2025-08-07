@@ -12,32 +12,34 @@ def create_database(db_path):
             CREATE TABLE IF NOT EXISTS calculations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 geometry_hash TEXT,
+                params_hash TEXT,
                 calculator TEXT,
                 model TEXT,
                 task TEXT,
                 blob_data TEXT,
-                UNIQUE(geometry_hash, calculator, model, task)
+                UNIQUE(geometry_hash, params_hash, calculator, model, task)
             )
         """)
 
         conn.commit()
 
-def hash_geometry(xyz_string): 
+def hash_string(string): 
 
-    # generate a hash for initial_xyz to simplify the unique key
-    xyz_hash = "\n".join(line.strip() for line in xyz_string.strip().splitlines() if line.strip())
+    # generate a hash for a string to simplify the unique key
+    string_hash = "\n".join(line.strip() for line in string.strip().splitlines() if line.strip())
 
-    return hashlib.sha256(xyz_hash.encode()).hexdigest()
+    return hashlib.sha256(string_hash.encode()).hexdigest()
 
 def insert_entry(json_line, db_path):
 
     try:
         data = json.loads(json_line)
 
-        if not all(k in data for k in ["initial_xyz", "calculator", "model", "task"]):
+        if not all(k in data for k in ["initial_xyz", "calculator", "model", "task", "params"]):
             raise ValueError("Missing required keys in input data.")
 
-        geometry_hash = hash_geometry(data["initial_xyz"])
+        geometry_hash = hash_string(data["initial_xyz"])
+        params_hash = hash_string(data["params"])
         calculator = data.get("calculator")
         model = data.get("model")
         task = data.get("task")
@@ -48,9 +50,9 @@ def insert_entry(json_line, db_path):
 
             cursor.execute("""
                 INSERT OR IGNORE INTO calculations (
-                    geometry_hash, calculator, model, task, blob_data
-                ) VALUES (?, ?, ?, ?, ?)
-            """, (geometry_hash, calculator, model, task, blob_data))
+                    geometry_hash, params_hash, calculator, model, task, blob_data
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            """, (geometry_hash, params_hash, calculator, model, task, blob_data))
         
             conn.commit()
         
