@@ -92,10 +92,10 @@ def save_results(results, output_file):
 
 def insert_jsonl_to_db(jsonl_file, db_path):
     with open(jsonl_file, "r") as f:
-        for line in f:
+        for line_num, line in enumerate(f, 1):
             try:
                 insert_entry(line, db_path)
-                logging.debug(f"Inserted entry from JSONL: {line}")
+                logging.debug(f"Inserted entry #{line_num} into database.")
             except Exception as e:
                 logging.error(f"Error inserting entry: {e}")
 
