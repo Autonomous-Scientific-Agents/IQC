@@ -84,6 +84,13 @@ def get_args():
         action="store_true",
     )
     parser.add_argument(
+        "-d",
+        "--database",
+        type=str,
+        default=None,  
+        help="Path to insert data into SQLite database",
+    )
+    parser.add_argument(
         "-s",
         "--save",
         help="Save trajectory and optimized structures to file",

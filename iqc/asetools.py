@@ -62,6 +62,7 @@ def get_calculator(name="mace", **kwargs):
             try:
                 # Attempt with specified/default dispersion
                 calculator = mace_mp(**mace_kwargs)
+                calculator.model_name = mace_kwargs["model"]
                 logging.info(f"Using MACE calculator with arguments: {mace_kwargs}")
             except Exception as e:
                 # Try without dispersion if the first attempt failed
@@ -70,6 +71,7 @@ def get_calculator(name="mace", **kwargs):
                 )
                 mace_kwargs["dispersion"] = False
                 calculator = mace_mp(**mace_kwargs)
+                calculator.model_name = mace_kwargs["model"]
                 logging.info(f"Using MACE calculator with arguments: {mace_kwargs}")
         except ImportError:
             logging.warning(
@@ -829,6 +831,7 @@ def _prepare_calculation(atoms, calculator=None, unique_name=""):
         "warnings": [],
         "error": "",
         "calculator_name": str(calc),
+        "model": getattr(calc, "model_name", ""),
     }
 
     return calc, results

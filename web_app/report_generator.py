@@ -129,7 +129,7 @@ def rdkit_descriptors(block):
         smiles = Chem.MolToSmiles(mol)
         inchi = Chem.MolToInchi(mol)
         mw = Descriptors.CalcExactMolWt(mol)
-        num_bonds = Descriptors.NumBonds(mol)
+        num_bonds = mol.GetNumBonds()
 
         return {"smiles": smiles, "inchi": inchi, "mw": mw, "formula": formula, "num_bonds": num_bonds}
     

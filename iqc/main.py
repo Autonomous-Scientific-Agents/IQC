@@ -28,6 +28,11 @@ from iqc.xyztools import count_xyz_frames
 from iqc.cli import get_args
 from iqc.mpitools import get_start_end
 
+from iqc.databasetools import (
+	create_database,
+	insert_entry
+)
+
 
 class ComplexEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -85,6 +90,14 @@ def save_results(results, output_file):
                     f.write(f"{key}: {value}\n")
             logging.info(f"Results saved to {txt_file} in text format")
 
+def insert_jsonl_to_db(jsonl_file, db_path):
+    with open(jsonl_file, "r") as f:
+        for line_num, line in enumerate(f, 1):
+            try:
+                insert_entry(line, db_path)
+                logging.debug(f"Inserted entry #{line_num} into database.")
+            except Exception as e:
+                logging.error(f"Error inserting entry: {e}")
 
 def main():
     """Main function."""
@@ -122,10 +135,12 @@ def main():
     logging.debug(f"Number of MPI ranks: {size}.")
     # --- Load Parameters from File ---
     params = {}
+    params_str = ""
     if args.params and os.path.isfile(args.params):
         try:
             with open(args.params, "r") as f:
-                params = yaml.safe_load(f)
+                params_str = f.read()
+                params = yaml.safe_load(params_str)
             if rank == 0:
                 logging.info(f"Loaded parameters from {args.params}")
                 logging.debug(f"Parameters: {params}")
@@ -232,6 +247,9 @@ def main():
             "mpi_rank": rank,
             "hostname": os.uname().nodename,
             "ase_version": get_ase_version(),
+            "task": task,
+            "calculator": calculator_name,
+            "params": params_str,
         }
 
         try:
@@ -336,6 +354,26 @@ def main():
         )
         logging.info(f"Combined results saved to {jsonl_file}")
         logging.info(f"Total time: {time.time() - start_time} seconds.")
+
+    # SQLite database
+
+    if not os.path.exists(jsonl_file):
+        logging.error(f"JSONL file not found: {jsonl_file}")
+        sys.exit(1) 
+
+    db_path = args.database
+
+    if db_path:  
+
+        logging.info(f"Checking/Creating database at: {db_path}")
+        create_database(db_path)  
+
+        logging.info(f"Reading from JSONL file: {jsonl_file}")
+        insert_jsonl_to_db(jsonl_file, db_path)
+        logging.info(f"Finished inserting data into database: {db_path}")
+
+    else:
+        logging.info("No database specified.")
 
     return 0
 
