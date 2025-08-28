@@ -19,6 +19,9 @@ dependencies = [
     "rdkit",
     "nglview",
     "pandas",
+    "pymatgen",
+    "mace-torch",
+    "xtb",
 ]
 
 [project.optional-dependencies]
