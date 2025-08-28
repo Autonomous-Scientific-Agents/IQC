@@ -14,7 +14,7 @@ from ase.vibrations import Vibrations
 from ase.visualize import view
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdmolops
-from io import StringIO
+import io
 
 # Optional dependencies with informative messages
 XTB = None
@@ -1077,14 +1077,35 @@ def run_vibrations(
         # Get frequencies and energies from vib_data
         frequencies = vib_data.get_frequencies()  # cm^-1
         logging.debug(f"Frequencies in cm^-1: {frequencies}")
-        vib_energies = vib_data.get_energies()  # eV
-        logging.debug(f"Vibrational energies in eV: {vib_energies}")
+
+        logging.debug(
+            f"Vibrational energies (ev) and modes (3N, N, 3) as tuple (energies, modes)"
+        )
+        vib_energies, vib_modes = vib_data.get_energies_and_modes()  # eV
         results["frequencies_cm^-1"] = (
             frequencies.tolist() if hasattr(frequencies, "tolist") else frequencies
         )
         results["vib_energies"] = (
             vib_energies.tolist() if hasattr(vib_energies, "tolist") else vib_energies
         )  # Store energies for thermo
+        results["vib_modes"] = (
+            vib_modes.tolist() if hasattr(vib_modes, "tolist") else vib_modes
+        )
+        # In-memory text file:
+        buffer = io.BytesIO()
+        f = io.TextIOWrapper(buffer, encoding="utf-8", write_through=True)
+
+        # Write Jmol XYZ+vectors into the in-memory "file"
+        vib._write_jmol(f)  # <-- accepts any TextIO-like object
+
+        # Rewind and read the string
+        f.seek(0)
+        xyz_with_modes = buffer.getvalue().decode("utf-8")
+
+        # Clean up
+        f.close()
+        buffer.close()
+        results["jmol_vib_modes_xyz"] = xyz_with_modes
         nrot = 3
         if is_linear_by_inertia(atoms):
             nrot = 2
@@ -1224,7 +1245,7 @@ def get_atoms_from_xyz(xyz, parallel=False, index=-1):
     if os.path.isfile(xyz):
         atoms = read(xyz, format="xyz", parallel=parallel, index=index)
     elif isinstance(xyz, str):
-        atoms = read(StringIO(xyz), format="xyz", parallel=parallel, index=index)
+        atoms = read(io.StringIO(xyz), format="xyz", parallel=parallel, index=index)
     else:
         logging.error(f"Invalid input type for ase.io.read: {type(xyz)}")
         return None
