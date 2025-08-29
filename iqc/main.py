@@ -28,10 +28,7 @@ from iqc.xyztools import count_xyz_frames
 from iqc.cli import get_args
 from iqc.mpitools import get_start_end
 
-from iqc.databasetools import (
-	create_database,
-	insert_entry
-)
+from iqc.databasetools import create_database, insert_entry
 
 
 class ComplexEncoder(json.JSONEncoder):
@@ -90,6 +87,7 @@ def save_results(results, output_file):
                     f.write(f"{key}: {value}\n")
             logging.info(f"Results saved to {txt_file} in text format")
 
+
 def insert_jsonl_to_db(jsonl_file, db_path):
     with open(jsonl_file, "r") as f:
         for line_num, line in enumerate(f, 1):
@@ -98,6 +96,7 @@ def insert_jsonl_to_db(jsonl_file, db_path):
                 logging.debug(f"Inserted entry #{line_num} into database.")
             except Exception as e:
                 logging.error(f"Error inserting entry: {e}")
+
 
 def main():
     """Main function."""
@@ -333,12 +332,14 @@ def main():
     comm.Barrier()
     logging.debug(f"Took { time.time() - barrier_start:.2f} seconds")
 
+    # Define jsonl_file for all ranks
+    jsonl_file = f"iqc_{task}_results_{time_stamp}.jsonl"
+
     if rank == 0:
         combine_start = time.time()
         logging.debug(f"Starting to combine JSON files")
 
         # Combine all JSON files into a single JSONL file
-        jsonl_file = f"iqc_{task}_results_{time_stamp}.jsonl"
         json_files = glob.glob(os.path.join("tmp*", f"*_{task}_*.json"), recursive=True)
         logging.debug(f"Found {len(json_files)} JSON files to combine.")
         with open(jsonl_file, "w") as outfile:
@@ -355,24 +356,26 @@ def main():
         logging.info(f"Combined results saved to {jsonl_file}")
         logging.info(f"Total time: {time.time() - start_time} seconds.")
 
-    # SQLite database
+    # Wait for rank 0 to finish creating the JSONL file
+    comm.Barrier()
 
-    if not os.path.exists(jsonl_file):
-        logging.error(f"JSONL file not found: {jsonl_file}")
-        sys.exit(1) 
+    # SQLite database - only check file existence on rank 0
+    if rank == 0:
+        if not os.path.exists(jsonl_file):
+            logging.error(f"JSONL file not found: {jsonl_file}")
+            comm.Abort(1)
 
     db_path = args.database
 
-    if db_path:  
-
+    if db_path and rank == 0:
         logging.info(f"Checking/Creating database at: {db_path}")
-        create_database(db_path)  
+        create_database(db_path)
 
         logging.info(f"Reading from JSONL file: {jsonl_file}")
         insert_jsonl_to_db(jsonl_file, db_path)
         logging.info(f"Finished inserting data into database: {db_path}")
 
-    else:
+    elif rank == 0:
         logging.info("No database specified.")
 
     return 0
