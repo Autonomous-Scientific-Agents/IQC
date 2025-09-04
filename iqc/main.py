@@ -218,6 +218,12 @@ def main():
             logging.info(f"Checking/Creating database at: {db_path}")
             create_database(db_path)
 
+    dir_name = None
+    if not args.direct_db:
+        dir_name = f"{'tmp'}_{task}_{rank}_{time_stamp}"
+        logging.debug(f"Creating directory: {dir_name}")
+        os.makedirs(dir_name, exist_ok=True)
+
     for xyz_index in range(start_index, end_index):
 
         if number_of_files > 1:
@@ -228,13 +234,6 @@ def main():
         base_name = os.path.splitext(os.path.basename(xyz_file))[0]
         unique_name = f"{base_name}_{xyz_index}_{rank}_{time_stamp}"
         logging.info(f"Processing file: {xyz_file} with unique ID: {unique_name}")
-
-        if not args.direct_db:
-            dir_name = f"{'tmp'}_{task}_{rank}_{time_stamp}"
-            logging.debug(f"Creating directory: {dir_name}")
-            os.makedirs(dir_name, exist_ok=True)
-        else:
-            dir_name = None
 
         # Read input
         try:
@@ -398,6 +397,7 @@ def main():
     
     else:
         logging.info("Results were saved directly to the database. No files created.")
+        return 0
 
 
 if __name__ == "__main__":
