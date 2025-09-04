@@ -177,13 +177,6 @@ def main():
         comm.Abort(1)
     time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    if not args.direct_db:
-        dir_name = f"{'tmp'}_{task}_{rank}_{time_stamp}"
-        logging.debug(f"Creating directory: {dir_name}")
-        os.makedirs(dir_name, exist_ok=True)
-    else:
-        dir_name = None
-
     if rank == 0:
         if os.path.isdir(args.xyz):
             xyz_dir = args.xyz
@@ -226,6 +219,7 @@ def main():
             create_database(db_path)
 
     for xyz_index in range(start_index, end_index):
+
         if number_of_files > 1:
             xyz_file = xyz_files[xyz_index]
         else:  # only one file
@@ -234,6 +228,13 @@ def main():
         base_name = os.path.splitext(os.path.basename(xyz_file))[0]
         unique_name = f"{base_name}_{xyz_index}_{rank}_{time_stamp}"
         logging.info(f"Processing file: {xyz_file} with unique ID: {unique_name}")
+
+        if not args.direct_db:
+            dir_name = f"{'tmp'}_{task}_{rank}_{time_stamp}"
+            logging.debug(f"Creating directory: {dir_name}")
+            os.makedirs(dir_name, exist_ok=True)
+        else:
+            dir_name = None
 
         # Read input
         try:
