@@ -139,9 +139,9 @@ def insert_entry(json_line, db_path, debug=False):
 
         geometry_hash = hash_string(data["initial_xyz"])
         params_hash = hash_string(data["params"])
-        calculator = data.get("calculator")
-        model = data.get("model")
-        task = data.get("task")
+        calculator = data.get("calculator") # mace, xtb, emt
+        model = data.get("model") # small, medium, large
+        task = data.get("task") # single, opt, vib, thermo
         blob_data = json.dumps(data)
 
         with sqlite3.connect(db_path) as conn:
