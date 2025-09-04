@@ -1,7 +1,7 @@
 import sqlite3
 import json
 import hashlib
-
+import pandas as pd
 
 def create_database(db_path):
 
@@ -240,3 +240,44 @@ def process_json_file(json_file_path, db_path, debug=False, skip_errors=True):
             print(f"  Line {error['line_number']}: {error['error']}")
 
     return results
+
+def merge_databases(target_db_path, source_db_path):
+
+    try:
+        with sqlite3.connect(target_db_path) as conn:
+            cursor = conn.cursor()
+
+            cursor.execute(f"ATTACH DATABASE '{source_db_path}' AS source_db")
+
+            cursor.execute("""
+                INSERT OR IGNORE INTO calculations (
+                    geometry_hash, params_hash, calculator, model, task, blob_data
+                )
+                SELECT geometry_hash, params_hash, calculator, model, task, blob_data
+                FROM source_db.calculations
+            """)
+
+            cursor.execute("DETACH DATABASE source_db")
+            conn.commit()
+
+    except sqlite3.DatabaseError as e:
+        print(f"Database error during merge: {e}")
+
+    except Exception as e:
+        print(f"Unexpected error during merge: {e}")
+
+def database_to_dataframe(db):
+
+    conn = sqlite3.connect(db)
+    db_dataframe = pd.read_sql("SELECT * FROM calculations", conn)
+    conn.close()
+
+    return db_dataframe
+
+def database_to_data(db):
+
+    db_dataframe = database_to_dataframe(db)
+    blob_data_list = [json.loads(data) for data in db_dataframe['blob_data']]
+    db_data = pd.DataFrame(blob_data_list)
+
+    return db_data
