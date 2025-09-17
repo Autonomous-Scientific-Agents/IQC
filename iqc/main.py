@@ -359,11 +359,6 @@ def main():
     comm.Barrier()
     logging.debug(f"Took { time.time() - barrier_start:.2f} seconds")
 
-    if args.direct_db and rank == 0 and os.path.exists(central_tmp_dir):
-        import shutil
-        shutil.rmtree(central_tmp_dir)
-        logging.info(f"Removed temporary directory: {central_tmp_dir}")
-
     if not args.direct_db:
 
         # Define jsonl_file for all ranks
