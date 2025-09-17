@@ -108,6 +108,13 @@ def main():
 
     # Get command line arguments
     args = get_args()
+
+    # Create a central directory for tmp folders
+    central_tmp_dir = os.path.abspath("iqc_tmp")
+    if rank == 0 and not os.path.exists(central_tmp_dir):
+        os.makedirs(central_tmp_dir, exist_ok=True)
+    comm.Barrier()  
+
     # --- Logging Setup --- (Remains mostly the same)
     logger = logging.getLogger()
     log_level_name = args.loglevel.upper()
@@ -286,7 +293,9 @@ def main():
             elif task == "vib":
                 # Pass vibration parameters if added to config later
                 # vib_params = params.get('vibration_params', {})
-                if dir_name:
+                if args.direct_db:
+                    vib_params["vib_dir"] = central_tmp_dir
+                elif dir_name:
                     vib_params["vib_dir"] = dir_name
                 trajectory_file = None
                 save_geometry = False
@@ -310,7 +319,9 @@ def main():
                 ignore_imag = (
                     args.ignore_imag
                 )  # or thermo_params.get('ignore_imag_modes', args.ignore_imag)
-                if dir_name:
+                if args.direct_db:
+                    thermo_params["vib_dir"] = central_tmp_dir
+                elif dir_name:
                     thermo_params["vib_dir"] = dir_name
                 trajectory_file = None
                 save_geometry = False
@@ -347,6 +358,11 @@ def main():
     logging.debug(f"Waiting for all processes to finish before combining files.")
     comm.Barrier()
     logging.debug(f"Took { time.time() - barrier_start:.2f} seconds")
+
+    if args.direct_db and rank == 0 and os.path.exists(central_tmp_dir):
+        import shutil
+        shutil.rmtree(central_tmp_dir)
+        logging.info(f"Removed temporary directory: {central_tmp_dir}")
 
     if not args.direct_db:
 
