@@ -4,6 +4,14 @@ import hashlib
 import pandas as pd
 
 def create_database(db_path):
+    """
+    Create a SQLite database with a 'calculations' table if it does not exist.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to the SQLite database file.
+    """
 
     with sqlite3.connect(db_path) as conn:
 
@@ -28,6 +36,19 @@ def create_database(db_path):
 
 
 def hash_string(string):
+    """
+    Generate a SHA-256 hash for a given string, ignoring leading/trailing whitespace and empty lines.
+
+    Parameters
+    ----------
+    string : str
+        The input string to hash.
+
+    Returns
+    -------
+    str
+        The SHA-256 hash of the normalized string.
+    """
 
     # generate a hash for a string to simplify the unique key
     string_hash = "\n".join(
@@ -124,6 +145,18 @@ def inspect_json_data(json_line, max_length=500):
         return {"error": "Unexpected error", "message": str(e)}
 
 def insert_entry(json_line, db_path, debug=False):
+    """
+    Insert a calculation entry into the database from a JSON string.
+
+    Parameters
+    ----------
+    json_line : str
+        JSON string containing calculation data.
+    db_path : str
+        Path to the SQLite database file.
+    debug : bool, optional
+        If True, print debug information during validation and insertion.
+    """
 
     try:
         data = json.loads(json_line)
@@ -166,6 +199,16 @@ def insert_entry(json_line, db_path, debug=False):
         print(f"Error inserting entry: {e}")
 
 def merge_databases(target_db_path, source_db_path):
+    """
+    Merge calculation entries from a source database into a target database.
+
+    Parameters
+    ----------
+    target_db_path : str
+        Path to the target SQLite database file.
+    source_db_path : str
+        Path to the source SQLite database file.
+    """
 
     try:
         with sqlite3.connect(target_db_path) as conn:
@@ -191,6 +234,19 @@ def merge_databases(target_db_path, source_db_path):
         print(f"Unexpected error during merge: {e}")
 
 def database_to_dataframe(db):
+    """
+    Load the 'calculations' table from the database into a pandas DataFrame.
+
+    Parameters
+    ----------
+    db : str
+        Path to the SQLite database file.
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame containing all rows from the 'calculations' table.
+    """
 
     conn = sqlite3.connect(db)
     db_dataframe = pd.read_sql("SELECT * FROM calculations", conn)
@@ -199,6 +255,19 @@ def database_to_dataframe(db):
     return db_dataframe
 
 def database_to_data(db):
+    """
+    Convert the 'blob_data' column from the database into a pandas DataFrame of calculation data.
+
+    Parameters
+    ----------
+    db : str
+        Path to the SQLite database file.
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame containing the parsed calculation data from 'blob_data'.
+    """
 
     db_dataframe = database_to_dataframe(db)
     blob_data_list = [json.loads(data) for data in db_dataframe['blob_data']]
@@ -207,6 +276,19 @@ def database_to_data(db):
     return db_data
 
 def get_number_of_molecules(db):
+    """
+    Get the number of unique molecules in the database based on 'geometry_hash'.
+
+    Parameters
+    ----------
+    db : str
+        Path to the SQLite database file.
+
+    Returns
+    -------
+    int
+        Number of unique molecules in the database.
+    """
 
     db_dataframe = database_to_dataframe(db)
 
