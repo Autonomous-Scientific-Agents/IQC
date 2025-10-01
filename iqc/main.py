@@ -108,6 +108,13 @@ def main():
 
     # Get command line arguments
     args = get_args()
+
+    # Create a central directory for tmp folders
+    central_tmp_dir = os.path.abspath("iqc_tmp")
+    if rank == 0 and not os.path.exists(central_tmp_dir):
+        os.makedirs(central_tmp_dir, exist_ok=True)
+    comm.Barrier()  
+
     # --- Logging Setup --- (Remains mostly the same)
     logger = logging.getLogger()
     log_level_name = args.loglevel.upper()
@@ -176,9 +183,7 @@ def main():
         logging.error(f"Failed to initialize calculator '{calculator_name}': {e}")
         comm.Abort(1)
     time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dir_name = f"{'tmp'}_{task}_{rank}_{time_stamp}"
-    logging.debug(f"Creating directory: {dir_name}")
-    os.makedirs(dir_name, exist_ok=True)
+
     if rank == 0:
         if os.path.isdir(args.xyz):
             xyz_dir = args.xyz
@@ -214,7 +219,20 @@ def main():
     start_index, end_index = get_start_end(comm, number_of_xyz)
     logging.debug(f"Processing files from index {start_index} to {end_index}.")
     logging.info(f"Initialization time: {time.time() - start_time} seconds.")
+
+    db_path = args.database
+    if db_path and rank == 0:
+            logging.info(f"Checking/Creating database at: {db_path}")
+            create_database(db_path)
+
+    dir_name = None
+    if not args.direct_db:
+        dir_name = f"{'tmp'}_{task}_{rank}_{time_stamp}"
+        logging.debug(f"Creating directory: {dir_name}")
+        os.makedirs(dir_name, exist_ok=True)
+
     for xyz_index in range(start_index, end_index):
+
         if number_of_files > 1:
             xyz_file = xyz_files[xyz_index]
         else:  # only one file
@@ -275,7 +293,10 @@ def main():
             elif task == "vib":
                 # Pass vibration parameters if added to config later
                 # vib_params = params.get('vibration_params', {})
-                vib_params["vib_dir"] = dir_name
+                if args.direct_db:
+                    vib_params["vib_dir"] = central_tmp_dir
+                elif dir_name:
+                    vib_params["vib_dir"] = dir_name
                 trajectory_file = None
                 save_geometry = False
                 if args.save:
@@ -298,7 +319,10 @@ def main():
                 ignore_imag = (
                     args.ignore_imag
                 )  # or thermo_params.get('ignore_imag_modes', args.ignore_imag)
-                thermo_params["vib_dir"] = dir_name
+                if args.direct_db:
+                    thermo_params["vib_dir"] = central_tmp_dir
+                elif dir_name:
+                    thermo_params["vib_dir"] = dir_name
                 trajectory_file = None
                 save_geometry = False
                 if args.save:
@@ -322,9 +346,12 @@ def main():
             logging.error(f"Task '{task}' failed for {xyz_file}: {e}", exc_info=True)
 
         # Save results
-        output_file = f"{unique_name}_{task}_{time_stamp}_{rank}.json"
-        output_file = os.path.join(dir_name, output_file)
-        save_results(results, output_file)
+        if args.direct_db and db_path and rank == 0:
+            insert_entry(json.dumps(results), db_path)
+        elif not args.direct_db: 
+            output_file = f"{unique_name}_{task}_{time_stamp}_{rank}.json"
+            output_file = os.path.join(dir_name, output_file)
+            save_results(results, output_file)
 
     # Wait for all processes to finish before combining files
     barrier_start = time.time()
@@ -332,53 +359,56 @@ def main():
     comm.Barrier()
     logging.debug(f"Took { time.time() - barrier_start:.2f} seconds")
 
-    # Define jsonl_file for all ranks
-    jsonl_file = f"iqc_{task}_results_{time_stamp}.jsonl"
+    if not args.direct_db:
 
-    if rank == 0:
-        combine_start = time.time()
-        logging.debug(f"Starting to combine JSON files")
+        # Define jsonl_file for all ranks
+        jsonl_file = f"iqc_{task}_results_{time_stamp}.jsonl"
 
-        # Combine all JSON files into a single JSONL file
-        json_files = glob.glob(os.path.join("tmp*", f"*_{task}_*.json"), recursive=True)
-        logging.debug(f"Found {len(json_files)} JSON files to combine.")
-        with open(jsonl_file, "w") as outfile:
-            for json_file in json_files:
-                with open(json_file, "r") as infile:
-                    data = json.load(infile)
-                    json.dump(data, outfile)
-                    outfile.write("\n")
+        if rank == 0:
+            combine_start = time.time()
+            logging.debug(f"Starting to combine JSON files")
 
-        combine_end = time.time()
-        logging.debug(
-            f"Finished combining JSON files in {combine_end - combine_start:.2f} seconds"
-        )
-        logging.info(f"Combined results saved to {jsonl_file}")
-        logging.info(f"Total time: {time.time() - start_time} seconds.")
+            # Combine all JSON files into a single JSONL file
+            json_files = glob.glob(os.path.join("tmp*", f"*_{task}_*.json"), recursive=True)
+            logging.debug(f"Found {len(json_files)} JSON files to combine.")
+            with open(jsonl_file, "w") as outfile:
+                for json_file in json_files:
+                    with open(json_file, "r") as infile:
+                        data = json.load(infile)
+                        json.dump(data, outfile)
+                        outfile.write("\n")
 
-    # Wait for rank 0 to finish creating the JSONL file
-    comm.Barrier()
+            combine_end = time.time()
+            logging.debug(
+                f"Finished combining JSON files in {combine_end - combine_start:.2f} seconds"
+            )
+            logging.info(f"Combined results saved to {jsonl_file}")
+            logging.info(f"Total time: {time.time() - start_time} seconds.")
 
-    # SQLite database - only check file existence on rank 0
-    if rank == 0:
-        if not os.path.exists(jsonl_file):
-            logging.error(f"JSONL file not found: {jsonl_file}")
-            comm.Abort(1)
+        # Wait for rank 0 to finish creating the JSONL file
+        comm.Barrier()
 
-    db_path = args.database
+        # SQLite database - only check file existence on rank 0
+        if rank == 0:
+            if not os.path.exists(jsonl_file):
+                logging.error(f"JSONL file not found: {jsonl_file}")
+                comm.Abort(1)
 
-    if db_path and rank == 0:
-        logging.info(f"Checking/Creating database at: {db_path}")
-        create_database(db_path)
 
-        logging.info(f"Reading from JSONL file: {jsonl_file}")
-        insert_jsonl_to_db(jsonl_file, db_path)
-        logging.info(f"Finished inserting data into database: {db_path}")
+        if db_path and rank == 0:
 
-    elif rank == 0:
-        logging.info("No database specified.")
+            logging.info(f"Reading from JSONL file: {jsonl_file}")
+            insert_jsonl_to_db(jsonl_file, db_path)
+            logging.info(f"Finished inserting data into database: {db_path}")
 
-    return 0
+        elif rank == 0:
+            logging.info("No database specified.")
+
+        return 0
+    
+    else:
+        logging.info("Results were saved directly to the database. No files created.")
+        return 0
 
 
 if __name__ == "__main__":
