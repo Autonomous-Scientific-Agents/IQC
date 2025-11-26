@@ -21,10 +21,12 @@ dependencies = [
     "pandas",
     "pymatgen",
     "mace-torch",
-    "xtb",
 ]
 
 [project.optional-dependencies]
+xtb = [
+    "xtb",
+]
 test = [
     "pytest>=7.0",
     "pytest-mock",

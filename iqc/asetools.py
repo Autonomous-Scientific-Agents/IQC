@@ -53,7 +53,7 @@ def get_calculator(name="mace", **kwargs):
             from mace.calculators import mace_mp
 
             mace_kwargs = {
-                "model": "medium",
+                "model": "large",
                 "dispersion": True,
                 "default_dtype": "float64",
                 "device": "cpu",
@@ -89,10 +89,10 @@ def get_calculator(name="mace", **kwargs):
             logging.info(f"Using XTB calculator with arguments: {xtb_kwargs}")
         except ImportError:
             logging.warning(
-                "XTB not found. Install with 'pip install xtb-python'. Falling back to EMT."
+                "XTB not found. Install with 'pip install xtb' or 'pip install iqc[xtb]'. Falling back to MACE."
             )
         except Exception as e:
-            logging.warning(f"XTB initialization failed: {e}. Falling back to EMT.")
+            logging.warning(f"XTB initialization failed: {e}. Falling back to MACE.")
 
     elif name == "emt":
         try:
@@ -108,25 +108,58 @@ def get_calculator(name="mace", **kwargs):
             return None
 
     else:
-        logging.warning(f"Unknown calculator '{name}'. Falling back to EMT.")
+        logging.warning(f"Unknown calculator '{name}'. Falling back to MACE.")
 
-    # Fallback to EMT if the requested calculator failed or was unknown
+    # Fallback to MACE if the requested calculator failed or was unknown
+    # MACE is a required dependency, so it should be available
     if calculator is None:
         logging.warning(
-            f"Calculator '{name}' failed or not found. Attempting fallback to EMT."
+            f"Calculator '{name}' failed or not found. Attempting fallback to MACE."
         )
         try:
-            from ase.calculators.emt import EMT
+            from mace.calculators import mace_mp
 
-            calculator = EMT()
-            logging.info("Using EMT calculator as fallback.")
+            mace_kwargs = {
+                "model": "large",
+                "dispersion": True,
+                "default_dtype": "float64",
+                "device": "cpu",
+            }
+            try:
+                calculator = mace_mp(**mace_kwargs)
+                calculator.model_name = mace_kwargs["model"]
+                logging.info("Using MACE calculator as fallback.")
+            except Exception as e:
+                # Try without dispersion if the first attempt failed
+                logging.warning(
+                    f"Failed to initialize MACE fallback with dispersion: {str(e)}. Trying without dispersion."
+                )
+                mace_kwargs["dispersion"] = False
+                calculator = mace_mp(**mace_kwargs)
+                calculator.model_name = mace_kwargs["model"]
+                logging.info("Using MACE calculator as fallback (without dispersion).")
         except ImportError:
             logging.error(
-                "Fallback EMT calculator could not be imported. No calculator available."
+                "MACE fallback calculator could not be imported. MACE is a required dependency."
             )
             raise RuntimeError(
-                "No suitable ASE calculator found or could be initialized."
+                "No suitable ASE calculator found. MACE (required dependency) is not available."
             )
+        except Exception as e:
+            logging.error(f"MACE fallback initialization failed: {e}")
+            # Last resort: try EMT
+            try:
+                from ase.calculators.emt import EMT
+
+                calculator = EMT()
+                logging.warning("Using EMT calculator as last resort fallback.")
+            except ImportError:
+                logging.error(
+                    "All fallback calculators failed. No calculator available."
+                )
+                raise RuntimeError(
+                    "No suitable ASE calculator found or could be initialized."
+                )
 
     return calculator
 
