@@ -1,9 +1,17 @@
 import sqlite3
 import json
 import hashlib
-
+import pandas as pd
 
 def create_database(db_path):
+    """
+    Create a SQLite database with a 'calculations' table if it does not exist.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to the SQLite database file.
+    """
 
     with sqlite3.connect(db_path) as conn:
 
@@ -28,6 +36,19 @@ def create_database(db_path):
 
 
 def hash_string(string):
+    """
+    Generate a SHA-256 hash for a given string, ignoring leading/trailing whitespace and empty lines.
+
+    Parameters
+    ----------
+    string : str
+        The input string to hash.
+
+    Returns
+    -------
+    str
+        The SHA-256 hash of the normalized string.
+    """
 
     # generate a hash for a string to simplify the unique key
     string_hash = "\n".join(
@@ -65,7 +86,6 @@ def validate_data_structure(data, debug=False):
             print(f"Data preview: {dict(list(data.items())[:3])}...")
 
     return len(missing_keys) == 0, missing_keys, available_keys
-
 
 def inspect_json_data(json_line, max_length=500):
     """
@@ -124,8 +144,19 @@ def inspect_json_data(json_line, max_length=500):
     except Exception as e:
         return {"error": "Unexpected error", "message": str(e)}
 
-
 def insert_entry(json_line, db_path, debug=False):
+    """
+    Insert a calculation entry into the database from a JSON string.
+
+    Parameters
+    ----------
+    json_line : str
+        JSON string containing calculation data.
+    db_path : str
+        Path to the SQLite database file.
+    debug : bool, optional
+        If True, print debug information during validation and insertion.
+    """
 
     try:
         data = json.loads(json_line)
@@ -139,9 +170,9 @@ def insert_entry(json_line, db_path, debug=False):
 
         geometry_hash = hash_string(data["initial_xyz"])
         params_hash = hash_string(data["params"])
-        calculator = data.get("calculator")
-        model = data.get("model")
-        task = data.get("task")
+        calculator = data.get("calculator") # mace, xtb, emt
+        model = data.get("model") # small, medium, large
+        task = data.get("task") # single, opt, vib, thermo
         blob_data = json.dumps(data)
 
         with sqlite3.connect(db_path) as conn:
@@ -167,76 +198,103 @@ def insert_entry(json_line, db_path, debug=False):
     except Exception as e:
         print(f"Error inserting entry: {e}")
 
-
-def process_json_file(json_file_path, db_path, debug=False, skip_errors=True):
+def merge_databases(target_db_path, source_db_path):
     """
-    Process a JSON file (one JSON object per line) and insert entries into the database.
+    Merge calculation entries from a source database into a target database.
 
     Parameters
     ----------
-    json_file_path : str
-        Path to the JSON file to process
-    db_path : str
-        Path to the SQLite database
-    debug : bool, optional
-        If True, print detailed debugging information
-    skip_errors : bool, optional
-        If True, skip lines with errors and continue processing
+    target_db_path : str
+        Path to the target SQLite database file.
+    source_db_path : str
+        Path to the source SQLite database file.
+    """
+
+    try:
+        with sqlite3.connect(target_db_path) as conn:
+            cursor = conn.cursor()
+
+            cursor.execute(f"ATTACH DATABASE '{source_db_path}' AS source_db")
+
+            cursor.execute("""
+                INSERT OR IGNORE INTO calculations (
+                    geometry_hash, params_hash, calculator, model, task, blob_data
+                )
+                SELECT geometry_hash, params_hash, calculator, model, task, blob_data
+                FROM source_db.calculations
+            """)
+
+            cursor.execute("DETACH DATABASE source_db")
+            conn.commit()
+
+    except sqlite3.DatabaseError as e:
+        print(f"Database error during merge: {e}")
+
+    except Exception as e:
+        print(f"Unexpected error during merge: {e}")
+
+def database_to_dataframe(db):
+    """
+    Load the 'calculations' table from the database into a pandas DataFrame.
+
+    Parameters
+    ----------
+    db : str
+        Path to the SQLite database file.
 
     Returns
     -------
-    dict
-        Summary of processing results
+    pandas.DataFrame
+        DataFrame containing all rows from the 'calculations' table.
     """
-    results = {"total_lines": 0, "successful_inserts": 0, "errors": [], "skipped": 0}
 
-    try:
-        with open(json_file_path, "r") as file:
-            for line_num, line in enumerate(file, 1):
-                line = line.strip()
-                if not line:  # Skip empty lines
-                    continue
+    conn = sqlite3.connect(db)
+    db_dataframe = pd.read_sql("SELECT * FROM calculations", conn)
+    conn.close()
 
-                results["total_lines"] += 1
+    return db_dataframe
 
-                try:
-                    insert_entry(line, db_path, debug=debug)
-                    results["successful_inserts"] += 1
+def database_to_data(db):
+    """
+    Convert the 'blob_data' column from the database into a pandas DataFrame of calculation data.
 
-                except Exception as e:
-                    error_info = {
-                        "line_number": line_num,
-                        "error": str(e),
-                        "line_preview": line[:200] + "..." if len(line) > 200 else line,
-                    }
-                    results["errors"].append(error_info)
+    Parameters
+    ----------
+    db : str
+        Path to the SQLite database file.
 
-                    if debug:
-                        print(f"Error on line {line_num}: {e}")
-                        print(f"Line preview: {line[:200]}...")
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame containing the parsed calculation data from 'blob_data'.
+    """
 
-                    if not skip_errors:
-                        raise e
-                    else:
-                        results["skipped"] += 1
+    db_dataframe = database_to_dataframe(db)
+    blob_data_list = [json.loads(data) for data in db_dataframe['blob_data']]
+    db_data = pd.DataFrame(blob_data_list)
 
-    except FileNotFoundError:
-        print(f"File not found: {json_file_path}")
-        return results
-    except Exception as e:
-        print(f"Error processing file: {e}")
-        return results
+    return db_data
 
-    # Print summary
-    print(f"Processing complete:")
-    print(f"  Total lines: {results['total_lines']}")
-    print(f"  Successful inserts: {results['successful_inserts']}")
-    print(f"  Errors: {len(results['errors'])}")
-    print(f"  Skipped: {results['skipped']}")
+def get_number_of_molecules(db):
+    """
+    Get the number of unique molecules in the database based on 'geometry_hash'.
 
-    if results["errors"] and debug:
-        print("\nFirst few errors:")
-        for error in results["errors"][:5]:
-            print(f"  Line {error['line_number']}: {error['error']}")
+    Parameters
+    ----------
+    db : str
+        Path to the SQLite database file.
 
-    return results
+    Returns
+    -------
+    int
+        Number of unique molecules in the database.
+    """
+
+    db_dataframe = database_to_dataframe(db)
+
+    if db_dataframe.empty:
+        return 0
+
+    num_molecules = db_dataframe['geometry_hash'].nunique()
+
+    return num_molecules

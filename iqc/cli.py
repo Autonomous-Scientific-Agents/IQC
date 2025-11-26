@@ -96,5 +96,10 @@ def get_args():
         help="Save trajectory and optimized structures to file",
         action="store_true",
     )
+    parser.add_argument(
+        "--direct-db",
+        help="Save results directly to the SQLite database without creating any files.",
+        action="store_true",
+    )
 
     return parser.parse_args()
