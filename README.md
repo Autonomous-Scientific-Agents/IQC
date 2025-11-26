@@ -11,7 +11,32 @@ Interactive Quantum Chemistry
    cd IQC
    ```
 
-### Option 1: Using Conda
+### Option 1: Using uv (Recommended)
+
+[uv](https://github.com/astral-sh/uv) is a fast Python package installer and resolver written in Rust.
+
+1. Install uv (if not already installed):
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+   Or using pip:
+   ```bash
+   pip install uv
+   ```
+
+2. Create a virtual environment and install IQC:
+   ```bash
+   uv venv
+   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+   uv pip install -e .
+   ```
+
+   Or in a single command:
+   ```bash
+   uv pip install -e . --python 3.8
+   ```
+
+### Option 2: Using Conda
 
 1. First, install a package manager (Conda, Miniconda, Mamba, or MicroMamba)
    - Download Miniconda from the [official page](https://docs.conda.io/en/latest/miniconda.html)
@@ -28,7 +53,7 @@ Interactive Quantum Chemistry
    pip install .
    ```
 
-### Option 2: Using Docker
+### Option 3: Using Docker
 
 1. Build the Docker image:
    ```bash
