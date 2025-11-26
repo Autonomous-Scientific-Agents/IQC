@@ -161,7 +161,9 @@ def main():
     opt_params = params.get("optimization_params", {})
     vib_params = params.get("vibration_params", {})
     thermo_params = params.get("thermo_params", {})
-    opt_params = {**calc_params, **opt_params}
+    # Merge params for cascading: vib needs opt params (calls opt internally),
+    # thermo needs vib params (calls vib which calls opt internally)
+    # BUT: calc_params should NOT be merged - they're only for calculator initialization
     vib_params = {**opt_params, **vib_params}
     thermo_params = {**vib_params, **thermo_params}
     if rank == 0:
@@ -264,13 +266,17 @@ def main():
                 if args.save:
                     trajectory_file = f"{unique_name}_opt_trajectory.traj"
                     save_geometry = True
+                # Remove 'trajectory' from opt_params to avoid conflict with explicit trajectory parameter
+                opt_params_filtered = {
+                    k: v for k, v in opt_params.items() if k != "trajectory"
+                }
                 atoms, task_results = run_optimization(
                     atoms=atoms,
                     calculator=calculator,
                     unique_name=unique_name,
                     trajectory=trajectory_file,
                     save_geometry=save_geometry,
-                    **opt_params,
+                    **opt_params_filtered,
                 )
             elif task == "vib":
                 # Pass vibration parameters if added to config later
@@ -281,6 +287,10 @@ def main():
                 if args.save:
                     trajectory_file = f"{unique_name}_vib_trajectory.traj"
                     save_geometry = True
+                # Remove 'trajectory' from vib_params to avoid conflict with explicit trajectory parameter
+                vib_params_filtered = {
+                    k: v for k, v in vib_params.items() if k != "trajectory"
+                }
                 atoms, task_results = run_vibrations(
                     atoms=atoms,
                     calculator=calculator,
@@ -288,7 +298,7 @@ def main():
                     unique_name=unique_name,
                     trajectory=trajectory_file,
                     save_geometry=save_geometry,
-                    **vib_params,
+                    **vib_params_filtered,
                 )
             else:  # thermo
                 # Pass optimization and thermo parameters
@@ -304,6 +314,10 @@ def main():
                 if args.save:
                     trajectory_file = f"{unique_name}_thermo_trajectory.traj"
                     save_geometry = True
+                # Remove 'trajectory' from thermo_params to avoid conflict with explicit trajectory parameter
+                thermo_params_filtered = {
+                    k: v for k, v in thermo_params.items() if k != "trajectory"
+                }
                 atoms, task_results = run_thermo(
                     atoms=atoms,
                     calculator=calculator,
@@ -311,7 +325,7 @@ def main():
                     ignore_imag_modes=ignore_imag,
                     trajectory=trajectory_file,
                     save_geometry=save_geometry,
-                    **thermo_params,
+                    **thermo_params_filtered,
                 )
 
             # Merge task results into main results dict
