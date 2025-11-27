@@ -300,9 +300,16 @@ def main():
                 if args.save:
                     trajectory_file = f"{unique_name}_opt_trajectory.traj"
                     save_geometry = True
-                # Remove 'trajectory' from opt_params to avoid conflict with explicit trajectory parameter
+                # Filter out explicit parameters to avoid conflicts
+                explicit_params = {
+                    "atoms",
+                    "calculator",
+                    "unique_name",
+                    "trajectory",
+                    "save_geometry",
+                }
                 opt_params_filtered = {
-                    k: v for k, v in opt_params.items() if k != "trajectory"
+                    k: v for k, v in opt_params.items() if k not in explicit_params
                 }
                 atoms, task_results = run_optimization(
                     atoms=atoms,
@@ -324,9 +331,17 @@ def main():
                 if args.save:
                     trajectory_file = f"{unique_name}_vib_trajectory.traj"
                     save_geometry = True
-                # Remove 'trajectory' from vib_params to avoid conflict with explicit trajectory parameter
+                # Filter out explicit parameters to avoid conflicts
+                explicit_params = {
+                    "atoms",
+                    "calculator",
+                    "optimize",
+                    "unique_name",
+                    "trajectory",
+                    "save_geometry",
+                }
                 vib_params_filtered = {
-                    k: v for k, v in vib_params.items() if k != "trajectory"
+                    k: v for k, v in vib_params.items() if k not in explicit_params
                 }
                 atoms, task_results = run_vibrations(
                     atoms=atoms,
@@ -354,9 +369,17 @@ def main():
                 if args.save:
                     trajectory_file = f"{unique_name}_thermo_trajectory.traj"
                     save_geometry = True
-                # Remove 'trajectory' from thermo_params to avoid conflict with explicit trajectory parameter
+                # Filter out explicit parameters to avoid conflicts
+                explicit_params = {
+                    "atoms",
+                    "calculator",
+                    "unique_name",
+                    "ignore_imag_modes",
+                    "trajectory",
+                    "save_geometry",
+                }
                 thermo_params_filtered = {
-                    k: v for k, v in thermo_params.items() if k != "trajectory"
+                    k: v for k, v in thermo_params.items() if k not in explicit_params
                 }
                 atoms, task_results = run_thermo(
                     atoms=atoms,
