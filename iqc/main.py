@@ -38,7 +38,6 @@ class ComplexEncoder(json.JSONEncoder):
         elif isinstance(
             obj,
             (
-                np.int_,
                 np.intc,
                 np.intp,
                 np.int8,
@@ -52,13 +51,30 @@ class ComplexEncoder(json.JSONEncoder):
             ),
         ):
             return int(obj)
-        elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
+        # Handle np.int_ (removed in NumPy 2.0)
+        try:
+            if isinstance(obj, np.int_):
+                return int(obj)
+        except (AttributeError, TypeError):
+            pass
+        # Handle float types
+        if isinstance(obj, (np.float16, np.float32, np.float64)):
             return float(obj)
-        elif isinstance(obj, np.ndarray):
+        # Handle np.float_ (removed in NumPy 2.0)
+        try:
+            if isinstance(obj, np.float_):
+                return float(obj)
+        except (AttributeError, TypeError):
+            pass
+        if isinstance(obj, np.ndarray):
             return obj.tolist()
-        elif isinstance(obj, np.bool_):
-            return bool(obj)
-        elif hasattr(obj, "item"):  # Handle other numpy types
+        # Handle np.bool_ (removed in NumPy 2.0)
+        try:
+            if isinstance(obj, np.bool_):
+                return bool(obj)
+        except (AttributeError, TypeError):
+            pass
+        if hasattr(obj, "item"):  # Handle other numpy types
             return obj.item()
         return super().default(obj)
 
@@ -113,7 +129,7 @@ def main():
     central_tmp_dir = os.path.abspath("iqc_tmp")
     if rank == 0 and not os.path.exists(central_tmp_dir):
         os.makedirs(central_tmp_dir, exist_ok=True)
-    comm.Barrier()  
+    comm.Barrier()
 
     # --- Logging Setup --- (Remains mostly the same)
     logger = logging.getLogger()
@@ -224,8 +240,8 @@ def main():
 
     db_path = args.database
     if db_path and rank == 0:
-            logging.info(f"Checking/Creating database at: {db_path}")
-            create_database(db_path)
+        logging.info(f"Checking/Creating database at: {db_path}")
+        create_database(db_path)
 
     dir_name = None
     if not args.direct_db:
@@ -362,7 +378,7 @@ def main():
         # Save results
         if args.direct_db and db_path and rank == 0:
             insert_entry(json.dumps(results), db_path)
-        elif not args.direct_db: 
+        elif not args.direct_db:
             output_file = f"{unique_name}_{task}_{time_stamp}_{rank}.json"
             output_file = os.path.join(dir_name, output_file)
             save_results(results, output_file)
@@ -383,7 +399,9 @@ def main():
             logging.debug(f"Starting to combine JSON files")
 
             # Combine all JSON files into a single JSONL file
-            json_files = glob.glob(os.path.join("tmp*", f"*_{task}_*.json"), recursive=True)
+            json_files = glob.glob(
+                os.path.join("tmp*", f"*_{task}_*.json"), recursive=True
+            )
             logging.debug(f"Found {len(json_files)} JSON files to combine.")
             with open(jsonl_file, "w") as outfile:
                 for json_file in json_files:
@@ -408,7 +426,6 @@ def main():
                 logging.error(f"JSONL file not found: {jsonl_file}")
                 comm.Abort(1)
 
-
         if db_path and rank == 0:
 
             logging.info(f"Reading from JSONL file: {jsonl_file}")
@@ -419,7 +436,7 @@ def main():
             logging.info("No database specified.")
 
         return 0
-    
+
     else:
         logging.info("Results were saved directly to the database. No files created.")
         return 0
