@@ -405,10 +405,21 @@ def main():
             logging.debug(f"Found {len(json_files)} JSON files to combine.")
             with open(jsonl_file, "w") as outfile:
                 for json_file in json_files:
-                    with open(json_file, "r") as infile:
-                        data = json.load(infile)
-                        json.dump(data, outfile)
-                        outfile.write("\n")
+                    try:
+                        with open(json_file, "r") as infile:
+                            data = json.load(infile)
+                            json.dump(data, outfile)
+                            outfile.write("\n")
+                    except json.JSONDecodeError as e:
+                        logging.warning(
+                            f"Failed to parse JSON file {json_file}: {e}. Skipping."
+                        )
+                        continue
+                    except Exception as e:
+                        logging.warning(
+                            f"Error reading JSON file {json_file}: {e}. Skipping."
+                        )
+                        continue
 
             combine_end = time.time()
             logging.debug(
