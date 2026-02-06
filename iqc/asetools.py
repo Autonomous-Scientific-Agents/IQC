@@ -111,14 +111,14 @@ def get_calculator(name="mace", **kwargs):
 
         from fairchem.core import FAIRChemCalculator, pretrained_mlip
 
-        predictor = pretrained_mlip.get_predict_unit("uma-s-1p1", device="cuda")
+        predictor = pretrained_mlip.get_predict_unit("uma-s-1p1")
         calculator = FAIRChemCalculator(predictor, task_name="omol")
 
     elif name == "uma-m":
 
         from fairchem.core import FAIRChemCalculator, pretrained_mlip
 
-        predictor = pretrained_mlip.get_predict_unit("uma-m-1p1", device="cuda")
+        predictor = pretrained_mlip.get_predict_unit("uma-m-1p1")
         calculator = FAIRChemCalculator(predictor, task_name="omol")
 
     else:
