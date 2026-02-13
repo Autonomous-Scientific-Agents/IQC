@@ -20,7 +20,7 @@ dependencies = [
     "nglview",
     "pandas",
     "pymatgen",
-    "mace-torch",
+    "e3nn>=0.5",
 ]
 
 [project.optional-dependencies]
