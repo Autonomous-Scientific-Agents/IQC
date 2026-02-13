@@ -107,19 +107,24 @@ def get_calculator(name="mace", **kwargs):
             )
             return None
     
-    elif name == "uma-s":
+    elif name.startswith("uma"):
 
         from fairchem.core import FAIRChemCalculator, pretrained_mlip
 
-        predictor = pretrained_mlip.get_predict_unit("uma-s-1p1")
-        calculator = FAIRChemCalculator(predictor, task_name="omol")
+        if name.startswith("uma-m"):
+            predictor_name = "uma-m-1p1"
+        else: # default to UMA small
+            predictor_name = "uma-s-1p1"
 
-    elif name == "uma-m":
+        if "odac" in name:
+            task = "odac"
+        elif "omat" in name:
+            task = "omat"
+        else: # default to omol            
+            task = "omol"
 
-        from fairchem.core import FAIRChemCalculator, pretrained_mlip
-
-        predictor = pretrained_mlip.get_predict_unit("uma-m-1p1")
-        calculator = FAIRChemCalculator(predictor, task_name="omol")
+        predictor = pretrained_mlip.get_predict_unit(predictor_name)
+        calculator = FAIRChemCalculator(predictor, task_name=task)
 
     else:
         logging.warning(f"Unknown calculator '{name}'. Falling back to MACE.")
