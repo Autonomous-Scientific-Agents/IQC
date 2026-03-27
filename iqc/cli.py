@@ -67,7 +67,7 @@ def get_args():
         "-c",
         "--calculator",
         type=str,
-        choices=["mace", "xtb", "emt"],
+        choices=["mace", "xtb", "emt", "mace4ir"],
         default="mace",
         help="ASE calculator to use (default: mace)",
     )

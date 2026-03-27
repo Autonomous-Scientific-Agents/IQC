@@ -10,7 +10,7 @@ from ase.calculators.emt import EMT
 from ase.io import read, write
 from ase.optimize import BFGS
 from ase.thermochemistry import IdealGasThermo
-from ase.vibrations import Vibrations
+from ase.vibrations import Vibrations, Infrared
 from ase.visualize import view
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdmolops
@@ -50,29 +50,42 @@ def get_calculator(name="mace", **kwargs):
 
     if name == "mace":
         try:
-            from mace.calculators import mace_mp
-
-            mace_kwargs = {
-                "model": "large",
-                "dispersion": True,
-                "default_dtype": "float64",
-                "device": "cpu",
-                **kwargs,
-            }
-            try:
-                # Attempt with specified/default dispersion
-                calculator = mace_mp(**mace_kwargs)
-                calculator.model_name = mace_kwargs["model"]
-                logging.info(f"Using MACE calculator with arguments: {mace_kwargs}")
-            except Exception as e:
-                # Try without dispersion if the first attempt failed
-                logging.warning(
-                    f"Failed to initialize MACE with dispersion={mace_kwargs.get('dispersion')}: {str(e)}. Trying with dispersion=False."
-                )
-                mace_kwargs["dispersion"] = False
-                calculator = mace_mp(**mace_kwargs)
-                calculator.model_name = mace_kwargs["model"]
-                logging.info(f"Using MACE calculator with arguments: {mace_kwargs}")
+            model = kwargs.get("model", "large")
+            if os.path.isfile(model):
+                # Custom model path, use MACECalculator
+                from mace.calculators import MACECalculator
+                mace_kwargs = {
+                    "model_paths": model,
+                    "device": kwargs.get("device", "cpu"),
+                    "default_dtype": kwargs.get("default_dtype", "float64"),
+                }
+                calculator = MACECalculator(**mace_kwargs)
+                calculator.model_name = model
+                logging.info(f"Using MACE calculator with custom model: {model}")
+            else:
+                # Pretrained model
+                from mace.calculators import mace_mp
+                mace_kwargs = {
+                    "model": model,
+                    "dispersion": True,
+                    "default_dtype": "float64",
+                    "device": "cpu",
+                    **kwargs,
+                }
+                try:
+                    # Attempt with specified/default dispersion
+                    calculator = mace_mp(**mace_kwargs)
+                    calculator.model_name = mace_kwargs["model"]
+                    logging.info(f"Using MACE calculator with arguments: {mace_kwargs}")
+                except Exception as e:
+                    # Try without dispersion if the first attempt failed
+                    logging.warning(
+                        f"Failed to initialize MACE with dispersion={mace_kwargs.get('dispersion')}: {str(e)}. Trying with dispersion=False."
+                    )
+                    mace_kwargs["dispersion"] = False
+                    calculator = mace_mp(**mace_kwargs)
+                    calculator.model_name = mace_kwargs["model"]
+                    logging.info(f"Using MACE calculator with arguments: {mace_kwargs}")
         except ImportError:
             logging.warning(
                 "MACE not found. Install with 'pip install mace'. Falling back to EMT."
@@ -93,6 +106,34 @@ def get_calculator(name="mace", **kwargs):
             )
         except Exception as e:
             logging.warning(f"XTB initialization failed: {e}. Falling back to MACE.")
+
+    elif name == "mace4ir":
+        try:
+            from huggingface_hub import hf_hub_download, login
+            import os
+            hf_token = os.getenv('HF_TOKEN')
+            if hf_token:
+                login(hf_token)
+            else:
+                logging.warning("HF_TOKEN not set. MACE4IR requires authentication.")
+            # Download the dipole model for MACE4IR
+            model_path = hf_hub_download(
+                repo_id="nitbha007/MACE4IR",
+                filename="pretrained_models/model_1.model"  # Dipole model
+            )
+            from mace.calculators import MACECalculator
+            calculator = MACECalculator(
+                model_paths=model_path,
+                device="cpu",
+                default_dtype="float32"
+            )
+            logging.info(f"Using MACE4IR calculator with dipole model")
+        except ImportError:
+            logging.warning(
+                "huggingface_hub not found. Install with 'pip install huggingface_hub' for MACE4IR."
+            )
+        except Exception as e:
+            logging.warning(f"MACE4IR initialization failed: {e}. Note: MACE4IR requires the mace_dipole_pkg for dipole support. Install it from the tutorial.")
 
     elif name == "emt":
         try:
@@ -1102,7 +1143,14 @@ def run_vibrations(
         if vib_dir:
             os.makedirs(vib_dir, exist_ok=True)
             vib_name = os.path.join(vib_dir, vib_name)
-        vib = Vibrations(atoms, name=vib_name, indices=indices, delta=delta)
+        # Choose between Vibrations and Infrared based on calculator capabilities
+        use_ir = hasattr(calc, 'implemented_properties') and 'dipole' in calc.implemented_properties
+        if use_ir:
+            vib = Infrared(atoms, name=vib_name, indices=indices, delta=delta)
+            logging.info("Using Infrared for vibrational analysis (dipole moments available)")
+        else:
+            vib = Vibrations(atoms, name=vib_name, indices=indices, delta=delta)
+            logging.info("Using Vibrations for vibrational analysis (no dipole moments)")
         vib.run()
         vib_data = vib.get_vibrations()  # Get the VibrationsData object
         results["vib_time"] = time.time() - start_time
@@ -1124,6 +1172,13 @@ def run_vibrations(
         results["vib_modes"] = (
             vib_modes.tolist() if hasattr(vib_modes, "tolist") else vib_modes
         )
+        if use_ir:
+            # Get IR intensities
+            intensities = vib.intensities  # From Infrared
+            results["ir_intensities"] = (
+                intensities.tolist() if hasattr(intensities, "tolist") else intensities
+            )
+            logging.debug(f"IR intensities: {intensities}")
         # In-memory text file:
         buffer = io.BytesIO()
         f = io.TextIOWrapper(buffer, encoding="utf-8", write_through=True)

@@ -21,6 +21,7 @@ dependencies = [
     "pandas",
     "pymatgen",
     "mace-torch",
+    "huggingface_hub",
 ]
 
 [project.optional-dependencies]

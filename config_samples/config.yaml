@@ -1,12 +1,12 @@
 # Example IQC Configuration File
 
 # --- Calculator Settings ---
-# Specify the calculator name ('mace', 'xtb', 'emt')
+# Specify the calculator name ('mace', 'xtb', 'emt', 'mace4ir')
 calculator: mace
 
 # Parameters specific to the chosen calculator
 calculator_params:
-  model: small          # For MACE: 'small', 'medium', 'large'
+  model: large          # For MACE: 'small', 'medium', 'large' or path to custom model file
   dispersion: False      # For MACE: Use dispersion correction (requires DFTD4)
   default_dtype: float64 # For MACE: Precision ('float32' or 'float64')
   device: cpu           # For MACE: 'cpu' or 'cuda'
