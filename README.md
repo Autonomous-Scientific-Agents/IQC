@@ -87,8 +87,10 @@ IQC provides several computational tasks that can be performed on molecular syst
 
 - `single`: Single-point energy and force calculation
 - `vib`: Vibrational frequency calculation
+- `ir`: Infrared spectrum calculation
 - `opt`: Geometry optimization
 - `thermo`: Thermochemical analysis
+- `nmr`: Solution-state NMR shielding and spectrum simulation using ORCA, NWChem, or Gaussian, with optional xTB pre-optimization
 
 These tasks can be specified when running calculations. For example:
 
@@ -109,3 +111,108 @@ results = run_thermo(atoms)
 ```
 
 Each task returns a dictionary containing the results and timing information in milliseconds.
+
+## NMR Workflow
+
+The `nmr` task runs a backend-aware solution-state NMR workflow for small and medium-sized molecules. It can:
+
+- optimize the input geometry before the shielding calculation
+- optionally sample conformers with RDKit and apply Boltzmann weighting
+- run GIAO shielding calculations with `orca`, `nwchem`, or `gaussian`
+- simulate `1H` and `13C` spectra with Lorentzian, Gaussian, or pseudo-Voigt broadening
+- save plots plus tabulated per-atom and weighted peak data
+
+Reasonable defaults are provided for routine organic-molecule prediction:
+
+- backend: `orca`
+- nuclei: `1H` and `13C`
+- geometry optimization: enabled
+- conformer sampling: auto-enabled for flexible molecules when RDKit is available
+- optimization level: `B3LYP/def2-SVP`
+- shielding level: `PBE0/def2-TZVP`
+- solvent model: `smd`
+- solvent: `chloroform`
+- linewidth: `0.05 ppm` for `1H`, `1.0 ppm` for `13C`
+
+Built-in reference shieldings are available for `1H` and `13C` so the workflow works with minimal input, but they are approximate. For production use, pass calibrated values with `--reference-shielding`.
+
+### Basic Usage
+
+Minimal ORCA run:
+
+```bash
+iqc --task nmr --backend orca --xyz molecule.xyz --output-dir nmr_results
+```
+
+Generate the starting 3D geometry directly from a SMILES string with RDKit:
+
+```bash
+iqc --task nmr --backend orca --smiles CCO --output-dir nmr_results
+```
+
+Use xTB for cheap geometry optimization before ORCA shielding:
+
+```bash
+iqc --task nmr --backend orca --optimization-backend xtb --xyz molecule.xyz --output-dir nmr_results
+```
+
+Customize nuclei, method, basis, solvent, and references:
+
+```bash
+iqc --task nmr \
+  --backend gaussian \
+  --nuclei 1H 13C \
+  --method B3LYP \
+  --basis def2-TZVP \
+  --optimization-method B3LYP \
+  --optimization-basis def2-SVP \
+  --solvent-model smd \
+  --solvent dmso \
+  --reference-shielding 1H=31.77 \
+  --reference-shielding 13C=188.10 \
+  --xyz molecule.xyz \
+  --output-dir nmr_results
+```
+
+### Main NMR Options
+
+The most important CLI flags are:
+
+- `--backend`: shielding backend, one of `orca`, `nwchem`, `gaussian`
+- `--optimization-backend`: optional optimization backend, one of `orca`, `nwchem`, `gaussian`, `xtb`
+- `--nuclei`: nuclei to compute, for example `--nuclei 1H 13C`
+- `--method` and `--basis`: shielding calculation level
+- `--optimization-method` and `--optimization-basis`: geometry optimization level
+- `--solvent-model` and `--solvent`: implicit solvent settings
+- `--charge` and `--multiplicity`: total charge and spin state
+- `--optimize-geometry` / `--no-optimize-geometry`: control geometry optimization
+- `--conformer-sampling` / `--no-conformer-sampling`: control RDKit conformer sampling
+- `--num-conformers`: maximum number of retained conformers
+- `--temperature`: Boltzmann weighting temperature in Kelvin
+- `--linewidth`, `--lineshape`, and `--plot-range`: spectrum simulation controls
+- `--reference-shielding`: reference override in the form `nucleus=value`
+- `--output-dir`: directory for plots and tables
+
+When `--smiles` is used, IQC builds a 3D structure with RDKit and starts from the lowest-energy embedded conformer.
+
+`xtb` is supported only as `--optimization-backend`. It is not a direct NMR shielding backend.
+
+### Outputs
+
+The workflow writes:
+
+- a combined PNG spectrum plot for the requested nuclei
+- one CSV spectrum trace per nucleus
+- per-atom CSV and JSON tables with:
+  - conformer id
+  - atom index
+  - element
+  - nucleus
+  - isotropic shielding
+  - converted chemical shift
+  - conformer energy
+  - Boltzmann weight
+- weighted peak CSV and JSON tables
+- a conformer summary CSV with energies, weights, and convergence status
+
+These files make it easy to inspect raw shielding results, compare conformers, and post-process the simulated spectra.

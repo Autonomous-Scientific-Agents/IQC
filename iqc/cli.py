@@ -4,6 +4,21 @@ import argparse
 import os
 
 
+def add_bool_flag(parser, name, default=None, help_text=""):
+    """Add paired --flag / --no-flag boolean options."""
+
+    dest = name.lstrip("-").replace("-", "_")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(name, dest=dest, action="store_true", help=help_text)
+    group.add_argument(
+        f"--no-{dest.replace('_', '-')}",
+        dest=dest,
+        action="store_false",
+        help=f"Disable {dest.replace('_', ' ')}.",
+    )
+    parser.set_defaults(**{dest: default})
+
+
 def get_args():
     """
     Returns args object that contains command line options.
@@ -41,7 +56,13 @@ def get_args():
         "--xyz",
         type=str,
         default="xyz",
-        help="Path for an .xyz file or a directory containing .xyz files",
+        help="Path for an .xyz file or a directory containing .xyz files. Ignored when --smiles is provided.",
+    )
+    parser.add_argument(
+        "--smiles",
+        type=str,
+        default=None,
+        help="SMILES string to convert to a 3D geometry with RDKit. If provided, this takes precedence over --xyz.",
     )
     parser.add_argument(
         "--min-natom",
@@ -59,7 +80,7 @@ def get_args():
         "-t",
         "--task",
         type=str,
-        choices=["single", "opt", "vib", "thermo"],
+        choices=["single", "opt", "vib", "ir", "thermo", "nmr"],
         default="thermo",
         help="Calculation task to perform (default: thermo)",
     )
@@ -100,6 +121,131 @@ def get_args():
         "--direct-db",
         help="Save results directly to the SQLite database without creating any files.",
         action="store_true",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["orca", "nwchem", "gaussian", "xtb"],
+        default=None,
+        help="Electronic-structure backend for NMR calculations. xTB is only supported as --optimization-backend.",
+    )
+    parser.add_argument(
+        "--optimization-backend",
+        type=str,
+        choices=["orca", "nwchem", "gaussian", "xtb"],
+        default=None,
+        help="Backend for optional geometry optimization before NMR.",
+    )
+    parser.add_argument(
+        "--nuclei",
+        nargs="+",
+        default=None,
+        help="Nuclei to compute for NMR, e.g. --nuclei 1H 13C",
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        default=None,
+        help="Method for NMR shielding calculations.",
+    )
+    parser.add_argument(
+        "--basis",
+        type=str,
+        default=None,
+        help="Basis set for NMR shielding calculations.",
+    )
+    parser.add_argument(
+        "--optimization-method",
+        type=str,
+        default=None,
+        help="Method for optional geometry optimization before NMR.",
+    )
+    parser.add_argument(
+        "--optimization-basis",
+        type=str,
+        default=None,
+        help="Basis set for optional geometry optimization before NMR.",
+    )
+    parser.add_argument(
+        "--solvent-model",
+        type=str,
+        default=None,
+        help="Implicit solvent model for NMR calculations, e.g. smd or cpcm.",
+    )
+    parser.add_argument(
+        "--solvent",
+        type=str,
+        default=None,
+        help="Solvent name for implicit-solvent NMR calculations.",
+    )
+    parser.add_argument(
+        "--charge",
+        type=int,
+        default=None,
+        help="Total molecular charge for NMR calculations.",
+    )
+    parser.add_argument(
+        "--multiplicity",
+        type=int,
+        default=None,
+        help="Spin multiplicity for NMR calculations.",
+    )
+    add_bool_flag(
+        parser,
+        "--optimize-geometry",
+        default=None,
+        help_text="Optimize the geometry before the NMR calculation.",
+    )
+    add_bool_flag(
+        parser,
+        "--conformer-sampling",
+        default=None,
+        help_text="Perform RDKit-based conformer sampling before NMR.",
+    )
+    parser.add_argument(
+        "--num-conformers",
+        type=int,
+        default=None,
+        help="Maximum number of conformers to retain for NMR calculations.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Temperature in Kelvin for Boltzmann weighting.",
+    )
+    parser.add_argument(
+        "--linewidth",
+        type=float,
+        default=None,
+        help="Lorentzian/Gaussian line broadening in ppm for NMR spectra.",
+    )
+    parser.add_argument(
+        "--lineshape",
+        type=str,
+        choices=["lorentzian", "gaussian", "pseudo-voigt"],
+        default=None,
+        help="Line shape used to simulate the NMR spectrum.",
+    )
+    parser.add_argument(
+        "--plot-range",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("MIN_PPM", "MAX_PPM"),
+        help="Chemical-shift plotting range in ppm, applied to each requested nucleus.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Directory for NMR plots and tabulated outputs.",
+    )
+    parser.add_argument(
+        "--reference-shielding",
+        action="append",
+        default=None,
+        help="Reference shielding override in the form nucleus=value, e.g. 1H=31.77",
     )
 
     return parser.parse_args()

@@ -258,11 +258,67 @@ def get_rdmol_from_smiles(smiles: str, optimize=False, seed=0xF00D):
     Returns:
         rdkit.Chem.rdchem.Mol: The RDKit molecule object.
     """
-    rdmol = AllChem.MolFromSmiles(smiles)
-    rdmol = AllChem.AddHs(rdmol)
-    AllChem.EmbedMolecule(rdmol, randomSeed=seed)
-    if optimize:
-        AllChem.MMFFOptimizeMolecule(rdmol)
+    rdmol = Chem.MolFromSmiles(smiles)
+    if rdmol is None:
+        raise ValueError(f"Invalid SMILES string: {smiles}")
+
+    rdmol = Chem.AddHs(rdmol)
+    if not optimize:
+        status = AllChem.EmbedMolecule(rdmol, randomSeed=seed)
+        if status != 0:
+            raise ValueError(f"Failed to generate a 3D geometry from SMILES: {smiles}")
+        return rdmol
+
+    num_conformers = 20
+    params = AllChem.ETKDGv3() if hasattr(AllChem, "ETKDGv3") else AllChem.ETKDG()
+    params.randomSeed = seed
+    params.pruneRmsThresh = 0.35
+    params.enforceChirality = True
+    conf_ids = list(
+        AllChem.EmbedMultipleConfs(rdmol, numConfs=num_conformers, params=params)
+    )
+    if not conf_ids:
+        status = AllChem.EmbedMolecule(rdmol, randomSeed=seed)
+        if status != 0:
+            raise ValueError(f"Failed to generate a 3D geometry from SMILES: {smiles}")
+        conf_ids = [0]
+
+    props = None
+    force_field_name = "UFF"
+    if AllChem.MMFFHasAllMoleculeParams(rdmol):
+        props = AllChem.MMFFGetMoleculeProperties(rdmol)
+        if props is not None:
+            force_field_name = "MMFF94"
+
+    best_conf_id = int(conf_ids[0])
+    best_energy = None
+    for conf_id in conf_ids:
+        try:
+            if props is not None:
+                AllChem.MMFFOptimizeMolecule(
+                    rdmol, mmffVariant="MMFF94", confId=conf_id, maxIters=500
+                )
+                force_field = AllChem.MMFFGetMoleculeForceField(
+                    rdmol, props, confId=conf_id
+                )
+            else:
+                AllChem.UFFOptimizeMolecule(rdmol, confId=conf_id, maxIters=500)
+                force_field = AllChem.UFFGetMoleculeForceField(rdmol, confId=conf_id)
+            energy = float(force_field.CalcEnergy()) if force_field is not None else None
+        except Exception:
+            energy = None
+        if energy is not None and (best_energy is None or energy < best_energy):
+            best_energy = energy
+            best_conf_id = int(conf_id)
+
+    rdmol.SetIntProp("_IQCLowestEnergyConformerId", best_conf_id)
+    rdmol.SetProp(
+        "_IQCCanonicalSmiles",
+        Chem.MolToSmiles(Chem.RemoveHs(Chem.Mol(rdmol)), canonical=True),
+    )
+    rdmol.SetProp("_IQCForceField", force_field_name)
+    if best_energy is not None:
+        rdmol.SetDoubleProp("_IQCLowestEnergy", best_energy)
     return rdmol
 
 
@@ -306,17 +362,21 @@ def get_rdmol_from_xyz(xyz: str):
     return rdkit.Chem.AllChem.MolFromXYZBlock(xyz)
 
 
-def get_xyz_from_rdmol(rdmol):
+def get_xyz_from_rdmol(rdmol, conf_id=None):
     """
     Convert an RDKit molecule to an XYZ formatted string.
 
     Args:
         rdmol (rdkit.Chem.rdchem.Mol): The RDKit molecule object.
+        conf_id (int, optional): The conformer id to export. If not provided,
+            the lowest-energy conformer selected by IQC is used when available.
 
     Returns:
         str: The XYZ formatted string representing the molecule.
     """
-    conf = rdmol.GetConformer()
+    if conf_id is None and rdmol.HasProp("_IQCLowestEnergyConformerId"):
+        conf_id = rdmol.GetIntProp("_IQCLowestEnergyConformerId")
+    conf = rdmol.GetConformer(conf_id) if conf_id is not None else rdmol.GetConformer()
     xyz = str(rdmol.GetNumAtoms()) + "\n\n"
     for i in range(rdmol.GetNumAtoms()):
         at = rdmol.GetAtomWithIdx(i)
@@ -325,6 +385,25 @@ def get_xyz_from_rdmol(rdmol):
         x, y, z = pos.x, pos.y, pos.z
         xyz += f"{symbol} {x} {y} {z}\n"
     return xyz
+
+
+def get_atoms_from_smiles(smiles: str, seed=0xF00D):
+    """Generate an ASE Atoms object from a SMILES string using RDKit.
+
+    The geometry is built from the lowest-energy embedded conformer using MMFF94
+    when available, otherwise UFF.
+    """
+
+    rdmol = get_rdmol_from_smiles(smiles, optimize=True, seed=seed)
+    atoms = get_atoms_from_xyz(get_xyz_from_rdmol(rdmol))
+    atoms.info["smiles_input"] = smiles
+    if rdmol.HasProp("_IQCCanonicalSmiles"):
+        atoms.info["canonical_smiles"] = rdmol.GetProp("_IQCCanonicalSmiles")
+    if rdmol.HasProp("_IQCForceField"):
+        atoms.info["rdkit_force_field"] = rdmol.GetProp("_IQCForceField")
+    if rdmol.HasProp("_IQCLowestEnergy"):
+        atoms.info["rdkit_conformer_energy"] = rdmol.GetDoubleProp("_IQCLowestEnergy")
+    return atoms
 
 
 def convert_extended_xyz_to_standard(file_path):
@@ -1114,7 +1193,13 @@ def run_vibrations(
         logging.debug(
             f"Vibrational energies (ev) and modes (3N, N, 3) as tuple (energies, modes)"
         )
-        vib_energies, vib_modes = vib_data.get_energies_and_modes()  # eV
+        try:
+            vib_energies, vib_modes = vib_data.get_energies_and_modes()  # eV
+        except (AttributeError, TypeError, ValueError):
+            vib_energies = (
+                vib_data.get_energies() if hasattr(vib_data, "get_energies") else []
+            )
+            vib_modes = []
         results["frequencies_cm^-1"] = (
             frequencies.tolist() if hasattr(frequencies, "tolist") else frequencies
         )
@@ -1124,21 +1209,26 @@ def run_vibrations(
         results["vib_modes"] = (
             vib_modes.tolist() if hasattr(vib_modes, "tolist") else vib_modes
         )
-        # In-memory text file:
-        buffer = io.BytesIO()
-        f = io.TextIOWrapper(buffer, encoding="utf-8", write_through=True)
+        try:
+            # In-memory text file:
+            buffer = io.BytesIO()
+            f = io.TextIOWrapper(buffer, encoding="utf-8", write_through=True)
 
-        # Write Jmol XYZ+vectors into the in-memory "file"
-        vib._write_jmol(f)  # <-- accepts any TextIO-like object
+            # Write Jmol XYZ+vectors into the in-memory "file"
+            vib._write_jmol(f)  # <-- accepts any TextIO-like object
 
-        # Rewind and read the string
-        f.seek(0)
-        xyz_with_modes = buffer.getvalue().decode("utf-8")
+            # Rewind and read the string
+            f.seek(0)
+            xyz_with_modes = buffer.getvalue().decode("utf-8")
 
-        # Clean up
-        f.close()
-        buffer.close()
-        results["jmol_vib_modes_xyz"] = xyz_with_modes
+            # Clean up
+            f.close()
+            buffer.close()
+            results["jmol_vib_modes_xyz"] = xyz_with_modes
+        except Exception as e:
+            warning = f"Could not export Jmol vibrational modes: {e}"
+            logging.warning(warning)
+            results["warnings"].append(warning)
         nrot = 3
         if is_linear_by_inertia(atoms):
             nrot = 2
@@ -1170,6 +1260,168 @@ def run_vibrations(
         logging.error(error)
 
     logging.info(f"Vibrational analysis for {unique_name} completed")
+    return atoms, results
+
+
+def run_ir(
+    atoms,
+    calculator=None,
+    optimize=True,
+    unique_name="",
+    vib_dir=None,
+    indices=None,
+    fmax=0.01,
+    delta=0.01,
+    trajectory=None,
+    save_geometry=False,
+    ir_spectrum_start=500,
+    ir_spectrum_end=4000,
+    sparse_spectrum=False,
+    intensity_threshold=0.0,
+    **params,
+):
+    """
+    Run infrared spectrum calculations for an ASE Atoms object.
+
+    Args:
+        atoms (ase.Atoms): ASE Atoms object
+        calculator (ase.calculators.calculator.Calculator, optional): Calculator instance.
+        optimize (bool): Whether to optimize geometry before IR calculation.
+        unique_name (str): Unique name for the molecule
+        vib_dir (str, optional): Directory to store IR files. Defaults to None.
+        indices (list): List of atom indices to include in IR calculation
+        fmax (float): Maximum force for geometry optimization
+        delta (float): Displacement for finite difference calculation
+        trajectory (str): Path to save trajectory file during optimization
+        save_geometry (bool): Whether to save the final optimized geometry to xyz file
+        ir_spectrum_start (float): Start of IR spectrum range in cm^-1
+        ir_spectrum_end (float): End of IR spectrum range in cm^-1
+        sparse_spectrum (bool): Store only points above threshold instead of full spectrum
+        intensity_threshold (float): Absolute intensity cutoff used with sparse_spectrum
+
+    Returns:
+        tuple: A tuple containing the atoms and a dictionary with calculated properties
+    """
+    results = {
+        "warnings": [],
+        "error": "",
+        "spectrum_frequencies": [],
+        "spectrum_frequencies_units": "cm-1",
+        "spectrum_intensities": [],
+        "spectrum_intensities_units": "D/A^2 amu^-1",
+    }
+
+    try:
+        if calculator is None:
+            if atoms.calc is None:
+                calc, calc_results = _prepare_calculation(
+                    atoms, calculator, unique_name
+                )
+                results.update(calc_results)
+            else:
+                calc = atoms.calc
+        else:
+            calc = calculator
+    except Exception as e:
+        error = f"Error in calculator preparation: {e}"
+        results["error"] += error
+        logging.error(error)
+        return None, results
+
+    logging.debug(f"Starting IR calculations for {unique_name} with {str(calc)}")
+
+    if optimize:
+        atoms, opt_results = run_optimization(
+            atoms,
+            calculator=calc,
+            unique_name=unique_name,
+            fmax=fmax,
+            trajectory=trajectory,
+            save_geometry=save_geometry,
+            **params,
+        )
+        if opt_results.get("error"):
+            results["error"] += opt_results["error"]
+            logging.error("Optimization failed, cannot proceed with IR.")
+            return None, results
+        results.update(opt_results)
+    else:
+        logging.warning("No optimization requested, using given geometry for IR.")
+
+    try:
+        from ase.vibrations import Infrared
+    except ImportError as e:
+        error = f"Infrared module is not available in ASE: {e}\n"
+        results["error"] += error
+        logging.error(error)
+        return None, results
+
+    try:
+        start_time = time.time()
+        ir_name = f"tmp_ir_{unique_name}"
+        if vib_dir:
+            os.makedirs(vib_dir, exist_ok=True)
+            ir_name = os.path.join(vib_dir, ir_name)
+
+        ir = Infrared(atoms, name=ir_name, indices=indices, delta=delta)
+        ir.clean()
+        ir.run()
+
+        freq_intensity = ir.get_spectrum(
+            start=ir_spectrum_start,
+            end=ir_spectrum_end,
+        )
+        frequencies = np.asarray(freq_intensity[0], dtype=float)
+        intensities = np.asarray(freq_intensity[1], dtype=float)
+        if sparse_spectrum:
+            mask = np.abs(intensities) > intensity_threshold
+            frequencies_to_store = frequencies[mask]
+            intensities_to_store = intensities[mask]
+            results["spectrum_storage"] = "sparse"
+            results["spectrum_points_total"] = int(frequencies.size)
+            results["spectrum_points_stored"] = int(frequencies_to_store.size)
+            results["intensity_threshold"] = float(intensity_threshold)
+        else:
+            frequencies_to_store = frequencies
+            intensities_to_store = intensities
+            results["spectrum_storage"] = "full"
+            results["spectrum_points_total"] = int(frequencies.size)
+            results["spectrum_points_stored"] = int(frequencies.size)
+
+        results["spectrum_frequencies"] = frequencies_to_store.tolist()
+        results["spectrum_intensities"] = intensities_to_store.tolist()
+        results["ir_time"] = time.time() - start_time
+
+        try:
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots()
+            ax.plot(frequencies, intensities)
+            ax.set_xlabel("Frequency (cm^-1)")
+            ax.set_ylabel("Intensity (a.u.)")
+            ax.set_title("Infrared Spectrum")
+            ax.grid(True)
+
+            ir_plot_path = f"{ir_name}_spectrum.png"
+            fig.savefig(ir_plot_path, format="png", dpi=300)
+            plt.close(fig)
+
+            results["ir_plot"] = os.path.abspath(ir_plot_path)
+        except Exception as e:
+            warning = f"IR spectrum plot could not be generated: {e}"
+            logging.warning(warning)
+            results["warnings"].append(warning)
+
+        results["normal_mode_data"] = (
+            "Normal modes saved as .traj files with prefix "
+            f"{os.path.abspath(ir_name)}"
+        )
+    except Exception as e:
+        error = f"Error in IR analysis: {e}\n"
+        results["error"] += error
+        logging.error(error)
+
+    logging.info(f"IR analysis for {unique_name} completed")
     return atoms, results
 
 

@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import pickle
+import re
 import sys
 import glob
 from datetime import datetime
@@ -15,10 +16,12 @@ import time
 asepar.world = asepar.DummyMPI()
 from iqc.asetools import (
     run_optimization,
+    run_ir,
     run_single_point,
     run_thermo,
     run_vibrations,
     get_atoms_from_xyz,
+    get_atoms_from_smiles,
     get_calculator,
     get_ase_version,
 )
@@ -27,8 +30,16 @@ from mpi4py import MPI
 from iqc.xyztools import count_xyz_frames
 from iqc.cli import get_args
 from iqc.mpitools import get_start_end
+from iqc.nmr import run_nmr_workflow
 
 from iqc.databasetools import create_database, insert_entry
+
+
+def _smiles_to_basename(smiles: str) -> str:
+    """Convert a SMILES string into a filesystem-friendly stem."""
+
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", str(smiles)).strip("_")
+    return safe[:32] or "smiles"
 
 
 class ComplexEncoder(json.JSONEncoder):
@@ -114,6 +125,39 @@ def insert_jsonl_to_db(jsonl_file, db_path):
                 logging.error(f"Error inserting entry: {e}")
 
 
+def get_nmr_cli_overrides(args):
+    """Collect NMR-specific CLI overrides."""
+
+    mapping = {
+        "backend": "backend",
+        "optimization_backend": "optimization_backend",
+        "nuclei": "nuclei",
+        "method": "method",
+        "basis": "basis",
+        "optimization_method": "optimization_method",
+        "optimization_basis": "optimization_basis",
+        "solvent_model": "solvent_model",
+        "solvent": "solvent",
+        "charge": "charge",
+        "multiplicity": "multiplicity",
+        "optimize_geometry": "optimize_geometry",
+        "conformer_sampling": "conformer_sampling",
+        "num_conformers": "num_conformers",
+        "temperature": "temperature",
+        "linewidth": "linewidth",
+        "lineshape": "lineshape",
+        "plot_range": "plot_range",
+        "output_dir": "output_dir",
+        "reference_shielding": "reference_shieldings",
+    }
+    overrides = {}
+    for arg_name, param_name in mapping.items():
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            overrides[param_name] = value
+    return overrides
+
+
 def main():
     """Main function."""
     # Initialize MPI
@@ -183,27 +227,42 @@ def main():
     calc_params = params.get("calculator_params", {})
     opt_params = params.get("optimization_params", {})
     vib_params = params.get("vibration_params", {})
+    ir_params = params.get("ir_params", {})
     thermo_params = params.get("thermo_params", {})
-    # Merge params for cascading: vib needs opt params (calls opt internally),
+    nmr_params = params.get("nmr_params", {})
+    # Merge params for cascading:
+    # vib needs opt params (calls opt internally),
+    # ir uses vib-compatible params + optional ir-specific overrides,
     # thermo needs vib params (calls vib which calls opt internally)
     # BUT: calc_params should NOT be merged - they're only for calculator initialization
     vib_params = {**opt_params, **vib_params}
+    ir_params = {**vib_params, **ir_params}
     thermo_params = {**vib_params, **thermo_params}
     if rank == 0:
         logging.info(f"All parameters: {params}")
-    # Determine calculator name: CLI > Param file > Default ('mace')
-    calculator_name = args.calculator or params.get("calculator", "mace")
+    calculator = None
+    if task == "nmr":
+        calculator_name = args.backend or nmr_params.get("backend", "orca")
+    else:
+        # Determine calculator name: CLI > Param file > Default ('mace')
+        calculator_name = args.calculator or params.get("calculator", "mace")
 
-    # Initialize the calculator
-    try:
-        calculator = get_calculator(name=calculator_name, **calc_params)
-    except RuntimeError as e:
-        logging.error(f"Failed to initialize calculator '{calculator_name}': {e}")
-        comm.Abort(1)
+        # Initialize the calculator
+        try:
+            calculator = get_calculator(name=calculator_name, **calc_params)
+        except RuntimeError as e:
+            logging.error(f"Failed to initialize calculator '{calculator_name}': {e}")
+            comm.Abort(1)
     time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    input_mode = "smiles" if args.smiles else "xyz"
     if rank == 0:
-        if os.path.isdir(args.xyz):
+        if input_mode == "smiles":
+            xyz_files = [args.smiles]
+            number_of_xyz = 1
+            number_of_files = 1
+            logging.info(f"Using SMILES input: {args.smiles}")
+        elif os.path.isdir(args.xyz):
             xyz_dir = args.xyz
             xyz_files = glob.glob(os.path.join(xyz_dir, "*.xyz"))
             number_of_xyz = len(xyz_files)
@@ -231,6 +290,7 @@ def main():
             logging.info(f"Number of configurations: {number_of_xyz}")
 
     xyz_files = comm.bcast(xyz_files if rank == 0 else None, root=0)
+    input_mode = comm.bcast(input_mode if rank == 0 else None, root=0)
     number_of_xyz = comm.bcast(number_of_xyz if rank == 0 else None, root=0)
     number_of_files = len(xyz_files)
 
@@ -251,18 +311,26 @@ def main():
 
     for xyz_index in range(start_index, end_index):
 
-        if number_of_files > 1:
+        smiles_input = None
+        if input_mode == "smiles":
+            smiles_input = xyz_files[0]
+            xyz_file = f"smiles:{smiles_input}"
+            base_name = _smiles_to_basename(smiles_input)
+        elif number_of_files > 1:
             xyz_file = xyz_files[xyz_index]
+            base_name = os.path.splitext(os.path.basename(xyz_file))[0]
         else:  # only one file
             xyz_file = xyz_files[0]
+            base_name = os.path.splitext(os.path.basename(xyz_file))[0]
         time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_name = os.path.splitext(os.path.basename(xyz_file))[0]
         unique_name = f"{base_name}_{xyz_index}_{rank}_{time_stamp}"
-        logging.info(f"Processing file: {xyz_file} with unique ID: {unique_name}")
+        logging.info(f"Processing input: {xyz_file} with unique ID: {unique_name}")
 
         # Read input
         try:
-            if number_of_files > 1:
+            if input_mode == "smiles":
+                atoms = get_atoms_from_smiles(smiles_input)
+            elif number_of_files > 1:
                 atoms = get_atoms_from_xyz(xyz_file)
             else:
                 atoms = get_atoms_from_xyz(xyz_file, index=xyz_index)
@@ -277,6 +345,8 @@ def main():
 
         results = {
             "xyz_file": xyz_file,
+            "smiles_input": smiles_input or "",
+            "input_mode": input_mode,
             "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "mpi_size": size,
             "mpi_rank": rank,
@@ -352,7 +422,37 @@ def main():
                     save_geometry=save_geometry,
                     **vib_params_filtered,
                 )
-            else:  # thermo
+            elif task == "ir":
+                if args.direct_db:
+                    ir_params["vib_dir"] = central_tmp_dir
+                elif dir_name:
+                    ir_params["vib_dir"] = dir_name
+                trajectory_file = None
+                save_geometry = False
+                if args.save:
+                    trajectory_file = f"{unique_name}_ir_trajectory.traj"
+                    save_geometry = True
+                explicit_params = {
+                    "atoms",
+                    "calculator",
+                    "optimize",
+                    "unique_name",
+                    "trajectory",
+                    "save_geometry",
+                }
+                ir_params_filtered = {
+                    k: v for k, v in ir_params.items() if k not in explicit_params
+                }
+                atoms, task_results = run_ir(
+                    atoms=atoms,
+                    calculator=calculator,
+                    optimize=True,
+                    unique_name=unique_name,
+                    trajectory=trajectory_file,
+                    save_geometry=save_geometry,
+                    **ir_params_filtered,
+                )
+            elif task == "thermo":
                 # Pass optimization and thermo parameters
                 # thermo_params = params.get('thermo_params', {})
                 # Decide priority for ignore_imag: CLI flag or param file?
@@ -390,6 +490,21 @@ def main():
                     save_geometry=save_geometry,
                     **thermo_params_filtered,
                 )
+            elif task == "nmr":
+                nmr_run_params = {**nmr_params, **get_nmr_cli_overrides(args)}
+                if not nmr_run_params.get("output_dir"):
+                    base_output_dir = central_tmp_dir if args.direct_db else dir_name
+                    if base_output_dir:
+                        nmr_run_params["output_dir"] = os.path.join(
+                            base_output_dir, f"{unique_name}_nmr"
+                        )
+                atoms, task_results = run_nmr_workflow(
+                    atoms=atoms,
+                    unique_name=unique_name,
+                    **nmr_run_params,
+                )
+            else:
+                raise ValueError(f"Unsupported task '{task}'")
 
             # Merge task results into main results dict
             results.update(task_results)

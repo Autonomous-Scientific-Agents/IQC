@@ -15,6 +15,7 @@ from iqc.asetools import (
     save_atoms,
     translate_atoms,
     get_canonical_smiles_from_atoms,
+    get_atoms_from_smiles,
     atoms2xyz,
     get_total_electrons,
     get_spin,
@@ -130,6 +131,16 @@ H 0.0 1.0 0.0"""
     assert len(atoms) == 3
     assert atoms.get_chemical_symbols() == ["O", "H", "H"]
     assert atoms.positions.shape == (3, 3)
+
+
+def test_get_atoms_from_smiles():
+    """Test generating a 3D geometry from a SMILES string."""
+    atoms = get_atoms_from_smiles("O")
+    assert len(atoms) == 3
+    assert atoms.get_chemical_formula() == "H2O"
+    assert np.isfinite(atoms.positions).all()
+    assert atoms.info["smiles_input"] == "O"
+    assert atoms.info["canonical_smiles"] == "O"
 
 
 def test_get_ase_version():
