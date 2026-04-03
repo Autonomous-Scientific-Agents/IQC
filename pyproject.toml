@@ -17,6 +17,7 @@ dependencies = [
     "psutil",
     "ase",
     "rdkit",
+    "matplotlib",
     "nglview",
     "pandas",
     "pymatgen",
