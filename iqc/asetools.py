@@ -1112,20 +1112,101 @@ def get_total_electrons(atoms):
     return total_electrons
 
 
-def get_spin(atoms):
-    """Calculate spin for an ASE Atoms object based on total electron count.
+def get_spin(atoms, unpaired_electrons=None):
+    """Return total spin S = unpaired_electrons / 2 (ASE thermo convention).
 
-    For even number of electrons, spin=0 (singlet)
-    For odd number of electrons, spin=0.5 (doublet)
+    If `unpaired_electrons` is None, defaults to 1 for an odd electron count
+    (doublet) and 0 for an even electron count (singlet).
 
     Args:
         atoms: ASE Atoms object
+        unpaired_electrons (int, optional): Number of unpaired electrons. When
+            provided, overrides the parity-based default (e.g. for triplet
+            O2 pass unpaired_electrons=2).
 
     Returns:
-        float: Spin value (0.0 or 0.5)
+        float: Spin S (e.g. 0.0 for singlet, 0.5 for doublet, 1.0 for triplet).
     """
-    total_electrons = get_total_electrons(atoms)
-    return 0.5 if total_electrons % 2 else 0.0
+    if unpaired_electrons is None:
+        unpaired_electrons = get_total_electrons(atoms) % 2
+    return unpaired_electrons / 2.0
+
+
+def get_unpaired_electrons(atoms, spin=None):
+    """Resolve number of unpaired electrons (>=0).
+
+    Defaults to 1 for an odd electron count, 0 for an even count. Pass an
+    explicit `spin` (number of unpaired electrons) to override.
+    """
+    if spin is None:
+        return get_total_electrons(atoms) % 2
+    spin = int(spin)
+    if spin < 0:
+        raise ValueError(f"spin (unpaired electrons) must be >= 0, got {spin}")
+    return spin
+
+
+def apply_spin_charge(atoms, calculator, spin=None, charge=0):
+    """Apply spin and charge to `atoms` using the convention of `calculator`.
+
+    Different ASE calculators expect different inputs for spin state and
+    molecular charge. This helper exposes one user-facing convention and
+    translates internally:
+
+      - `spin` is the number of unpaired electrons (int >= 0). Pass None to
+        default from electron count parity.
+      - `charge` is the total molecular charge (int). Default 0.
+
+    Translation per calculator:
+      - XTB (`xtb.ase.calculator.XTB`): reads sums of
+        `atoms.get_initial_charges()` and `atoms.get_initial_magnetic_moments()`.
+        We place the totals on atom 0, leave others at 0.
+      - FAIRChem UMA (`fairchem.core.FAIRChemCalculator`): reads
+        `atoms.info["charge"]` and `atoms.info["spin"]`, where its `spin` is
+        the spin multiplicity 2S+1. We set `atoms.info["spin"] = spin + 1`.
+      - MACE (`MACECalculator` from mace_mp) and ASE EMT: no spin/charge
+        support; a warning is logged if non-default values are requested.
+
+    Returns:
+        int: Number of unpaired electrons that was applied (after defaulting).
+    """
+    unpaired = get_unpaired_electrons(atoms, spin)
+    charge = int(charge)
+    calc_class = type(calculator).__name__
+    n = len(atoms)
+
+    if calc_class == "XTB":
+        charges = [0.0] * n
+        magmoms = [0.0] * n
+        if n:
+            charges[0] = float(charge)
+            magmoms[0] = float(unpaired)
+        atoms.set_initial_charges(charges)
+        atoms.set_initial_magnetic_moments(magmoms)
+    elif calc_class == "FAIRChemCalculator":
+        atoms.info["charge"] = charge
+        atoms.info["spin"] = unpaired + 1  # multiplicity = 2S+1
+    elif calc_class in {"MACECalculator", "EMT"}:
+        default_unpaired = get_total_electrons(atoms) % 2
+        if charge != 0 or unpaired != default_unpaired:
+            logging.warning(
+                "%s does not support spin/charge; ignoring charge=%d, "
+                "unpaired_electrons=%d.",
+                calc_class,
+                charge,
+                unpaired,
+            )
+    else:
+        default_unpaired = get_total_electrons(atoms) % 2
+        if charge != 0 or unpaired != default_unpaired:
+            logging.warning(
+                "Spin/charge convention for calculator '%s' is unknown; "
+                "values not applied (charge=%d, unpaired_electrons=%d).",
+                calc_class,
+                charge,
+                unpaired,
+            )
+    return unpaired
 
 
 def get_inchikey(atoms):
@@ -1155,7 +1236,9 @@ def get_inchikey(atoms):
 atoms2inchikey = get_inchikey
 
 
-def _prepare_calculation(atoms, calculator=None, unique_name=""):
+def _prepare_calculation(
+    atoms, calculator=None, unique_name="", spin=None, charge=0
+):
     """
     Prepare atoms and calculator for a calculation.
 
@@ -1164,6 +1247,9 @@ def _prepare_calculation(atoms, calculator=None, unique_name=""):
         calculator (ase.calculators.calculator.Calculator): The calculator instance to use.
                                                             If None, get_calculator() is called.
         unique_name (str): Unique name for the molecule
+        spin (int, optional): Number of unpaired electrons. Defaults to electron
+            count parity (0 for even, 1 for odd).
+        charge (int): Total molecular charge. Defaults to 0.
 
     Returns:
         tuple: (calculator, initial_data, results_dict)
@@ -1181,6 +1267,10 @@ def _prepare_calculation(atoms, calculator=None, unique_name=""):
         raise ValueError("Failed to obtain a valid calculator.")
 
     calc = calculator
+
+    # Apply spin/charge in the convention expected by this calculator before
+    # attaching it; XTB and FAIRChem read these from the atoms object.
+    unpaired_electrons = apply_spin_charge(atoms, calc, spin=spin, charge=charge)
 
     # Get initial data
     initial_smiles = atoms2smiles(atoms)
@@ -1206,7 +1296,9 @@ def _prepare_calculation(atoms, calculator=None, unique_name=""):
     results = {
         "number_of_atoms": len(atoms),
         "number_of_electrons": get_total_electrons(atoms),
-        "spin": get_spin(atoms),
+        "spin": get_spin(atoms, unpaired_electrons),
+        "unpaired_electrons": unpaired_electrons,
+        "charge": charge,
         "formula": atoms.get_chemical_formula(mode="hill"),
         "unique_name": unique_name,
         "initial_smiles": initial_smiles,
@@ -1227,6 +1319,8 @@ def run_single_point(
     atoms,
     calculator=None,
     unique_name="",
+    spin=None,
+    charge=0,
 ):
     """
     Run a single point energy calculation for an ASE Atoms object.
@@ -1235,13 +1329,18 @@ def run_single_point(
         atoms (ase.Atoms): ASE Atoms object
         calculator (ase.calculators.calculator.Calculator, optional): Calculator instance. Defaults to None (uses get_calculator).
         unique_name (str): Unique name for the molecule
+        spin (int, optional): Number of unpaired electrons. Defaults to electron
+            count parity. Translated per-calculator by `apply_spin_charge`.
+        charge (int): Total molecular charge. Defaults to 0.
 
     Returns:
         tuple: A tuple containing the atoms and a dictionary with calculated properties
     """
     logging.info(f"Starting single point calculation for {unique_name}")
 
-    calc, results = _prepare_calculation(atoms, calculator, unique_name)
+    calc, results = _prepare_calculation(
+        atoms, calculator, unique_name, spin=spin, charge=charge
+    )
 
     try:
         start_time = time.time()
@@ -1271,6 +1370,8 @@ def run_optimization(
     max_steps=500,
     trajectory=None,
     save_geometry=False,
+    spin=None,
+    charge=0,
 ):
     """
     Run geometry optimization for an ASE Atoms object.
@@ -1283,11 +1384,16 @@ def run_optimization(
         max_steps (int): Maximum number of optimization steps
         trajectory (str): Path to save trajectory file
         save_geometry (bool): Whether to save the final optimized geometry to xyz file
+        spin (int, optional): Number of unpaired electrons. Defaults to electron
+            count parity. Translated per-calculator by `apply_spin_charge`.
+        charge (int): Total molecular charge. Defaults to 0.
 
     Returns:
         tuple: A tuple containing the optimized atoms and a dictionary with calculated properties
     """
-    calc, results = _prepare_calculation(atoms, calculator, unique_name)
+    calc, results = _prepare_calculation(
+        atoms, calculator, unique_name, spin=spin, charge=charge
+    )
     logging.info(f"Starting geometry optimization for {unique_name} with {str(calc)}")
     # Log optimization parameters
     logging.debug(f"Optimization parameters: fmax={fmax}, max_steps={max_steps}")
@@ -1381,6 +1487,8 @@ def run_vibrations(
     max_vib_imag=50,
     trajectory=None,
     save_geometry=False,
+    spin=None,
+    charge=0,
     **params,
 ):
     """
@@ -1412,7 +1520,7 @@ def run_vibrations(
         if calculator is None:
             if atoms.calc is None:
                 calc, calc_results = _prepare_calculation(
-                    atoms, calculator, unique_name
+                    atoms, calculator, unique_name, spin=spin, charge=charge
                 )
                 results.update(calc_results)  # Update results with calculator results
             else:
@@ -1437,6 +1545,8 @@ def run_vibrations(
             fmax=fmax,
             trajectory=trajectory,
             save_geometry=save_geometry,
+            spin=spin,
+            charge=charge,
             **params,
         )
         if opt_results.get("error"):  # Use get() to safely check for error
@@ -1706,6 +1816,8 @@ def run_thermo(
     unique_name="",
     trajectory=None,
     save_geometry=False,
+    spin=None,
+    charge=0,
     **params,
 ):
     """
@@ -1731,6 +1843,8 @@ def run_thermo(
         unique_name=unique_name,
         trajectory=trajectory,
         save_geometry=save_geometry,
+        spin=spin,
+        charge=charge,
         **params,
     )
     if results["error"]:
@@ -1767,7 +1881,7 @@ def run_thermo(
             geometry=get_geometry_type(atoms),
             atoms=atoms,
             potentialenergy=atoms.get_potential_energy(),
-            spin=get_spin(atoms),
+            spin=get_spin(atoms, results.get("unpaired_electrons")),
             symmetrynumber=results.get("opt_sym_number", 1),  # Use optimized symmetry
             ignore_imag_modes=ignore_imag_modes,
         )

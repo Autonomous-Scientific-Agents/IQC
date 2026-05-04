@@ -21,6 +21,8 @@ from iqc.asetools import (
     atoms2xyz,
     get_total_electrons,
     get_spin,
+    get_unpaired_electrons,
+    apply_spin_charge,
     xyz2atoms,
     get_calculator,
     get_ase_version,
@@ -127,6 +129,63 @@ def test_get_spin(water_atoms, methane_atoms):
     # Create OH radical (odd number of electrons)
     oh_radical = Atoms("OH", positions=[[0, 0, 0], [0, 0, 1]])
     assert get_spin(oh_radical) == 0.5
+
+    # Explicit unpaired-electron override (e.g. triplet O2 -> S=1)
+    o2 = Atoms("O2", positions=[[0, 0, 0], [0, 0, 1.2]])
+    assert get_spin(o2) == 0.0
+    assert get_spin(o2, unpaired_electrons=2) == 1.0
+
+
+def test_get_unpaired_electrons(water_atoms):
+    """Defaults to electron-count parity, override with explicit value."""
+    assert get_unpaired_electrons(water_atoms) == 0
+    oh_radical = Atoms("OH", positions=[[0, 0, 0], [0, 0, 1]])
+    assert get_unpaired_electrons(oh_radical) == 1
+    # Triplet override on a closed-shell parity molecule (e.g. O2)
+    o2 = Atoms("O2", positions=[[0, 0, 0], [0, 0, 1.2]])
+    assert get_unpaired_electrons(o2, spin=2) == 2
+    with pytest.raises(ValueError):
+        get_unpaired_electrons(water_atoms, spin=-1)
+
+
+def test_apply_spin_charge_xtb_convention():
+    """XTB reads sums of initial_charges and initial_magnetic_moments."""
+
+    class FakeXTB:
+        pass
+
+    FakeXTB.__name__ = "XTB"
+    atoms = Atoms("OH", positions=[[0, 0, 0], [0, 0, 1]])
+    unpaired = apply_spin_charge(atoms, FakeXTB(), spin=1, charge=-1)
+    assert unpaired == 1
+    assert int(round(atoms.get_initial_charges().sum())) == -1
+    assert int(round(atoms.get_initial_magnetic_moments().sum())) == 1
+
+
+def test_apply_spin_charge_fairchem_convention():
+    """FAIRChem UMA reads atoms.info; spin there is multiplicity (2S+1)."""
+
+    class FakeFAIR:
+        pass
+
+    FakeFAIR.__name__ = "FAIRChemCalculator"
+    atoms = Atoms("O2", positions=[[0, 0, 0], [0, 0, 1.2]])
+    apply_spin_charge(atoms, FakeFAIR(), spin=2, charge=0)
+    assert atoms.info["charge"] == 0
+    assert atoms.info["spin"] == 3  # triplet multiplicity
+
+
+def test_apply_spin_charge_emt_warns(caplog):
+    """EMT/MACE silently accept defaults but warn on non-default spin/charge."""
+    atoms = Atoms("H2O", positions=[[0, 0, 0], [0, 0, 1], [0, 1, 0]])
+    with caplog.at_level(logging.WARNING):
+        apply_spin_charge(atoms, EMT(), spin=0, charge=0)
+    assert not any("does not support" in r.message for r in caplog.records)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        apply_spin_charge(atoms, EMT(), spin=2, charge=-1)
+    assert any("does not support" in r.message for r in caplog.records)
 
 
 def test_xyz2atoms():
