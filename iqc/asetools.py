@@ -120,6 +120,25 @@ def get_calculator(name="mace", **kwargs):
                 "EMT not found, but it's usually built-in with ASE. Problem with ASE install? Returning None."
             )
             return None
+    
+    elif name.startswith("uma"):
+
+        from fairchem.core import FAIRChemCalculator, pretrained_mlip
+
+        if name.startswith("uma-m"):
+            predictor_name = "uma-m-1p1"
+        else: # default to UMA small
+            predictor_name = "uma-s-1p1"
+
+        if "odac" in name:
+            task = "odac"
+        elif "omat" in name:
+            task = "omat"
+        else: # default to omol            
+            task = "omol"
+
+        predictor = pretrained_mlip.get_predict_unit(predictor_name)
+        calculator = FAIRChemCalculator(predictor, task_name=task)
 
     else:
         logging.warning(f"Unknown calculator '{name}'. Falling back to MACE.")

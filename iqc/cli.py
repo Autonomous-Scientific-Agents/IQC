@@ -139,7 +139,9 @@ def get_args(argv=None):
         "-c",
         "--calculator",
         type=str,
-        choices=["mace", "xtb", "emt"],
+        choices=["mace", "xtb", "emt", 
+                 "uma-s-omol", "uma-s-omat", "uma-s-odac", 
+                 "uma-m-omol", "uma-m-omat", "uma-m-odac"],
         default="mace",
         help="ASE calculator to use (default: mace)",
     )
