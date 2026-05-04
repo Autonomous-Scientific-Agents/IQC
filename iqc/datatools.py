@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import sys
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -270,6 +271,49 @@ def _coerce_text_value(
     return value.strip() if value_label == "SMILES" else value
 
 
+def _sort_key(value: Any):
+    if isinstance(value, bool):
+        return (0, int(value))
+    if isinstance(value, (int, float)):
+        return (1, float(value))
+    if isinstance(value, (datetime, date)):
+        return (2, value.isoformat())
+    if isinstance(value, bytes):
+        return (3, value.decode("utf-8", errors="replace"))
+    if isinstance(value, str):
+        return (3, value)
+    return (4, str(value))
+
+
+def _sort_records(records, sort_values, sort_column: str, sort_order: str):
+    if sort_column is None:
+        return records
+    if sort_order not in {"up", "down"}:
+        raise ValueError("--sort_order must be 'up' or 'down'.")
+    if len(records) != len(sort_values):
+        raise ValueError(
+            f"Sort column '{sort_column}' row count does not match structure rows."
+        )
+
+    indexed_records = []
+    for record, sort_value in zip(records, sort_values):
+        if _is_missing_value(sort_value):
+            raise ValueError(
+                f"Sort column '{sort_column}' contains an empty value at row "
+                f"{record.row_index}."
+            )
+        indexed_records.append((_sort_key(sort_value), record))
+
+    return [
+        record
+        for _key, record in sorted(
+            indexed_records,
+            key=lambda item: item[0],
+            reverse=sort_order == "down",
+        )
+    ]
+
+
 def _read_column_values(input_file: str | Path, column_name: str) -> list[Any]:
     path = Path(input_file)
     if not path.exists():
@@ -293,7 +337,10 @@ def _read_column_values(input_file: str | Path, column_name: str) -> list[Any]:
 
 
 def read_xyz_column_records(
-    input_file: str | Path, column_name: str
+    input_file: str | Path,
+    column_name: str,
+    sort_column: str | None = None,
+    sort_order: str = "up",
 ) -> list[XYZColumnRecord]:
     """Read XYZ strings from a named column in a supported tabular data file."""
 
@@ -305,22 +352,36 @@ def read_xyz_column_records(
         )
         for row_index, value in enumerate(values)
     ]
-    return records
+    sort_values = (
+        _read_column_values(input_file, sort_column)
+        if sort_column is not None
+        else None
+    )
+    return _sort_records(records, sort_values, sort_column, sort_order)
 
 
 def read_smiles_column_records(
-    input_file: str | Path, column_name: str
+    input_file: str | Path,
+    column_name: str,
+    sort_column: str | None = None,
+    sort_order: str = "up",
 ) -> list[SMILESColumnRecord]:
     """Read SMILES strings from a named column in a supported tabular data file."""
 
     values = _read_column_values(input_file, column_name)
-    return [
+    records = [
         SMILESColumnRecord(
             row_index=row_index,
             smiles=_coerce_text_value(value, row_index, column_name, "SMILES"),
         )
         for row_index, value in enumerate(values)
     ]
+    sort_values = (
+        _read_column_values(input_file, sort_column)
+        if sort_column is not None
+        else None
+    )
+    return _sort_records(records, sort_values, sort_column, sort_order)
 
 
 def _arrow_column_summaries(table) -> list[ColumnSummary]:

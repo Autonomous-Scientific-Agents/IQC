@@ -30,7 +30,7 @@ The tabular reader supports:
 - Feather: `.feather`, `.ftr`
 - Arrow IPC: `.arrow`, `.ipc`
 
-For parquet, CSV/TSV, Feather, and Arrow IPC files, IQC reads only the requested structure column where the backend supports column projection. Excel and some JSON layouts are read through pandas.
+For parquet, CSV/TSV, Feather, and Arrow IPC files, IQC reads only the requested structure and sort columns where the backend supports column projection. Excel and some JSON layouts are read through pandas.
 
 ## Running Calculations From Data Columns
 
@@ -59,6 +59,27 @@ iqc --input molecules.parquet \
 ```
 
 `--xyz` and `--smiles` are mutually exclusive when `--input` is provided. Passing neither selector with calculation options is also an error because IQC cannot infer which column contains the structure.
+
+## Sorting Rows Before Processing
+
+Use `--sort COLUMN` to sort the tabular rows before IQC distributes and processes structures:
+
+```bash
+iqc --input molecules.parquet \
+  --smiles smiles \
+  --sort energy \
+  --sort_order up \
+  --task single
+```
+
+Sort order values are:
+
+- `up`: ascending order, the default
+- `down`: descending order
+
+The underscore form `--sort_order` and dashed form `--sort-order` are both accepted. Sorting preserves the original row identity in `data_row_index`; only processing order changes.
+
+Missing values in the sort column are rejected. This avoids silently placing incomplete rows at the beginning or end of a calculation campaign.
 
 ## XYZ Columns
 
@@ -106,6 +127,8 @@ Results from tabular inputs include source metadata:
 - `data_input_file`: source data file path
 - `data_xyz_column`: XYZ column name when using `--xyz`
 - `data_smiles_column`: SMILES column name when using `--smiles`
+- `data_sort_column`: sort column name when using `--sort`
+- `data_sort_order`: `up` or `down` when using `--sort`
 - `data_row_index`: zero-based row index from the source file
 
 This metadata lets downstream workflows trace each calculation result back to the original data row.

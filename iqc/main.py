@@ -147,6 +147,10 @@ def get_nmr_cli_overrides(args):
 def validate_input_args(args):
     """Return a user-facing validation error for unsupported --input combinations."""
 
+    if args.sort and not args.input:
+        return "Error: --sort can only be used with --input."
+    if args.sort_order_explicit and not args.sort:
+        return "Error: --sort_order requires --sort COLUMN."
     if not args.input or args.input_only:
         return None
     if args.input_xyz_column and args.input_smiles_column:
@@ -180,13 +184,12 @@ def main():
 
     # Get command line arguments
     args = get_args()
-    if args.input:
-        if args.input_only:
-            return run_input_inspection(args.input)
-        input_error = validate_input_args(args)
-        if input_error:
-            print(input_error, file=sys.stderr)
-            return 1
+    if args.input and args.input_only:
+        return run_input_inspection(args.input)
+    input_error = validate_input_args(args)
+    if input_error:
+        print(input_error, file=sys.stderr)
+        return 1
 
     # ASE must be imported before MPI initialization for calculation workflows.
     import ase  # noqa: F401
@@ -312,17 +315,32 @@ def main():
             logging.info(f"Using SMILES input: {args.smiles}")
         elif input_mode == "data_xyz":
             try:
-                xyz_files = read_xyz_column_records(args.input, args.xyz)
+                xyz_files = read_xyz_column_records(
+                    args.input,
+                    args.xyz,
+                    sort_column=args.sort,
+                    sort_order=args.sort_order,
+                )
             except Exception as e:
                 logging.error(f"Error reading XYZ column '{args.xyz}': {e}")
                 comm.Abort(1)
             number_of_xyz = len(xyz_files)
             number_of_files = number_of_xyz
             logging.info(f"Using XYZ column '{args.xyz}' from data input: {args.input}")
+            if args.sort:
+                logging.info(
+                    f"Sorted data input by column '{args.sort}' "
+                    f"({args.sort_order})."
+                )
             logging.info(f"Number of configurations: {number_of_xyz}")
         elif input_mode == "data_smiles":
             try:
-                xyz_files = read_smiles_column_records(args.input, args.smiles)
+                xyz_files = read_smiles_column_records(
+                    args.input,
+                    args.smiles,
+                    sort_column=args.sort,
+                    sort_order=args.sort_order,
+                )
             except Exception as e:
                 logging.error(f"Error reading SMILES column '{args.smiles}': {e}")
                 comm.Abort(1)
@@ -331,6 +349,11 @@ def main():
             logging.info(
                 f"Using SMILES column '{args.smiles}' from data input: {args.input}"
             )
+            if args.sort:
+                logging.info(
+                    f"Sorted data input by column '{args.sort}' "
+                    f"({args.sort_order})."
+                )
             logging.info(f"Number of configurations: {number_of_xyz}")
         elif os.path.isdir(args.xyz):
             xyz_dir = args.xyz
@@ -433,6 +456,8 @@ def main():
             "data_input_file": args.input or "",
             "data_xyz_column": args.xyz if input_mode == "data_xyz" else "",
             "data_smiles_column": args.smiles if input_mode == "data_smiles" else "",
+            "data_sort_column": args.sort or "",
+            "data_sort_order": args.sort_order if args.sort else "",
             "data_row_index": (
                 xyz_record.row_index
                 if input_mode == "data_xyz"

@@ -136,12 +136,20 @@ Run a calculation from a column containing SMILES strings:
 iqc --input molecules.csv --smiles smiles --task opt
 ```
 
-Supported input formats include parquet (`.parquet`, `.pq`), CSV/TSV text files, Excel files (`.xls`, `.xlsx`, `.xlsm`, `.ods`), JSON/JSONL, Feather, and Arrow IPC. For parquet, CSV/TSV, Feather, and Arrow IPC, IQC reads only the requested structure column where possible.
+Sort tabular rows before running the task:
+
+```bash
+iqc --input molecules.parquet --smiles smiles --sort energy --sort_order up --task single
+```
+
+Supported input formats include parquet (`.parquet`, `.pq`), CSV/TSV text files, Excel files (`.xls`, `.xlsx`, `.xlsm`, `.ods`), JSON/JSONL, Feather, and Arrow IPC. For parquet, CSV/TSV, Feather, and Arrow IPC, IQC reads only the requested structure and sort columns where possible.
 
 When `--input` is used for a calculation, pass exactly one structure selector:
 
 - `--xyz COLUMN`: read XYZ-format geometry strings from `COLUMN`
 - `--smiles COLUMN`: read SMILES strings from `COLUMN` and build 3D geometries with RDKit
+
+Use `--sort COLUMN` to sort rows before processing. `--sort_order up` sorts ascending and `--sort_order down` sorts descending; the default is `up`. Missing sort values are rejected.
 
 CSV files may contain multiline XYZ values, but those cells must be quoted by the CSV writer. For example:
 
@@ -155,7 +163,7 @@ H 1 0 0
 "
 ```
 
-Results written from tabular inputs include `input_mode`, `data_input_file`, `data_xyz_column` or `data_smiles_column`, and `data_row_index` so each output can be traced back to the source row.
+Results written from tabular inputs include `input_mode`, `data_input_file`, `data_xyz_column` or `data_smiles_column`, `data_sort_column`, `data_sort_order`, and `data_row_index` so each output can be traced back to the source row.
 
 See [docs/data_input.md](docs/data_input.md) for the full tabular input guide.
 

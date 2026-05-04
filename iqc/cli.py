@@ -80,6 +80,23 @@ def get_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--sort",
+        type=str,
+        default=None,
+        help=(
+            "Column name used to sort tabular --input rows before running a "
+            "calculation."
+        ),
+    )
+    parser.add_argument(
+        "--sort-order",
+        "--sort_order",
+        dest="sort_order",
+        choices=["up", "down"],
+        default="up",
+        help="Sort order for --sort: up for ascending or down for descending.",
+    )
+    parser.add_argument(
         "-x",
         "--xyz",
         type=str,
@@ -289,4 +306,7 @@ def get_args(argv=None):
         explicit_options.intersection({"-x", "--xyz"})
     )
     args.input_smiles_column = bool(args.input) and "--smiles" in explicit_options
+    args.sort_order_explicit = bool(
+        explicit_options.intersection({"--sort-order", "--sort_order"})
+    )
     return args

@@ -27,6 +27,7 @@ from iqc.asetools import (
     get_symmetry_info,
     run_vibrations,
     run_thermo,
+    _normalize_calculator_compatibility,
 )
 
 
@@ -230,6 +231,19 @@ def test_get_calculator_mace_unavailable_fallback():
         except ImportError:
             # This could happen if EMT also fails to import
             pytest.skip("Neither MACE nor EMT fallback available.")
+
+
+def test_normalize_calculator_exposes_sumcalculator_calcs():
+    """Test compatibility shim for ASE SumCalculator child calculators."""
+
+    calculator = SumCalculator([EMT(), EMT()])
+    assert not hasattr(calculator, "calcs")
+
+    normalized = _normalize_calculator_compatibility(calculator)
+
+    assert normalized is calculator
+    assert calculator.calcs is calculator.mixer.calcs
+    assert len(calculator.calcs) == 2
 
 
 def test_get_calculator_xtb_success():

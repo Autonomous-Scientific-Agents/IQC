@@ -33,6 +33,20 @@ def get_ase_version():
     return ase.__version__
 
 
+def _normalize_calculator_compatibility(calculator):
+    """Expose stable compatibility attributes across ASE calculator versions."""
+
+    if calculator is None:
+        return None
+
+    mixer = getattr(calculator, "mixer", None)
+    mixer_calcs = getattr(mixer, "calcs", None)
+    if mixer_calcs is not None and not hasattr(calculator, "calcs"):
+        calculator.calcs = mixer_calcs
+
+    return calculator
+
+
 def get_calculator(name="mace", **kwargs):
     """Initializes and returns the specified ASE calculator.
 
@@ -161,7 +175,7 @@ def get_calculator(name="mace", **kwargs):
                     "No suitable ASE calculator found or could be initialized."
                 )
 
-    return calculator
+    return _normalize_calculator_compatibility(calculator)
 
 
 def save_atoms(atoms, prefix="", suffix="", file_format="xyz", directory=None):
@@ -304,7 +318,9 @@ def get_rdmol_from_smiles(smiles: str, optimize=False, seed=0xF00D):
             else:
                 AllChem.UFFOptimizeMolecule(rdmol, confId=conf_id, maxIters=500)
                 force_field = AllChem.UFFGetMoleculeForceField(rdmol, confId=conf_id)
-            energy = float(force_field.CalcEnergy()) if force_field is not None else None
+            energy = (
+                float(force_field.CalcEnergy()) if force_field is not None else None
+            )
         except Exception:
             energy = None
         if energy is not None and (best_energy is None or energy < best_energy):
