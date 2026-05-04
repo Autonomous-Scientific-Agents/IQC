@@ -53,6 +53,28 @@ Interactive Quantum Chemistry
    pip install .
    ```
 
+### MACE and UMA Calculators
+
+To install MACE and FAIRChem UMA in the same Python 3.11+ environment, install
+IQC's MLIP runtime dependencies first, then install `mace-torch` without
+dependencies so its old `e3nn==0.4.4` metadata does not downgrade the newer
+UMA-compatible `e3nn` stack:
+
+```bash
+uv pip install -e ".[mlip]"
+uv pip install --no-deps mace-torch
+```
+
+For Conda environments created from `env.yml`, run this after activation:
+
+```bash
+python -m pip install --no-deps mace-torch
+python -m pip install -e .
+```
+
+See [docs/calculators.md](docs/calculators.md) for calculator names, UMA model
+mapping, and Hugging Face setup.
+
 ### Option 3: Using Docker
 
 1. Build the Docker image:
@@ -111,6 +133,20 @@ results = run_thermo(atoms)
 ```
 
 Each task returns a dictionary containing the results and timing information in milliseconds.
+
+## Calculator Selection
+
+Use `--calculator` to choose the ASE calculator for `single`, `opt`, `vib`,
+`ir`, and `thermo` tasks:
+
+```bash
+iqc --xyz molecule.xyz --calculator mace --task opt
+iqc --xyz molecule.xyz --calculator uma-s-omol --task single
+```
+
+Supported names are `mace`, `xtb`, `emt`, `uma`, `uma-s-omol`, `uma-s-omat`,
+`uma-s-odac`, `uma-m-omol`, `uma-m-omat`, and `uma-m-odac`. `uma` is an alias
+for `uma-s-omol`.
 
 ## Tabular Data Input
 

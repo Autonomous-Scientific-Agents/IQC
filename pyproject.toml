@@ -24,10 +24,29 @@ dependencies = [
     "openpyxl",
     "xlrd",
     "pymatgen",
+    # Keep e3nn unpinned for UMA/fairchem compatibility. MACE metadata pins
+    # e3nn==0.4.4, so install mace-torch separately with --no-deps.
     "e3nn>=0.5",
 ]
 
 [project.optional-dependencies]
+mlip = [
+    "fairchem-core>=2.0; python_version >= '3.11'",
+    "torch-dftd",
+    "torch-ema",
+    "prettytable",
+    "matscipy",
+    "h5py",
+    "torchmetrics",
+    "python-hostlist",
+    "configargparse",
+    "GitPython",
+    "PyYAML",
+    "tqdm",
+    "lmdb",
+    "orjson",
+    "opt_einsum",
+]
 xtb = [
     "xtb",
 ]

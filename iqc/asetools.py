@@ -47,11 +47,256 @@ def _normalize_calculator_compatibility(calculator):
     return calculator
 
 
+def _patch_e3nn_codegen_legacy_state(codegen_mixin=None):
+    """Allow newer e3nn to load MACE checkpoints saved with older codegen state."""
+
+    if codegen_mixin is None:
+        try:
+            from e3nn.util.codegen import _mixin as codegen_mixin
+        except Exception:
+            return False
+
+    codegen_cls = getattr(codegen_mixin, "CodeGenMixin", None)
+    if codegen_cls is None or getattr(codegen_cls, "_iqc_legacy_state_patch", False):
+        return False
+
+    original_setstate = getattr(codegen_cls, "__setstate__", None)
+    code = getattr(original_setstate, "__code__", None)
+    if original_setstate is None or code is None:
+        return False
+
+    if "buffer_type" not in code.co_varnames:
+        return False
+
+    def _iqc_setstate(self, state):
+        if isinstance(state, dict):
+            codegen_state = state.get("__codegen__")
+            if isinstance(codegen_state, dict):
+                legacy_codegen_state = {
+                    name: (
+                        ("torchscript", buffer) if isinstance(buffer, bytes) else buffer
+                    )
+                    for name, buffer in codegen_state.items()
+                }
+                if legacy_codegen_state != codegen_state:
+                    state = state.copy()
+                    state["__codegen__"] = legacy_codegen_state
+        return original_setstate(self, state)
+
+    codegen_cls.__setstate__ = _iqc_setstate
+    codegen_cls._iqc_legacy_state_patch = True
+    codegen_cls._iqc_original_setstate = original_setstate
+    return True
+
+
+def _make_e3nn_spherical_harmonics_func():
+    """Build the callable e3nn 0.5 expects on SphericalHarmonics instances."""
+
+    import torch
+    from e3nn import get_optimization_defaults
+    from e3nn.o3._spherical_harmonics import _spherical_harmonics
+
+    jit_mode = get_optimization_defaults().get("jit_mode")
+    if jit_mode == "script":
+        return torch.jit.script(_spherical_harmonics)
+    if jit_mode == "inductor":
+        return torch.compile(_spherical_harmonics, fullgraph=True)
+    return _spherical_harmonics
+
+
+def _restore_e3nn_spherical_harmonics_sph_func(module, sph_func_factory=None):
+    """Restore e3nn 0.5 SphericalHarmonics state missing from old checkpoints."""
+
+    if module.__class__.__name__ != "SphericalHarmonics":
+        return False
+    if hasattr(module, "sph_func"):
+        return False
+
+    if sph_func_factory is None:
+        sph_func_factory = _make_e3nn_spherical_harmonics_func
+    module.sph_func = sph_func_factory()
+    return True
+
+
+def _patch_e3nn_spherical_harmonics_legacy_state(
+    spherical_harmonics_cls=None, sph_func_factory=None
+):
+    """Patch e3nn SphericalHarmonics restored from older MACE checkpoints."""
+
+    if spherical_harmonics_cls is None:
+        try:
+            from e3nn.o3._spherical_harmonics import SphericalHarmonics
+
+            spherical_harmonics_cls = SphericalHarmonics
+        except Exception:
+            return False
+
+    if getattr(spherical_harmonics_cls, "_iqc_sph_func_patch", False):
+        return False
+
+    original_forward = getattr(spherical_harmonics_cls, "forward", None)
+    original_setstate = getattr(spherical_harmonics_cls, "__setstate__", None)
+    if original_forward is None:
+        return False
+
+    def _iqc_forward(self, *args, **kwargs):
+        _restore_e3nn_spherical_harmonics_sph_func(self, sph_func_factory)
+        return original_forward(self, *args, **kwargs)
+
+    spherical_harmonics_cls.forward = _iqc_forward
+    spherical_harmonics_cls._iqc_original_forward = original_forward
+
+    if original_setstate is not None:
+
+        def _iqc_setstate(self, state):
+            result = original_setstate(self, state)
+            _restore_e3nn_spherical_harmonics_sph_func(self, sph_func_factory)
+            return result
+
+        spherical_harmonics_cls.__setstate__ = _iqc_setstate
+        spherical_harmonics_cls._iqc_original_setstate = original_setstate
+
+    spherical_harmonics_cls._iqc_sph_func_patch = True
+    return True
+
+
+def _restore_e3nn_activation_paths(module):
+    """Restore e3nn 0.5 Activation paths missing from old checkpoints."""
+
+    if module.__class__.__name__ != "Activation":
+        return False
+    if hasattr(module, "paths"):
+        return False
+    if not hasattr(module, "irreps_in") or not hasattr(module, "acts"):
+        return False
+
+    module.paths = [
+        (mul, (l, p), act) for (mul, (l, p)), act in zip(module.irreps_in, module.acts)
+    ]
+    return True
+
+
+def _patch_e3nn_activation_legacy_state(activation_cls=None):
+    """Patch e3nn Activation restored from older MACE checkpoints."""
+
+    if activation_cls is None:
+        try:
+            from e3nn.nn._activation import Activation
+
+            activation_cls = Activation
+        except Exception:
+            return False
+
+    if getattr(activation_cls, "_iqc_paths_patch", False):
+        return False
+
+    original_forward = getattr(activation_cls, "forward", None)
+    original_setstate = getattr(activation_cls, "__setstate__", None)
+    if original_forward is None:
+        return False
+
+    def _iqc_forward(self, *args, **kwargs):
+        _restore_e3nn_activation_paths(self)
+        return original_forward(self, *args, **kwargs)
+
+    activation_cls.forward = _iqc_forward
+    activation_cls._iqc_original_forward = original_forward
+
+    if original_setstate is not None:
+
+        def _iqc_setstate(self, state):
+            result = original_setstate(self, state)
+            _restore_e3nn_activation_paths(self)
+            return result
+
+        activation_cls.__setstate__ = _iqc_setstate
+        activation_cls._iqc_original_setstate = original_setstate
+
+    activation_cls._iqc_paths_patch = True
+    return True
+
+
+def _patch_e3nn_mace_compatibility():
+    """Apply e3nn compatibility patches needed by MACE foundation checkpoints."""
+
+    codegen_patched = _patch_e3nn_codegen_legacy_state()
+    spherical_harmonics_patched = _patch_e3nn_spherical_harmonics_legacy_state()
+    activation_patched = _patch_e3nn_activation_legacy_state()
+    return codegen_patched or spherical_harmonics_patched or activation_patched
+
+
+UMA_DEFAULT_MODEL_BY_SIZE = {
+    "s": "uma-s-1p1",
+    "m": "uma-m-1p1",
+}
+UMA_TASKS = {"omol", "omat", "odac"}
+UMA_PREDICTOR_KWARGS = {
+    "cache_dir",
+    "device",
+    "inference_settings",
+    "overrides",
+    "seed",
+    "workers",
+}
+
+
+def _parse_uma_calculator_name(name):
+    """Return the UMA model name and task encoded in an IQC calculator name."""
+
+    if name == "uma":
+        return UMA_DEFAULT_MODEL_BY_SIZE["s"], "omol"
+
+    parts = name.split("-")
+    if len(parts) != 3 or parts[0] != "uma":
+        raise ValueError(
+            "UMA calculator names must be 'uma' or 'uma-{s,m}-{omol,omat,odac}'."
+        )
+
+    _, size, task = parts
+    if size not in UMA_DEFAULT_MODEL_BY_SIZE:
+        raise ValueError("UMA calculator size must be 's' or 'm'.")
+    if task not in UMA_TASKS:
+        raise ValueError(f"UMA task must be one of {', '.join(sorted(UMA_TASKS))}.")
+
+    return UMA_DEFAULT_MODEL_BY_SIZE[size], task
+
+
+def _get_uma_calculator(name, **kwargs):
+    """Initialize a FAIRChem UMA calculator with IQC's compact name aliases."""
+
+    from fairchem.core import FAIRChemCalculator, pretrained_mlip
+
+    predictor_name, task = _parse_uma_calculator_name(name)
+    uma_kwargs = dict(kwargs)
+    predictor_name = uma_kwargs.pop("model", predictor_name)
+    task = uma_kwargs.pop("task_name", task)
+    predictor_kwargs = {
+        key: uma_kwargs.pop(key)
+        for key in list(uma_kwargs)
+        if key in UMA_PREDICTOR_KWARGS
+    }
+
+    predictor = pretrained_mlip.get_predict_unit(predictor_name, **predictor_kwargs)
+    calculator = FAIRChemCalculator(predictor, task_name=task, **uma_kwargs)
+    calculator.model_name = predictor_name
+    calculator.task_name = task
+    logging.info(
+        "Using UMA calculator with model=%s, task=%s, predictor_args=%s, calculator_args=%s",
+        predictor_name,
+        task,
+        predictor_kwargs,
+        uma_kwargs,
+    )
+    return calculator
+
+
 def get_calculator(name="mace", **kwargs):
     """Initializes and returns the specified ASE calculator.
 
     Args:
-        name (str): The name of the calculator ('mace', 'xtb', 'emt').
+        name (str): The name of the calculator ('mace', 'xtb', 'emt', 'uma',
+                    'uma-s-omol', 'uma-s-omat', 'uma-s-odac',
+                    'uma-m-omol', 'uma-m-omat', or 'uma-m-odac').
         **kwargs: Additional keyword arguments passed to the calculator constructor.
 
     Returns:
@@ -64,6 +309,7 @@ def get_calculator(name="mace", **kwargs):
 
     if name == "mace":
         try:
+            _patch_e3nn_mace_compatibility()
             from mace.calculators import mace_mp
 
             mace_kwargs = {
@@ -120,25 +366,17 @@ def get_calculator(name="mace", **kwargs):
                 "EMT not found, but it's usually built-in with ASE. Problem with ASE install? Returning None."
             )
             return None
-    
+
     elif name.startswith("uma"):
-
-        from fairchem.core import FAIRChemCalculator, pretrained_mlip
-
-        if name.startswith("uma-m"):
-            predictor_name = "uma-m-1p1"
-        else: # default to UMA small
-            predictor_name = "uma-s-1p1"
-
-        if "odac" in name:
-            task = "odac"
-        elif "omat" in name:
-            task = "omat"
-        else: # default to omol            
-            task = "omol"
-
-        predictor = pretrained_mlip.get_predict_unit(predictor_name)
-        calculator = FAIRChemCalculator(predictor, task_name=task)
+        try:
+            calculator = _get_uma_calculator(name, **kwargs)
+        except ImportError:
+            logging.warning(
+                "FAIRChem UMA calculator not available. Install fairchem-core and "
+                "follow the MACE/UMA install workaround. Falling back to MACE."
+            )
+        except Exception as e:
+            logging.warning(f"UMA initialization failed: {e}. Falling back to MACE.")
 
     else:
         logging.warning(f"Unknown calculator '{name}'. Falling back to MACE.")
@@ -150,6 +388,7 @@ def get_calculator(name="mace", **kwargs):
             f"Calculator '{name}' failed or not found. Attempting fallback to MACE."
         )
         try:
+            _patch_e3nn_mace_compatibility()
             from mace.calculators import mace_mp
 
             mace_kwargs = {

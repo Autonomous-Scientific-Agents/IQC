@@ -1,4 +1,6 @@
 import os
+from pathlib import Path
+import types
 import numpy as np
 from ase import Atoms
 from ase.calculators.emt import EMT
@@ -27,7 +29,14 @@ from iqc.asetools import (
     get_symmetry_info,
     run_vibrations,
     run_thermo,
+    _get_uma_calculator,
     _normalize_calculator_compatibility,
+    _patch_e3nn_activation_legacy_state,
+    _patch_e3nn_codegen_legacy_state,
+    _patch_e3nn_spherical_harmonics_legacy_state,
+    _parse_uma_calculator_name,
+    _restore_e3nn_activation_paths,
+    _restore_e3nn_spherical_harmonics_sph_func,
 )
 
 
@@ -246,6 +255,227 @@ def test_normalize_calculator_exposes_sumcalculator_calcs():
     assert len(calculator.calcs) == 2
 
 
+def test_patch_e3nn_codegen_legacy_state_converts_old_buffers():
+    """Test e3nn 0.5 can accept legacy raw-byte codegen state."""
+
+    calls = []
+
+    class DummyCodeGenMixin:
+        def __setstate__(self, state):
+            for fname, (buffer_type, buffer) in state["__codegen__"].items():
+                calls.append((fname, buffer_type, buffer))
+
+    codegen_mixin_module = types.ModuleType("e3nn.util.codegen._mixin")
+    codegen_mixin_module.CodeGenMixin = DummyCodeGenMixin
+
+    assert _patch_e3nn_codegen_legacy_state(codegen_mixin_module) is True
+    DummyCodeGenMixin().__setstate__({"__codegen__": {"compiled": b"legacy"}})
+
+    assert calls == [("compiled", "torchscript", b"legacy")]
+
+
+def test_patch_e3nn_codegen_legacy_state_skips_old_e3nn_shape():
+    """Test old e3nn codegen state support is left untouched."""
+
+    calls = []
+
+    class DummyCodeGenMixin:
+        def __setstate__(self, state):
+            for fname, buffer in state["__codegen__"].items():
+                calls.append((fname, buffer))
+
+    codegen_mixin_module = types.ModuleType("e3nn.util.codegen._mixin")
+    codegen_mixin_module.CodeGenMixin = DummyCodeGenMixin
+
+    assert _patch_e3nn_codegen_legacy_state(codegen_mixin_module) is False
+    DummyCodeGenMixin().__setstate__({"__codegen__": {"compiled": b"legacy"}})
+
+    assert calls == [("compiled", b"legacy")]
+
+
+def test_restore_e3nn_spherical_harmonics_sph_func():
+    """Test missing e3nn SphericalHarmonics callable is restored."""
+
+    SphericalHarmonics = type("SphericalHarmonics", (), {})
+    module = SphericalHarmonics()
+
+    restored = _restore_e3nn_spherical_harmonics_sph_func(
+        module, sph_func_factory=lambda: "restored"
+    )
+
+    assert restored is True
+    assert module.sph_func == "restored"
+    assert (
+        _restore_e3nn_spherical_harmonics_sph_func(
+            module, sph_func_factory=lambda: "new"
+        )
+        is False
+    )
+    assert module.sph_func == "restored"
+
+
+def test_patch_e3nn_spherical_harmonics_legacy_state_repairs_forward():
+    """Test patched SphericalHarmonics lazily restores sph_func before forward."""
+
+    class SphericalHarmonics:
+        def forward(self, value):
+            return self.sph_func(value)
+
+    patched = _patch_e3nn_spherical_harmonics_legacy_state(
+        SphericalHarmonics, sph_func_factory=lambda: lambda value: value + 1
+    )
+
+    assert patched is True
+    assert SphericalHarmonics().forward(2) == 3
+    assert (
+        _patch_e3nn_spherical_harmonics_legacy_state(
+            SphericalHarmonics, sph_func_factory=lambda: lambda value: value + 2
+        )
+        is False
+    )
+
+
+def test_restore_e3nn_activation_paths():
+    """Test missing e3nn Activation paths are rebuilt from irreps and acts."""
+
+    class Activation:
+        pass
+
+    module = Activation()
+    module.irreps_in = [(2, (0, 1)), (1, (1, -1))]
+    module.acts = ["act", None]
+
+    restored = _restore_e3nn_activation_paths(module)
+
+    assert restored is True
+    assert module.paths == [
+        (2, (0, 1), "act"),
+        (1, (1, -1), None),
+    ]
+    assert _restore_e3nn_activation_paths(module) is False
+
+
+def test_patch_e3nn_activation_legacy_state_repairs_forward():
+    """Test patched Activation lazily restores paths before forward."""
+
+    class Activation:
+        def __init__(self):
+            self.irreps_in = [(1, (0, 1))]
+            self.acts = [lambda value: value + 1]
+
+        def forward(self, value):
+            return self.paths[0][2](value)
+
+    patched = _patch_e3nn_activation_legacy_state(Activation)
+
+    assert patched is True
+    assert Activation().forward(2) == 3
+    assert _patch_e3nn_activation_legacy_state(Activation) is False
+
+
+def test_parse_uma_calculator_name():
+    """Test compact IQC UMA calculator aliases."""
+
+    assert _parse_uma_calculator_name("uma") == ("uma-s-1p1", "omol")
+    assert _parse_uma_calculator_name("uma-s-omol") == ("uma-s-1p1", "omol")
+    assert _parse_uma_calculator_name("uma-m-odac") == ("uma-m-1p1", "odac")
+
+    with pytest.raises(ValueError):
+        _parse_uma_calculator_name("uma-xl-omol")
+
+    with pytest.raises(ValueError):
+        _parse_uma_calculator_name("uma-s-unknown")
+
+
+def test_get_uma_calculator_uses_fairchem_predictor_and_task():
+    """Test UMA initialization without importing or downloading real FAIRChem models."""
+
+    calls = []
+
+    class DummyFAIRChemCalculator:
+        def __init__(self, predictor, task_name, **kwargs):
+            self.predictor = predictor
+            self.task_name = task_name
+            self.kwargs = kwargs
+            self.name = "fairchem"
+
+    class DummyPretrainedMLIP:
+        @staticmethod
+        def get_predict_unit(model_name, **kwargs):
+            calls.append((model_name, kwargs))
+            return {"model_name": model_name}
+
+    fairchem_module = types.ModuleType("fairchem")
+    fairchem_core_module = types.ModuleType("fairchem.core")
+    fairchem_core_module.FAIRChemCalculator = DummyFAIRChemCalculator
+    fairchem_core_module.pretrained_mlip = DummyPretrainedMLIP
+    fairchem_module.core = fairchem_core_module
+
+    with patch.dict(
+        sys.modules,
+        {"fairchem": fairchem_module, "fairchem.core": fairchem_core_module},
+    ):
+        calculator = _get_uma_calculator(
+            "uma-m-odac",
+            device="cpu",
+            inference_settings="turbo",
+            foo="bar",
+        )
+
+    assert calls == [("uma-m-1p1", {"device": "cpu", "inference_settings": "turbo"})]
+    assert calculator.predictor == {"model_name": "uma-m-1p1"}
+    assert calculator.task_name == "odac"
+    assert calculator.kwargs == {"foo": "bar"}
+    assert calculator.model_name == "uma-m-1p1"
+
+
+def test_get_calculator_uma_unavailable_falls_back_to_mace():
+    """Test UMA import failure follows the existing MACE fallback path."""
+
+    mace_calculators_module = types.ModuleType("mace.calculators")
+
+    def fake_mace_mp(**kwargs):
+        calculator = EMT()
+        calculator.mace_kwargs = kwargs
+        return calculator
+
+    mace_calculators_module.mace_mp = fake_mace_mp
+    mace_module = types.ModuleType("mace")
+    mace_module.calculators = mace_calculators_module
+
+    with patch.dict(
+        sys.modules,
+        {
+            "fairchem": None,
+            "fairchem.core": None,
+            "mace": mace_module,
+            "mace.calculators": mace_calculators_module,
+        },
+    ):
+        calculator = get_calculator(name="uma-s-omol")
+
+    assert isinstance(calculator, EMT)
+    assert calculator.model_name == "large"
+    assert calculator.mace_kwargs["dispersion"] is True
+
+
+def test_mace_uma_dependency_workaround_is_declared():
+    """Test packaging metadata keeps MACE out of the resolver conflict path."""
+
+    root = Path(__file__).resolve().parents[2]
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+    env_yml = (root / "env.yml").read_text(encoding="utf-8")
+
+    assert '"mace-torch"' not in pyproject
+    assert '"e3nn>=0.5"' in pyproject
+    assert "fairchem-core>=2.0" in pyproject
+    assert "torch-dftd" in pyproject
+
+    assert "- e3nn>=0.5" in env_yml
+    assert "- fairchem-core" in env_yml
+    assert "--no-deps mace-torch" in env_yml
+
+
 def test_get_calculator_xtb_success():
     """Test getting XTB calculator successfully."""
     # Skip test if XTB cannot be imported
@@ -439,7 +669,9 @@ def test_run_vibrations_error_handling(tmp_path):
     # Test with optimization failure
     with patch("iqc.asetools.run_optimization") as mock_opt:
         mock_opt.return_value = (h2, {"error": "Optimization failed"})
-        atoms, results = run_vibrations(h2, optimize=True, vib_dir=vib_dir)
+        atoms, results = run_vibrations(
+            h2, calculator=EMT(), optimize=True, vib_dir=vib_dir
+        )
         assert atoms is None
         assert "error" in results
         assert "Optimization failed" in results["error"]
@@ -448,7 +680,9 @@ def test_run_vibrations_error_handling(tmp_path):
     with patch(
         "ase.vibrations.Vibrations.run", side_effect=Exception("Vibration failed")
     ):
-        atoms, results = run_vibrations(h2, optimize=False, vib_dir=vib_dir)
+        atoms, results = run_vibrations(
+            h2, calculator=EMT(), optimize=False, vib_dir=vib_dir
+        )
         assert "error" in results
         assert "Vibration failed" in results["error"]
 
@@ -465,7 +699,9 @@ def test_run_vibrations_warnings(tmp_path):
     vib_dir = tmp_path / "vib"
 
     # Mock the vibrations calculation to return high frequencies
-    with patch("ase.vibrations.Vibrations.get_vibrations") as mock_vib:
+    with patch("ase.vibrations.Vibrations.run", return_value=None), patch(
+        "ase.vibrations.Vibrations.get_vibrations"
+    ) as mock_vib:
         mock_vib.return_value.get_frequencies.return_value = np.array(
             [200, 200, 200, 100, 100, 100, 50, 50, 50]
         )
@@ -474,7 +710,11 @@ def test_run_vibrations_warnings(tmp_path):
         )
 
         atoms, results = run_vibrations(
-            co2, optimize=False, max_trans_rot=50, vib_dir=vib_dir
+            co2,
+            calculator=EMT(),
+            optimize=False,
+            max_trans_rot=50,
+            vib_dir=vib_dir,
         )
         assert "warnings" in results
         assert len(results["warnings"]) > 0
@@ -517,6 +757,6 @@ def test_run_thermo_error_handling(tmp_path):
         "ase.thermochemistry.IdealGasThermo.get_gibbs_energy",
         side_effect=Exception("Thermo failed"),
     ):
-        thermo, results = run_thermo(h2, vib_dir=vib_dir)
+        thermo, results = run_thermo(h2, calculator=EMT(), vib_dir=vib_dir)
         assert "error" in results
         assert "Thermo failed" in results["error"]
