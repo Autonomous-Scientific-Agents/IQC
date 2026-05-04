@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import sys
 
 
 def add_bool_flag(parser, name, default=None, help_text=""):
@@ -19,7 +20,24 @@ def add_bool_flag(parser, name, default=None, help_text=""):
     parser.set_defaults(**{dest: default})
 
 
-def get_args():
+def _explicit_option_names(argv):
+    """Return option names explicitly provided on the command line."""
+
+    options = set()
+    for token in argv:
+        if token == "--":
+            break
+        if not token.startswith("-") or token == "-":
+            continue
+        option = token.split("=", 1)[0]
+        if option.startswith("--"):
+            options.add(option)
+        else:
+            options.add(option[:2])
+    return options
+
+
+def get_args(argv=None):
     """
     Returns args object that contains command line options.
     """
@@ -50,6 +68,16 @@ def get_args():
         type=str,
         default=os.getenv("TMPDIR", default="/tmp"),
         help="Scratch directory. If not given checks TMPDIR env. variable, if not defined uses /tmp.",
+    )
+    parser.add_argument(
+        "-i",
+        "--input",
+        type=str,
+        default=None,
+        help=(
+            "Path to a tabular data file to inspect. Supports parquet, CSV/TSV, "
+            "Excel, JSON/JSONL, Feather, and Arrow IPC formats."
+        ),
     )
     parser.add_argument(
         "-x",
@@ -108,7 +136,7 @@ def get_args():
         "-d",
         "--database",
         type=str,
-        default=None,  
+        default=None,
         help="Path to insert data into SQLite database",
     )
     parser.add_argument(
@@ -248,4 +276,7 @@ def get_args():
         help="Reference shielding override in the form nucleus=value, e.g. 1H=31.77",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    explicit_options = _explicit_option_names(sys.argv[1:] if argv is None else argv)
+    args.input_only = bool(args.input) and explicit_options <= {"-i", "--input"}
+    return args

@@ -9,30 +9,12 @@ from datetime import datetime
 from pathlib import Path
 import yaml  # Import YAML
 import numpy as np
-import ase  # just to disable parallel features of ASE, import it before mpi initialization
-import ase.parallel as asepar
 import time
 
-asepar.world = asepar.DummyMPI()
-from iqc.asetools import (
-    run_optimization,
-    run_ir,
-    run_single_point,
-    run_thermo,
-    run_vibrations,
-    get_atoms_from_xyz,
-    get_atoms_from_smiles,
-    get_calculator,
-    get_ase_version,
-)
-from mpi4py import MPI
-
-from iqc.xyztools import count_xyz_frames
 from iqc.cli import get_args
-from iqc.mpitools import get_start_end
-from iqc.nmr import run_nmr_workflow
 
 from iqc.databasetools import create_database, insert_entry
+from iqc.datatools import run_input_inspection
 
 
 def _smiles_to_basename(smiles: str) -> str:
@@ -160,14 +142,48 @@ def get_nmr_cli_overrides(args):
 
 def main():
     """Main function."""
-    # Initialize MPI
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    size = comm.Get_size()
     start_time = time.time()
 
     # Get command line arguments
     args = get_args()
+    if args.input:
+        if args.input_only:
+            return run_input_inspection(args.input)
+        print(
+            "Error: --input currently supports inspection mode only. "
+            "Run it without other IQC calculation options to print schema and statistics.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # ASE must be imported before MPI initialization for calculation workflows.
+    import ase  # noqa: F401
+    import ase.parallel as asepar
+
+    asepar.world = asepar.DummyMPI()
+
+    from iqc.asetools import (
+        run_optimization,
+        run_ir,
+        run_single_point,
+        run_thermo,
+        run_vibrations,
+        get_atoms_from_xyz,
+        get_atoms_from_smiles,
+        get_calculator,
+        get_ase_version,
+    )
+    from iqc.nmr import run_nmr_workflow
+    from iqc.xyztools import count_xyz_frames
+
+    # Initialize MPI only for calculation workflows.
+    from mpi4py import MPI
+
+    from iqc.mpitools import get_start_end
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
 
     # Create a central directory for tmp folders
     central_tmp_dir = os.path.abspath("iqc_tmp")

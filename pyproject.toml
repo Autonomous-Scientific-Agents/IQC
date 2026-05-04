@@ -20,6 +20,9 @@ dependencies = [
     "matplotlib",
     "nglview",
     "pandas",
+    "pyarrow",
+    "openpyxl",
+    "xlrd",
     "pymatgen",
     "mace-torch",
 ]
