@@ -112,6 +112,53 @@ results = run_thermo(atoms)
 
 Each task returns a dictionary containing the results and timing information in milliseconds.
 
+## Tabular Data Input
+
+IQC can inspect and process tabular data files with `--input` / `-i`.
+
+Inspect a data file without running a calculation:
+
+```bash
+iqc --input molecules.parquet
+```
+
+When `--input` is the only option, IQC prints the file format, row and column counts, schema, null counts, and basic numeric statistics.
+
+Run a calculation from a column containing XYZ text:
+
+```bash
+iqc --input molecules.parquet --xyz geometry --task single
+```
+
+Run a calculation from a column containing SMILES strings:
+
+```bash
+iqc --input molecules.csv --smiles smiles --task opt
+```
+
+Supported input formats include parquet (`.parquet`, `.pq`), CSV/TSV text files, Excel files (`.xls`, `.xlsx`, `.xlsm`, `.ods`), JSON/JSONL, Feather, and Arrow IPC. For parquet, CSV/TSV, Feather, and Arrow IPC, IQC reads only the requested structure column where possible.
+
+When `--input` is used for a calculation, pass exactly one structure selector:
+
+- `--xyz COLUMN`: read XYZ-format geometry strings from `COLUMN`
+- `--smiles COLUMN`: read SMILES strings from `COLUMN` and build 3D geometries with RDKit
+
+CSV files may contain multiline XYZ values, but those cells must be quoted by the CSV writer. For example:
+
+```csv
+name,geometry
+water,"3
+water
+O 0 0 0
+H 0 0 1
+H 1 0 0
+"
+```
+
+Results written from tabular inputs include `input_mode`, `data_input_file`, `data_xyz_column` or `data_smiles_column`, and `data_row_index` so each output can be traced back to the source row.
+
+See [docs/data_input.md](docs/data_input.md) for the full tabular input guide.
+
 ## NMR Workflow
 
 The `nmr` task runs a backend-aware solution-state NMR workflow for small and medium-sized molecules. It can:

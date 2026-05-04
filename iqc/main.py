@@ -14,7 +14,11 @@ import time
 from iqc.cli import get_args
 
 from iqc.databasetools import create_database, insert_entry
-from iqc.datatools import run_input_inspection
+from iqc.datatools import (
+    read_smiles_column_records,
+    read_xyz_column_records,
+    run_input_inspection,
+)
 
 
 def _smiles_to_basename(smiles: str) -> str:
@@ -140,6 +144,36 @@ def get_nmr_cli_overrides(args):
     return overrides
 
 
+def validate_input_args(args):
+    """Return a user-facing validation error for unsupported --input combinations."""
+
+    if not args.input or args.input_only:
+        return None
+    if args.input_xyz_column and args.input_smiles_column:
+        return (
+            "Error: --input can use either --xyz COLUMN or --smiles COLUMN, "
+            "but not both."
+        )
+    if not args.input_xyz_column and not args.input_smiles_column:
+        return (
+            "Error: when using --input for calculations, pass --xyz COLUMN "
+            "or --smiles COLUMN to identify the structure column."
+        )
+    return None
+
+
+def get_structure_input_mode(args):
+    """Return the molecular input mode implied by parsed CLI arguments."""
+
+    if args.input and args.input_xyz_column:
+        return "data_xyz"
+    if args.input and args.input_smiles_column:
+        return "data_smiles"
+    if args.smiles:
+        return "smiles"
+    return "xyz"
+
+
 def main():
     """Main function."""
     start_time = time.time()
@@ -149,12 +183,10 @@ def main():
     if args.input:
         if args.input_only:
             return run_input_inspection(args.input)
-        print(
-            "Error: --input currently supports inspection mode only. "
-            "Run it without other IQC calculation options to print schema and statistics.",
-            file=sys.stderr,
-        )
-        return 1
+        input_error = validate_input_args(args)
+        if input_error:
+            print(input_error, file=sys.stderr)
+            return 1
 
     # ASE must be imported before MPI initialization for calculation workflows.
     import ase  # noqa: F401
@@ -271,13 +303,35 @@ def main():
             comm.Abort(1)
     time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    input_mode = "smiles" if args.smiles else "xyz"
+    input_mode = get_structure_input_mode(args)
     if rank == 0:
         if input_mode == "smiles":
             xyz_files = [args.smiles]
             number_of_xyz = 1
             number_of_files = 1
             logging.info(f"Using SMILES input: {args.smiles}")
+        elif input_mode == "data_xyz":
+            try:
+                xyz_files = read_xyz_column_records(args.input, args.xyz)
+            except Exception as e:
+                logging.error(f"Error reading XYZ column '{args.xyz}': {e}")
+                comm.Abort(1)
+            number_of_xyz = len(xyz_files)
+            number_of_files = number_of_xyz
+            logging.info(f"Using XYZ column '{args.xyz}' from data input: {args.input}")
+            logging.info(f"Number of configurations: {number_of_xyz}")
+        elif input_mode == "data_smiles":
+            try:
+                xyz_files = read_smiles_column_records(args.input, args.smiles)
+            except Exception as e:
+                logging.error(f"Error reading SMILES column '{args.smiles}': {e}")
+                comm.Abort(1)
+            number_of_xyz = len(xyz_files)
+            number_of_files = number_of_xyz
+            logging.info(
+                f"Using SMILES column '{args.smiles}' from data input: {args.input}"
+            )
+            logging.info(f"Number of configurations: {number_of_xyz}")
         elif os.path.isdir(args.xyz):
             xyz_dir = args.xyz
             xyz_files = glob.glob(os.path.join(xyz_dir, "*.xyz"))
@@ -301,7 +355,7 @@ def main():
         if number_of_files == 0:
             logging.error(f"No .xyz files found in {args.xyz}. Exiting.")
             comm.Abort(1)
-        else:
+        elif input_mode not in {"data_xyz", "data_smiles"}:
             logging.info(f"Found {number_of_files} .xyz file(s).")
             logging.info(f"Number of configurations: {number_of_xyz}")
 
@@ -332,6 +386,15 @@ def main():
             smiles_input = xyz_files[0]
             xyz_file = f"smiles:{smiles_input}"
             base_name = _smiles_to_basename(smiles_input)
+        elif input_mode == "data_xyz":
+            xyz_record = xyz_files[xyz_index]
+            xyz_file = f"{args.input}:{args.xyz}[{xyz_record.row_index}]"
+            base_name = f"{Path(args.input).stem}_row{xyz_record.row_index}"
+        elif input_mode == "data_smiles":
+            smiles_record = xyz_files[xyz_index]
+            smiles_input = smiles_record.smiles
+            xyz_file = f"{args.input}:{args.smiles}[{smiles_record.row_index}]"
+            base_name = f"{Path(args.input).stem}_row{smiles_record.row_index}"
         elif number_of_files > 1:
             xyz_file = xyz_files[xyz_index]
             base_name = os.path.splitext(os.path.basename(xyz_file))[0]
@@ -345,6 +408,10 @@ def main():
         # Read input
         try:
             if input_mode == "smiles":
+                atoms = get_atoms_from_smiles(smiles_input)
+            elif input_mode == "data_xyz":
+                atoms = get_atoms_from_xyz(xyz_record.xyz)
+            elif input_mode == "data_smiles":
                 atoms = get_atoms_from_smiles(smiles_input)
             elif number_of_files > 1:
                 atoms = get_atoms_from_xyz(xyz_file)
@@ -363,6 +430,14 @@ def main():
             "xyz_file": xyz_file,
             "smiles_input": smiles_input or "",
             "input_mode": input_mode,
+            "data_input_file": args.input or "",
+            "data_xyz_column": args.xyz if input_mode == "data_xyz" else "",
+            "data_smiles_column": args.smiles if input_mode == "data_smiles" else "",
+            "data_row_index": (
+                xyz_record.row_index
+                if input_mode == "data_xyz"
+                else smiles_record.row_index if input_mode == "data_smiles" else ""
+            ),
             "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "mpi_size": size,
             "mpi_rank": rank,
@@ -608,4 +683,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
+class ColumnNotFoundError(ValueError):
+    """Raised when a requested data column is absent."""
+
+
 @dataclass(frozen=True)
 class ColumnSummary:
     """Compact summary for one data column."""
@@ -34,6 +38,22 @@ class DataSummary:
     size_bytes: int
     engine: str
     column_summaries: Sequence[ColumnSummary]
+
+
+@dataclass(frozen=True)
+class XYZColumnRecord:
+    """XYZ text and source row metadata from a data input file."""
+
+    row_index: int
+    xyz: str
+
+
+@dataclass(frozen=True)
+class SMILESColumnRecord:
+    """SMILES text and source row metadata from a data input file."""
+
+    row_index: int
+    smiles: str
 
 
 def format_bytes(size: int) -> str:
@@ -91,7 +111,10 @@ def _read_arrow_table(path: Path, suffix: str):
         return pq.read_table(path), "parquet", "pyarrow"
     if suffix in {".csv", ".tsv", ".tab", ".txt"}:
         delimiter = "\t" if suffix in {".tsv", ".tab"} else ","
-        parse_options = pacsv.ParseOptions(delimiter=delimiter)
+        parse_options = pacsv.ParseOptions(
+            delimiter=delimiter,
+            newlines_in_values=True,
+        )
         return (
             pacsv.read_csv(path, parse_options=parse_options),
             "delimited text",
@@ -125,6 +148,179 @@ def _read_pandas_frame(path: Path, suffix: str):
     if suffix in {".feather", ".ftr"}:
         return pd.read_feather(path), "feather", "pandas"
     raise ValueError(f"Unsupported input file type: {suffix or '<none>'}")
+
+
+def _ensure_column(
+    column_name: str, available_columns: Sequence[str], path: Path
+) -> None:
+    if column_name in available_columns:
+        return
+
+    preview = ", ".join(available_columns[:12])
+    if len(available_columns) > 12:
+        preview += ", ..."
+    raise ColumnNotFoundError(
+        f"Column '{column_name}' was not found in {path}. "
+        f"Available columns: {preview}"
+    )
+
+
+def _read_arrow_column(path: Path, suffix: str, column_name: str):
+    import pyarrow.csv as pacsv
+    import pyarrow.feather as feather
+    import pyarrow.ipc as ipc
+    import pyarrow.json as pajson
+    import pyarrow.parquet as pq
+
+    if suffix in {".parquet", ".pq"}:
+        parquet_file = pq.ParquetFile(path)
+        _ensure_column(column_name, parquet_file.schema_arrow.names, path)
+        table = pq.read_table(path, columns=[column_name])
+        return table[column_name].to_pylist(), "pyarrow"
+
+    if suffix in {".csv", ".tsv", ".tab", ".txt"}:
+        delimiter = "\t" if suffix in {".tsv", ".tab"} else ","
+        parse_options = pacsv.ParseOptions(
+            delimiter=delimiter,
+            newlines_in_values=True,
+        )
+        convert_options = pacsv.ConvertOptions(include_columns=[column_name])
+        table = pacsv.read_csv(
+            path,
+            parse_options=parse_options,
+            convert_options=convert_options,
+        )
+        return table[column_name].to_pylist(), "pyarrow"
+
+    if suffix in {".json", ".jsonl", ".ndjson"}:
+        table = pajson.read_json(path)
+        _ensure_column(column_name, table.column_names, path)
+        return table[column_name].to_pylist(), "pyarrow"
+
+    if suffix in {".feather", ".ftr"}:
+        table = feather.read_table(path, columns=[column_name])
+        return table[column_name].to_pylist(), "pyarrow"
+
+    if suffix in {".arrow", ".ipc"}:
+        with ipc.open_file(path) as reader:
+            _ensure_column(column_name, reader.schema.names, path)
+            table = reader.read_all()
+        return table[column_name].to_pylist(), "pyarrow"
+
+    raise ValueError(f"Unsupported input file type: {suffix or '<none>'}")
+
+
+def _read_pandas_column(path: Path, suffix: str, column_name: str):
+    pd = _require_pandas()
+
+    if suffix in {".parquet", ".pq"}:
+        frame = pd.read_parquet(path, columns=[column_name])
+    elif suffix in {".csv", ".txt"}:
+        frame = pd.read_csv(path, usecols=[column_name])
+    elif suffix in {".tsv", ".tab"}:
+        frame = pd.read_csv(path, sep="\t", usecols=[column_name])
+    elif suffix in {".xls", ".xlsx", ".xlsm", ".ods"}:
+        frame = pd.read_excel(path, usecols=[column_name])
+    elif suffix == ".json":
+        frame = pd.read_json(path)
+    elif suffix in {".jsonl", ".ndjson"}:
+        frame = pd.read_json(path, lines=True)
+    elif suffix in {".feather", ".ftr"}:
+        frame = pd.read_feather(path, columns=[column_name])
+    else:
+        raise ValueError(f"Unsupported input file type: {suffix or '<none>'}")
+
+    available_columns = [str(column) for column in frame.columns]
+    _ensure_column(column_name, available_columns, path)
+    return frame[column_name].tolist(), "pandas"
+
+
+def _is_missing_value(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        import pandas as pd
+
+        return bool(pd.isna(value))
+    except (ImportError, TypeError, ValueError):
+        pass
+    if isinstance(value, float):
+        return math.isnan(value)
+    return False
+
+
+def _coerce_text_value(
+    value: Any, row_index: int, column_name: str, value_label: str
+) -> str:
+    if _is_missing_value(value):
+        raise ValueError(
+            f"Column '{column_name}' contains an empty {value_label} value "
+            f"at row {row_index}."
+        )
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    elif not isinstance(value, str):
+        value = str(value)
+
+    if not value.strip():
+        raise ValueError(
+            f"Column '{column_name}' contains a blank {value_label} value "
+            f"at row {row_index}."
+        )
+    return value.strip() if value_label == "SMILES" else value
+
+
+def _read_column_values(input_file: str | Path, column_name: str) -> list[Any]:
+    path = Path(input_file)
+    if not path.exists():
+        raise FileNotFoundError(f"Input file does not exist: {path}")
+    if not path.is_file():
+        raise ValueError(f"Input path is not a file: {path}")
+
+    suffix = path.suffix.lower()
+    try:
+        values, _engine = _read_arrow_column(path, suffix, column_name)
+    except ImportError:
+        values, _engine = _read_pandas_column(path, suffix, column_name)
+    except ColumnNotFoundError:
+        raise
+    except Exception:
+        values, _engine = _read_pandas_column(path, suffix, column_name)
+
+    if not values:
+        raise ValueError(f"Column '{column_name}' in {path} does not contain any rows.")
+    return values
+
+
+def read_xyz_column_records(
+    input_file: str | Path, column_name: str
+) -> list[XYZColumnRecord]:
+    """Read XYZ strings from a named column in a supported tabular data file."""
+
+    values = _read_column_values(input_file, column_name)
+    records = [
+        XYZColumnRecord(
+            row_index=row_index,
+            xyz=_coerce_text_value(value, row_index, column_name, "XYZ"),
+        )
+        for row_index, value in enumerate(values)
+    ]
+    return records
+
+
+def read_smiles_column_records(
+    input_file: str | Path, column_name: str
+) -> list[SMILESColumnRecord]:
+    """Read SMILES strings from a named column in a supported tabular data file."""
+
+    values = _read_column_values(input_file, column_name)
+    return [
+        SMILESColumnRecord(
+            row_index=row_index,
+            smiles=_coerce_text_value(value, row_index, column_name, "SMILES"),
+        )
+        for row_index, value in enumerate(values)
+    ]
 
 
 def _arrow_column_summaries(table) -> list[ColumnSummary]:

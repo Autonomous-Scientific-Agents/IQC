@@ -84,13 +84,19 @@ def get_args(argv=None):
         "--xyz",
         type=str,
         default="xyz",
-        help="Path for an .xyz file or a directory containing .xyz files. Ignored when --smiles is provided.",
+        help=(
+            "Path for an .xyz file or a directory containing .xyz files. When "
+            "--input is provided, this is the column name containing XYZ text."
+        ),
     )
     parser.add_argument(
         "--smiles",
         type=str,
         default=None,
-        help="SMILES string to convert to a 3D geometry with RDKit. If provided, this takes precedence over --xyz.",
+        help=(
+            "SMILES string to convert to a 3D geometry with RDKit. When --input "
+            "is provided, this is the column name containing SMILES strings."
+        ),
     )
     parser.add_argument(
         "--min-natom",
@@ -279,4 +285,8 @@ def get_args(argv=None):
     args = parser.parse_args(argv)
     explicit_options = _explicit_option_names(sys.argv[1:] if argv is None else argv)
     args.input_only = bool(args.input) and explicit_options <= {"-i", "--input"}
+    args.input_xyz_column = bool(args.input) and bool(
+        explicit_options.intersection({"-x", "--xyz"})
+    )
+    args.input_smiles_column = bool(args.input) and "--smiles" in explicit_options
     return args
