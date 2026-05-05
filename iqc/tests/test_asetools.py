@@ -19,10 +19,12 @@ from iqc.asetools import (
     get_canonical_smiles_from_atoms,
     get_atoms_from_smiles,
     atoms2xyz,
+    get_atoms_from_xyz,
     get_total_electrons,
     get_spin,
-    get_unpaired_electrons,
+    get_multiplicity,
     apply_spin_charge,
+    parse_multiplicity_charge_from_comment,
     xyz2atoms,
     get_calculator,
     get_ase_version,
@@ -121,70 +123,109 @@ def test_get_total_electrons(water_atoms, methane_atoms):
 
 
 def test_get_spin(water_atoms, methane_atoms):
-    """Test spin calculation."""
-    # Both water and methane have even number of electrons -> spin 0
+    """Test spin calculation (returns S = (multiplicity - 1) / 2)."""
+    # Both water and methane have even number of electrons -> singlet, S=0
     assert get_spin(water_atoms) == 0.0
     assert get_spin(methane_atoms) == 0.0
 
-    # Create OH radical (odd number of electrons)
+    # Create OH radical (odd number of electrons -> doublet, S=0.5)
     oh_radical = Atoms("OH", positions=[[0, 0, 0], [0, 0, 1]])
     assert get_spin(oh_radical) == 0.5
 
-    # Explicit unpaired-electron override (e.g. triplet O2 -> S=1)
+    # Explicit multiplicity override (e.g. triplet O2 -> S=1)
     o2 = Atoms("O2", positions=[[0, 0, 0], [0, 0, 1.2]])
     assert get_spin(o2) == 0.0
-    assert get_spin(o2, unpaired_electrons=2) == 1.0
+    assert get_spin(o2, multiplicity=3) == 1.0
 
 
-def test_get_unpaired_electrons(water_atoms):
+def test_get_multiplicity(water_atoms):
     """Defaults to electron-count parity, override with explicit value."""
-    assert get_unpaired_electrons(water_atoms) == 0
+    assert get_multiplicity(water_atoms) == 1  # singlet
     oh_radical = Atoms("OH", positions=[[0, 0, 0], [0, 0, 1]])
-    assert get_unpaired_electrons(oh_radical) == 1
+    assert get_multiplicity(oh_radical) == 2  # doublet
     # Triplet override on a closed-shell parity molecule (e.g. O2)
     o2 = Atoms("O2", positions=[[0, 0, 0], [0, 0, 1.2]])
-    assert get_unpaired_electrons(o2, spin=2) == 2
+    assert get_multiplicity(o2, multiplicity=3) == 3
     with pytest.raises(ValueError):
-        get_unpaired_electrons(water_atoms, spin=-1)
+        get_multiplicity(water_atoms, multiplicity=0)
 
 
 def test_apply_spin_charge_xtb_convention():
-    """XTB reads sums of initial_charges and initial_magnetic_moments."""
+    """XTB reads sums of initial_charges and initial_magnetic_moments
+    (uhf = unpaired electrons = multiplicity - 1)."""
 
     class FakeXTB:
         pass
 
     FakeXTB.__name__ = "XTB"
     atoms = Atoms("OH", positions=[[0, 0, 0], [0, 0, 1]])
-    unpaired = apply_spin_charge(atoms, FakeXTB(), spin=1, charge=-1)
-    assert unpaired == 1
+    mult = apply_spin_charge(atoms, FakeXTB(), multiplicity=2, charge=-1)
+    assert mult == 2
     assert int(round(atoms.get_initial_charges().sum())) == -1
-    assert int(round(atoms.get_initial_magnetic_moments().sum())) == 1
+    assert int(round(atoms.get_initial_magnetic_moments().sum())) == 1  # uhf
 
 
 def test_apply_spin_charge_fairchem_convention():
-    """FAIRChem UMA reads atoms.info; spin there is multiplicity (2S+1)."""
+    """FAIRChem UMA reads atoms.info; its `spin` key is the multiplicity."""
 
     class FakeFAIR:
         pass
 
     FakeFAIR.__name__ = "FAIRChemCalculator"
     atoms = Atoms("O2", positions=[[0, 0, 0], [0, 0, 1.2]])
-    apply_spin_charge(atoms, FakeFAIR(), spin=2, charge=0)
+    apply_spin_charge(atoms, FakeFAIR(), multiplicity=3, charge=0)
     assert atoms.info["charge"] == 0
     assert atoms.info["spin"] == 3  # triplet multiplicity
 
 
+def test_parse_multiplicity_charge_from_comment():
+    """Comment-line parser handles multiplicity, uhf, and charge tokens."""
+    assert parse_multiplicity_charge_from_comment("") == (None, None)
+    assert parse_multiplicity_charge_from_comment("just a comment") == (None, None)
+    # multiplicity preferred form
+    assert parse_multiplicity_charge_from_comment("multiplicity=3 charge=-1") == (3, -1)
+    assert parse_multiplicity_charge_from_comment("mult=1 q=0") == (1, 0)
+    # uhf converts to multiplicity = uhf + 1
+    assert parse_multiplicity_charge_from_comment("uhf=1 chrg=1") == (2, 1)
+    # case insensitive, mixed separators
+    assert parse_multiplicity_charge_from_comment("Mult: 1, Charge: 2") == (1, 2)
+    # consistent multiplicity + uhf -> no warning, multiplicity wins
+    assert parse_multiplicity_charge_from_comment("multiplicity=3 uhf=2") == (3, None)
+    # invalid multiplicity rejected
+    with pytest.raises(ValueError):
+        parse_multiplicity_charge_from_comment("multiplicity=0")
+
+
+def test_get_atoms_from_xyz_reads_multiplicity_charge(tmp_path):
+    """get_atoms_from_xyz stashes parsed multiplicity/charge in atoms.info."""
+    xyz = """3
+multiplicity=2 charge=-1
+O 0.0 0.0 0.0
+H 0.0 0.0 1.0
+H 0.0 1.0 0.0
+"""
+    f = tmp_path / "anion.xyz"
+    f.write_text(xyz)
+    atoms = get_atoms_from_xyz(str(f))
+    assert atoms.info.get("multiplicity") == 2
+    assert atoms.info.get("charge") == -1
+
+    # And from a string with no tokens — info is unset
+    atoms2 = get_atoms_from_xyz("1\n\nH 0 0 0\n")
+    assert "multiplicity" not in atoms2.info
+    assert "charge" not in atoms2.info
+
+
 def test_apply_spin_charge_emt_warns(caplog):
-    """EMT/MACE silently accept defaults but warn on non-default spin/charge."""
+    """EMT/MACE silently accept defaults but warn on non-default values."""
     atoms = Atoms("H2O", positions=[[0, 0, 0], [0, 0, 1], [0, 1, 0]])
     with caplog.at_level(logging.WARNING):
-        apply_spin_charge(atoms, EMT(), spin=0, charge=0)
+        apply_spin_charge(atoms, EMT(), multiplicity=1, charge=0)
     assert not any("does not support" in r.message for r in caplog.records)
 
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        apply_spin_charge(atoms, EMT(), spin=2, charge=-1)
+        apply_spin_charge(atoms, EMT(), multiplicity=3, charge=-1)
     assert any("does not support" in r.message for r in caplog.records)
 
 

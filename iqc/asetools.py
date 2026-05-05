@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime
 import numpy as np
@@ -1112,65 +1113,61 @@ def get_total_electrons(atoms):
     return total_electrons
 
 
-def get_spin(atoms, unpaired_electrons=None):
-    """Return total spin S = unpaired_electrons / 2 (ASE thermo convention).
+def get_multiplicity(atoms, multiplicity=None):
+    """Resolve spin multiplicity (2S+1, integer >= 1).
 
-    If `unpaired_electrons` is None, defaults to 1 for an odd electron count
-    (doublet) and 0 for an even electron count (singlet).
+    Defaults to 2 for an odd electron count (doublet), 1 for an even count
+    (singlet). Pass an explicit `multiplicity` to override (e.g. 3 for
+    triplet O2).
+    """
+    if multiplicity is None:
+        return 2 if get_total_electrons(atoms) % 2 else 1
+    multiplicity = int(multiplicity)
+    if multiplicity < 1:
+        raise ValueError(f"multiplicity must be >= 1, got {multiplicity}")
+    return multiplicity
+
+
+def get_spin(atoms, multiplicity=None):
+    """Return total spin S = (multiplicity - 1) / 2 (ASE thermo convention).
+
+    If `multiplicity` is None, defaults from electron count parity (singlet
+    for even, doublet for odd).
 
     Args:
         atoms: ASE Atoms object
-        unpaired_electrons (int, optional): Number of unpaired electrons. When
-            provided, overrides the parity-based default (e.g. for triplet
-            O2 pass unpaired_electrons=2).
+        multiplicity (int, optional): Spin multiplicity 2S+1. When provided,
+            overrides the parity-based default (e.g. for triplet O2 pass 3).
 
     Returns:
         float: Spin S (e.g. 0.0 for singlet, 0.5 for doublet, 1.0 for triplet).
     """
-    if unpaired_electrons is None:
-        unpaired_electrons = get_total_electrons(atoms) % 2
-    return unpaired_electrons / 2.0
+    return (get_multiplicity(atoms, multiplicity) - 1) / 2.0
 
 
-def get_unpaired_electrons(atoms, spin=None):
-    """Resolve number of unpaired electrons (>=0).
+def apply_spin_charge(atoms, calculator, multiplicity=None, charge=0):
+    """Apply spin state and charge to `atoms` using the calculator's convention.
 
-    Defaults to 1 for an odd electron count, 0 for an even count. Pass an
-    explicit `spin` (number of unpaired electrons) to override.
-    """
-    if spin is None:
-        return get_total_electrons(atoms) % 2
-    spin = int(spin)
-    if spin < 0:
-        raise ValueError(f"spin (unpaired electrons) must be >= 0, got {spin}")
-    return spin
-
-
-def apply_spin_charge(atoms, calculator, spin=None, charge=0):
-    """Apply spin and charge to `atoms` using the convention of `calculator`.
-
-    Different ASE calculators expect different inputs for spin state and
-    molecular charge. This helper exposes one user-facing convention and
-    translates internally:
-
-      - `spin` is the number of unpaired electrons (int >= 0). Pass None to
-        default from electron count parity.
-      - `charge` is the total molecular charge (int). Default 0.
+    User-facing convention is **multiplicity** 2S+1 (singlet=1, doublet=2,
+    triplet=3, ...) and integer **charge**. Defaults: multiplicity from
+    electron-count parity, charge=0.
 
     Translation per calculator:
       - XTB (`xtb.ase.calculator.XTB`): reads sums of
         `atoms.get_initial_charges()` and `atoms.get_initial_magnetic_moments()`.
+        XTB's `uhf` is the number of unpaired electrons (= multiplicity - 1).
         We place the totals on atom 0, leave others at 0.
       - FAIRChem UMA (`fairchem.core.FAIRChemCalculator`): reads
-        `atoms.info["charge"]` and `atoms.info["spin"]`, where its `spin` is
-        the spin multiplicity 2S+1. We set `atoms.info["spin"] = spin + 1`.
+        `atoms.info["charge"]` and `atoms.info["spin"]` where its `spin` is
+        the spin multiplicity. We set `atoms.info["spin"] = multiplicity`.
       - MACE (`MACECalculator` from mace_mp) and ASE EMT: no spin/charge
         support; a warning is logged if non-default values are requested.
 
     Returns:
-        int: Number of unpaired electrons that was applied (after defaulting).
+        int: Resolved multiplicity that was applied (after defaulting).
     """
-    unpaired = get_unpaired_electrons(atoms, spin)
+    multiplicity = get_multiplicity(atoms, multiplicity)
+    unpaired = multiplicity - 1
     charge = int(charge)
     calc_class = type(calculator).__name__
     n = len(atoms)
@@ -1185,28 +1182,28 @@ def apply_spin_charge(atoms, calculator, spin=None, charge=0):
         atoms.set_initial_magnetic_moments(magmoms)
     elif calc_class == "FAIRChemCalculator":
         atoms.info["charge"] = charge
-        atoms.info["spin"] = unpaired + 1  # multiplicity = 2S+1
+        atoms.info["spin"] = multiplicity
     elif calc_class in {"MACECalculator", "EMT"}:
-        default_unpaired = get_total_electrons(atoms) % 2
-        if charge != 0 or unpaired != default_unpaired:
+        default_mult = 2 if get_total_electrons(atoms) % 2 else 1
+        if charge != 0 or multiplicity != default_mult:
             logging.warning(
                 "%s does not support spin/charge; ignoring charge=%d, "
-                "unpaired_electrons=%d.",
+                "multiplicity=%d.",
                 calc_class,
                 charge,
-                unpaired,
+                multiplicity,
             )
     else:
-        default_unpaired = get_total_electrons(atoms) % 2
-        if charge != 0 or unpaired != default_unpaired:
+        default_mult = 2 if get_total_electrons(atoms) % 2 else 1
+        if charge != 0 or multiplicity != default_mult:
             logging.warning(
                 "Spin/charge convention for calculator '%s' is unknown; "
-                "values not applied (charge=%d, unpaired_electrons=%d).",
+                "values not applied (charge=%d, multiplicity=%d).",
                 calc_class,
                 charge,
-                unpaired,
+                multiplicity,
             )
-    return unpaired
+    return multiplicity
 
 
 def get_inchikey(atoms):
@@ -1237,7 +1234,7 @@ atoms2inchikey = get_inchikey
 
 
 def _prepare_calculation(
-    atoms, calculator=None, unique_name="", spin=None, charge=0
+    atoms, calculator=None, unique_name="", multiplicity=None, charge=0
 ):
     """
     Prepare atoms and calculator for a calculation.
@@ -1247,8 +1244,8 @@ def _prepare_calculation(
         calculator (ase.calculators.calculator.Calculator): The calculator instance to use.
                                                             If None, get_calculator() is called.
         unique_name (str): Unique name for the molecule
-        spin (int, optional): Number of unpaired electrons. Defaults to electron
-            count parity (0 for even, 1 for odd).
+        multiplicity (int, optional): Spin multiplicity 2S+1. Defaults from
+            electron-count parity (1 for even, 2 for odd).
         charge (int): Total molecular charge. Defaults to 0.
 
     Returns:
@@ -1270,7 +1267,9 @@ def _prepare_calculation(
 
     # Apply spin/charge in the convention expected by this calculator before
     # attaching it; XTB and FAIRChem read these from the atoms object.
-    unpaired_electrons = apply_spin_charge(atoms, calc, spin=spin, charge=charge)
+    multiplicity = apply_spin_charge(
+        atoms, calc, multiplicity=multiplicity, charge=charge
+    )
 
     # Get initial data
     initial_smiles = atoms2smiles(atoms)
@@ -1296,8 +1295,8 @@ def _prepare_calculation(
     results = {
         "number_of_atoms": len(atoms),
         "number_of_electrons": get_total_electrons(atoms),
-        "spin": get_spin(atoms, unpaired_electrons),
-        "unpaired_electrons": unpaired_electrons,
+        "spin": get_spin(atoms, multiplicity),
+        "multiplicity": multiplicity,
         "charge": charge,
         "formula": atoms.get_chemical_formula(mode="hill"),
         "unique_name": unique_name,
@@ -1319,7 +1318,7 @@ def run_single_point(
     atoms,
     calculator=None,
     unique_name="",
-    spin=None,
+    multiplicity=None,
     charge=0,
 ):
     """
@@ -1329,8 +1328,8 @@ def run_single_point(
         atoms (ase.Atoms): ASE Atoms object
         calculator (ase.calculators.calculator.Calculator, optional): Calculator instance. Defaults to None (uses get_calculator).
         unique_name (str): Unique name for the molecule
-        spin (int, optional): Number of unpaired electrons. Defaults to electron
-            count parity. Translated per-calculator by `apply_spin_charge`.
+        multiplicity (int, optional): Spin multiplicity 2S+1. Defaults from
+            electron-count parity. Translated per-calculator by `apply_spin_charge`.
         charge (int): Total molecular charge. Defaults to 0.
 
     Returns:
@@ -1339,7 +1338,7 @@ def run_single_point(
     logging.info(f"Starting single point calculation for {unique_name}")
 
     calc, results = _prepare_calculation(
-        atoms, calculator, unique_name, spin=spin, charge=charge
+        atoms, calculator, unique_name, multiplicity=multiplicity, charge=charge
     )
 
     try:
@@ -1370,7 +1369,7 @@ def run_optimization(
     max_steps=500,
     trajectory=None,
     save_geometry=False,
-    spin=None,
+    multiplicity=None,
     charge=0,
 ):
     """
@@ -1384,15 +1383,15 @@ def run_optimization(
         max_steps (int): Maximum number of optimization steps
         trajectory (str): Path to save trajectory file
         save_geometry (bool): Whether to save the final optimized geometry to xyz file
-        spin (int, optional): Number of unpaired electrons. Defaults to electron
-            count parity. Translated per-calculator by `apply_spin_charge`.
+        multiplicity (int, optional): Spin multiplicity 2S+1. Defaults from
+            electron-count parity. Translated per-calculator by `apply_spin_charge`.
         charge (int): Total molecular charge. Defaults to 0.
 
     Returns:
         tuple: A tuple containing the optimized atoms and a dictionary with calculated properties
     """
     calc, results = _prepare_calculation(
-        atoms, calculator, unique_name, spin=spin, charge=charge
+        atoms, calculator, unique_name, multiplicity=multiplicity, charge=charge
     )
     logging.info(f"Starting geometry optimization for {unique_name} with {str(calc)}")
     # Log optimization parameters
@@ -1487,7 +1486,7 @@ def run_vibrations(
     max_vib_imag=50,
     trajectory=None,
     save_geometry=False,
-    spin=None,
+    multiplicity=None,
     charge=0,
     **params,
 ):
@@ -1520,7 +1519,7 @@ def run_vibrations(
         if calculator is None:
             if atoms.calc is None:
                 calc, calc_results = _prepare_calculation(
-                    atoms, calculator, unique_name, spin=spin, charge=charge
+                    atoms, calculator, unique_name, multiplicity=multiplicity, charge=charge
                 )
                 results.update(calc_results)  # Update results with calculator results
             else:
@@ -1545,7 +1544,7 @@ def run_vibrations(
             fmax=fmax,
             trajectory=trajectory,
             save_geometry=save_geometry,
-            spin=spin,
+            multiplicity=multiplicity,
             charge=charge,
             **params,
         )
@@ -1662,6 +1661,8 @@ def run_ir(
     ir_spectrum_end=4000,
     sparse_spectrum=False,
     intensity_threshold=0.0,
+    multiplicity=None,
+    charge=0,
     **params,
 ):
     """
@@ -1699,7 +1700,7 @@ def run_ir(
         if calculator is None:
             if atoms.calc is None:
                 calc, calc_results = _prepare_calculation(
-                    atoms, calculator, unique_name
+                    atoms, calculator, unique_name, multiplicity=multiplicity, charge=charge
                 )
                 results.update(calc_results)
             else:
@@ -1722,6 +1723,8 @@ def run_ir(
             fmax=fmax,
             trajectory=trajectory,
             save_geometry=save_geometry,
+            multiplicity=multiplicity,
+            charge=charge,
             **params,
         )
         if opt_results.get("error"):
@@ -1816,7 +1819,7 @@ def run_thermo(
     unique_name="",
     trajectory=None,
     save_geometry=False,
-    spin=None,
+    multiplicity=None,
     charge=0,
     **params,
 ):
@@ -1843,7 +1846,7 @@ def run_thermo(
         unique_name=unique_name,
         trajectory=trajectory,
         save_geometry=save_geometry,
-        spin=spin,
+        multiplicity=multiplicity,
         charge=charge,
         **params,
     )
@@ -1881,7 +1884,7 @@ def run_thermo(
             geometry=get_geometry_type(atoms),
             atoms=atoms,
             potentialenergy=atoms.get_potential_energy(),
-            spin=get_spin(atoms, results.get("unpaired_electrons")),
+            spin=get_spin(atoms, results.get("multiplicity")),
             symmetrynumber=results.get("opt_sym_number", 1),  # Use optimized symmetry
             ignore_imag_modes=ignore_imag_modes,
         )
@@ -1903,9 +1906,64 @@ def run_thermo(
     return thermo, results
 
 
+_XYZ_COMMENT_KV_RE = re.compile(
+    r"(?:^|[\s,;])(multiplicity|mult|uhf|charge|chrg|q)\s*[=:]\s*(-?\d+)",
+    re.IGNORECASE,
+)
+
+
+def parse_multiplicity_charge_from_comment(comment):
+    """Extract spin multiplicity and charge from an XYZ comment line.
+
+    Recognized tokens (case-insensitive, separator `=` or `:`):
+      - `multiplicity=N` or `mult=N`: spin multiplicity 2S+1 (preferred form)
+      - `uhf=N`: number of unpaired electrons (XTB spelling); converted to N+1
+      - `charge=N`, `chrg=N`, or `q=N`: total molecular charge
+
+    Returns:
+        tuple[Optional[int], Optional[int]]: (multiplicity, charge). Either
+        may be None if not present. If both `multiplicity` and `uhf` are given
+        and disagree, `multiplicity` wins (a warning is logged).
+    """
+    if not comment:
+        return None, None
+    mult = None
+    uhf = None
+    charge = None
+    for key, value in _XYZ_COMMENT_KV_RE.findall(comment):
+        key = key.lower()
+        n = int(value)
+        if key in ("multiplicity", "mult"):
+            mult = n
+        elif key == "uhf":
+            uhf = n
+        elif key in ("charge", "chrg", "q"):
+            charge = n
+    if mult is None and uhf is not None:
+        if uhf < 0:
+            raise ValueError(f"uhf must be >= 0, got {uhf}")
+        mult = uhf + 1
+    elif mult is not None and uhf is not None and (uhf + 1) != mult:
+        logging.warning(
+            "XYZ comment has both multiplicity=%d and uhf=%d (mismatched); "
+            "using multiplicity=%d.",
+            mult,
+            uhf,
+            mult,
+        )
+    if mult is not None and mult < 1:
+        raise ValueError(f"multiplicity must be >= 1, got {mult}")
+    return mult, charge
+
+
 def get_atoms_from_xyz(xyz, parallel=False, index=-1):
     """
     Generate ASE Atoms object from XYZ input.
+
+    The XYZ comment line is parsed for `multiplicity`/`uhf` and `charge`/`q`
+    tokens (see `parse_multiplicity_charge_from_comment`). When found, they
+    are stored under `atoms.info["multiplicity"]` and `atoms.info["charge"]`
+    for downstream consumption.
 
     Args:
         xyz (str): Either path to an XYZ file or XYZ content as string
@@ -1916,14 +1974,54 @@ def get_atoms_from_xyz(xyz, parallel=False, index=-1):
     """
     logging.debug(f"Reading atoms from XYZ input: {xyz}")
     if os.path.isfile(xyz):
-        atoms = read(xyz, format="xyz", parallel=parallel, index=index)
+        with open(xyz, "r") as fh:
+            xyz_text = fh.read()
+        atoms = read(io.StringIO(xyz_text), format="xyz", parallel=parallel, index=index)
     elif isinstance(xyz, str):
-        atoms = read(io.StringIO(xyz), format="xyz", parallel=parallel, index=index)
+        xyz_text = xyz
+        atoms = read(io.StringIO(xyz_text), format="xyz", parallel=parallel, index=index)
     else:
         logging.error(f"Invalid input type for ase.io.read: {type(xyz)}")
         return None
+
+    try:
+        comment = _extract_xyz_comment(xyz_text, index)
+        mult, charge = parse_multiplicity_charge_from_comment(comment)
+        if mult is not None:
+            atoms.info["multiplicity"] = mult
+        if charge is not None:
+            atoms.info["charge"] = charge
+    except Exception as e:
+        logging.debug(f"Could not parse multiplicity/charge from XYZ comment: {e}")
+
     logging.debug(f"Successfully read atoms from {xyz}")
     return atoms
+
+
+def _extract_xyz_comment(xyz_text, index=-1):
+    """Return the comment (line 2) of the requested XYZ frame, or empty string."""
+    lines = xyz_text.splitlines()
+    frames = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
+        try:
+            n = int(line)
+        except ValueError:
+            i += 1
+            continue
+        comment = lines[i + 1] if i + 1 < len(lines) else ""
+        frames.append(comment)
+        i += 2 + n
+    if not frames:
+        return ""
+    try:
+        return frames[index]
+    except IndexError:
+        return frames[-1]
 
 
 xyz2atoms = get_atoms_from_xyz

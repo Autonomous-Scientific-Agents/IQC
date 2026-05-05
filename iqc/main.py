@@ -473,11 +473,27 @@ def main():
             "params": params_str,
         }
 
+        # Resolve multiplicity (2S+1) and charge: CLI > XYZ comment > default.
+        ase_multiplicity = (
+            args.multiplicity
+            if getattr(args, "multiplicity", None) is not None
+            else atoms.info.get("multiplicity")
+        )
+        ase_charge = (
+            args.charge
+            if getattr(args, "charge", None) is not None
+            else int(atoms.info.get("charge", 0))
+        )
+
         try:
             # Run calculation based on task using the selected calculator and parameters
             if task == "single":
                 atoms, task_results = run_single_point(
-                    atoms=atoms, calculator=calculator, unique_name=unique_name
+                    atoms=atoms,
+                    calculator=calculator,
+                    unique_name=unique_name,
+                    multiplicity=ase_multiplicity,
+                    charge=ase_charge,
                 )
             elif task == "opt":
                 # Pass optimization parameters from file
@@ -503,6 +519,8 @@ def main():
                     unique_name=unique_name,
                     trajectory=trajectory_file,
                     save_geometry=save_geometry,
+                    multiplicity=ase_multiplicity,
+                    charge=ase_charge,
                     **opt_params_filtered,
                 )
             elif task == "vib":
@@ -536,6 +554,8 @@ def main():
                     unique_name=unique_name,
                     trajectory=trajectory_file,
                     save_geometry=save_geometry,
+                    multiplicity=ase_multiplicity,
+                    charge=ase_charge,
                     **vib_params_filtered,
                 )
             elif task == "ir":
@@ -566,6 +586,8 @@ def main():
                     unique_name=unique_name,
                     trajectory=trajectory_file,
                     save_geometry=save_geometry,
+                    multiplicity=ase_multiplicity,
+                    charge=ase_charge,
                     **ir_params_filtered,
                 )
             elif task == "thermo":
@@ -604,6 +626,8 @@ def main():
                     ignore_imag_modes=ignore_imag,
                     trajectory=trajectory_file,
                     save_geometry=save_geometry,
+                    multiplicity=ase_multiplicity,
+                    charge=ase_charge,
                     **thermo_params_filtered,
                 )
             elif task == "nmr":

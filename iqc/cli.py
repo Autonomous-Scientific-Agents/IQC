@@ -244,13 +244,22 @@ def get_args(argv=None):
         "--charge",
         type=int,
         default=None,
-        help="Total molecular charge for NMR calculations.",
+        help=(
+            "Total molecular charge. Used by NMR backends and by ASE "
+            "calculators that support charge (e.g. xTB, FAIRChem UMA). "
+            "Overrides any 'charge=' set in the XYZ comment line."
+        ),
     )
     parser.add_argument(
         "--multiplicity",
         type=int,
         default=None,
-        help="Spin multiplicity for NMR calculations.",
+        help=(
+            "Spin multiplicity 2S+1 (singlet=1, doublet=2, triplet=3, ...). "
+            "Used by NMR backends and by ASE calculators that support spin "
+            "(e.g. xTB, FAIRChem UMA). Overrides any 'multiplicity='/'uhf=' "
+            "in the XYZ comment line."
+        ),
     )
     add_bool_flag(
         parser,
