@@ -790,6 +790,30 @@ def test_run_vibrations_error_handling(tmp_path):
         assert "Vibration failed" in results["error"]
 
 
+def test_run_vibrations_filters_optimization_params(tmp_path):
+    """Vibration-only parameters must not be passed to run_optimization."""
+    h2 = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
+
+    with patch("iqc.asetools.run_optimization") as mock_opt:
+        mock_opt.return_value = (h2, {"error": "Optimization failed"})
+        run_vibrations(
+            h2,
+            calculator=EMT(),
+            optimize=True,
+            max_trans_rot=50,
+            max_vib_imag=20,
+            max_steps=7,
+            output_dir=str(tmp_path),
+            vib_dir=tmp_path / "vib",
+        )
+
+    opt_kwargs = mock_opt.call_args.kwargs
+    assert "max_trans_rot" not in opt_kwargs
+    assert "max_vib_imag" not in opt_kwargs
+    assert opt_kwargs["max_steps"] == 7
+    assert opt_kwargs["output_dir"] == str(tmp_path)
+
+
 def test_run_vibrations_warnings(tmp_path):
     """Test warning handling in run_vibrations."""
     # Create a linear molecule with high translational/rotational modes
@@ -910,6 +934,33 @@ def test_run_ir_uses_separate_dipole_calculator(tmp_path, monkeypatch):
     assert results["calculator_vibration"]
     assert results["calculator_dipole"]
     assert results["error"] == ""
+
+
+def test_run_ir_filters_optimization_params(tmp_path):
+    """IR parameters must not leak into run_optimization."""
+    h2 = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
+    calc = MagicMock()
+    calc.implemented_properties = ["energy", "forces", "dipole"]
+    calc.__str__.return_value = "dipole-calc"
+
+    with patch("iqc.asetools.run_optimization") as mock_opt:
+        mock_opt.return_value = (h2, {"error": "Optimization failed"})
+        run_ir(
+            h2,
+            calculator=calc,
+            optimize=True,
+            max_trans_rot=50,
+            max_vib_imag=20,
+            max_steps=7,
+            output_dir=str(tmp_path),
+            vib_dir=tmp_path / "ir",
+        )
+
+    opt_kwargs = mock_opt.call_args.kwargs
+    assert "max_trans_rot" not in opt_kwargs
+    assert "max_vib_imag" not in opt_kwargs
+    assert opt_kwargs["max_steps"] == 7
+    assert opt_kwargs["output_dir"] == str(tmp_path)
 
 
 def test_get_calculator_orca_constructs_with_profile(monkeypatch):

@@ -1663,6 +1663,16 @@ def run_optimization(
     return atoms, results
 
 
+def _optimization_extra_params(params):
+    """Return only params accepted by run_optimization beyond common arguments."""
+
+    return {
+        key: params[key]
+        for key in ("max_steps", "output_dir")
+        if key in params
+    }
+
+
 def run_vibrations(
     atoms,
     calculator=None,
@@ -1736,7 +1746,7 @@ def run_vibrations(
             save_geometry=save_geometry,
             multiplicity=multiplicity,
             charge=charge,
-            **params,
+            **_optimization_extra_params(params),
         )
         if opt_results.get("error"):  # Use get() to safely check for error
             results["error"] += opt_results["error"]  # Append optimization error
@@ -1982,7 +1992,7 @@ def run_ir(
             save_geometry=save_geometry,
             multiplicity=multiplicity,
             charge=charge,
-            **params,
+            **_optimization_extra_params(params),
         )
         if opt_results.get("error"):
             results["error"] += opt_results["error"]
