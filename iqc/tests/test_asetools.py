@@ -31,6 +31,7 @@ from iqc.asetools import (
     XTB,
     is_linear_by_inertia,
     get_symmetry_info,
+    run_ir,
     run_vibrations,
     run_thermo,
     _get_uma_calculator,
@@ -860,3 +861,204 @@ def test_run_thermo_error_handling(tmp_path):
         thermo, results = run_thermo(h2, calculator=EMT(), vib_dir=vib_dir)
         assert "error" in results
         assert "Thermo failed" in results["error"]
+
+
+def test_run_ir_uses_separate_dipole_calculator(tmp_path, monkeypatch):
+    """run_ir must compute forces with vib_calc and dipoles with dip_calc."""
+    monkeypatch.chdir(tmp_path)
+    h2 = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]], cell=[10, 10, 10], pbc=False)
+
+    vib_calls = {"forces": 0, "dipole": 0}
+    dip_calls = {"forces": 0, "dipole": 0}
+
+    class _CountingCalc:
+        def __init__(self, store, dipole=None):
+            self._store = store
+            self._dipole = dipole
+            self.name = "counting"
+
+        def get_forces(self, atoms):
+            self._store["forces"] += 1
+            return np.zeros((len(atoms), 3))
+
+        def get_dipole_moment(self, atoms):
+            self._store["dipole"] += 1
+            if self._dipole is None:
+                raise AssertionError("dipole calculator should not be called")
+            return np.array(self._dipole, dtype=float)
+
+    vib_calc = _CountingCalc(vib_calls)
+    dip_calc = _CountingCalc(dip_calls, dipole=[0.0, 0.0, 0.1])
+
+    _, results = run_ir(
+        h2,
+        vibration_calculator=vib_calc,
+        dipole_calculator=dip_calc,
+        optimize=False,
+        unique_name="h2_split",
+        vib_dir=str(tmp_path / "ir"),
+        delta=0.01,
+    )
+
+    # Forces requested only from vib_calc; dipoles only from dip_calc.
+    assert vib_calls["forces"] > 0
+    assert vib_calls["dipole"] == 0
+    assert dip_calls["forces"] == 0
+    assert dip_calls["dipole"] > 0
+    assert results["calculator_vibration"]
+    assert results["calculator_dipole"]
+    assert results["error"] == ""
+
+
+def test_get_calculator_orca_constructs_with_profile(monkeypatch):
+    """`get_calculator(name='orca', command=...)` returns a real ORCA calculator."""
+    pytest.importorskip("ase.calculators.orca")
+    from ase.calculators.orca import ORCA
+
+    calc = get_calculator(
+        name="orca",
+        command="/usr/bin/false",  # dummy; we don't run ORCA, just construct it
+        orcasimpleinput="HF def2-SVP",
+        orcablocks="%pal nprocs 1 end",
+    )
+    assert isinstance(calc, ORCA), (
+        f"expected ORCA instance, got {type(calc).__name__}"
+    )
+    # Dipole must be in implemented_properties for the IR dipole role.
+    assert "dipole" in calc.implemented_properties
+
+
+def test_get_calculator_orca_auto_detects_path(monkeypatch):
+    """When command/env are unset, get_calculator must probe PATH for `orca`."""
+    pytest.importorskip("ase.calculators.orca")
+    from ase.calculators.orca import ORCA
+
+    monkeypatch.delenv("ASE_ORCA_COMMAND", raising=False)
+    # Pretend `orca` lives at a known path so OrcaProfile gets a command.
+    monkeypatch.setattr(
+        "shutil.which", lambda exe: "/fake/path/orca" if exe == "orca" else None
+    )
+    calc = get_calculator(name="orca")
+    assert isinstance(calc, ORCA)
+
+
+ORCA6_OUTPUT_NO_COM = """\
+                                  ORCA 6.0.1
+                          - the next ORCA -
+
+------------------
+TOTAL SCF ENERGY
+------------------
+
+FINAL SINGLE POINT ENERGY       -76.42830000
+
+---------------------------------
+CARTESIAN COORDINATES (ANGSTROEM)
+---------------------------------
+  O      0.000000    0.000000    0.122147
+  H      0.000000    0.769065   -0.473338
+  H      0.000000   -0.769065   -0.463338
+
+Number of atoms                             ...      3
+
+-------------
+DIPOLE MOMENT
+-------------
+                                X             Y             Z
+Electronic contribution:      0.000000      0.000000      0.123456
+Nuclear contribution   :      0.000000      0.000000     -0.905784
+                        -----------------------------------------
+Total Dipole Moment    :     -0.000000000       0.000000000      -0.782327949
+                        -----------------------------------------
+Magnitude (a.u.)       :      0.78232795
+Magnitude (Debye)      :      1.98852000
+
+
+****ORCA TERMINATED NORMALLY****
+"""
+
+
+def test_patch_ase_orca_dipole_recovers_dipole_for_orca6(tmp_path, monkeypatch):
+    """ORCA 6 outputs lack the COM line; patched parser must still emit dipole."""
+    pytest.importorskip("ase.io.orca")
+
+    # Reset any prior patch state so this test is self-contained.
+    from ase.io import orca as _orca_io
+    original = getattr(
+        _orca_io, "_iqc_original_read_orca_output", _orca_io.read_orca_output
+    )
+    monkeypatch.setattr(_orca_io, "read_orca_output", original)
+    monkeypatch.setattr(_orca_io, "_iqc_dipole_patched", False, raising=False)
+    try:
+        from iqc.asetools import _patch_ase_orca_dipole
+
+        applied = _patch_ase_orca_dipole()
+        assert applied, "patch should have been applied on a fresh import"
+
+        out = tmp_path / "orca.out"
+        out.write_text(ORCA6_OUTPUT_NO_COM)
+        atoms = _orca_io.read_orca_output(str(out), index=0)
+        results = atoms.calc.results
+        assert "dipole" in results, (
+            f"patched read_orca_output must surface dipole; got keys {list(results)}"
+        )
+        # ASE's read_dipole converts a.u. (e·Bohr) to e·Å:
+        # -0.782327949 * Bohr ≈ -0.41399.
+        from ase.units import Bohr
+        np.testing.assert_allclose(
+            results["dipole"], [0.0, 0.0, -0.782327949 * Bohr], atol=1e-9
+        )
+    finally:
+        _orca_io.read_orca_output = original
+        _orca_io._iqc_dipole_patched = False
+
+
+def test_run_ir_rejects_dipole_calculator_without_dipole_property(tmp_path, monkeypatch):
+    """EMT lacks 'dipole' in implemented_properties; must fail before any work."""
+    monkeypatch.chdir(tmp_path)
+    h2 = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]], cell=[10, 10, 10], pbc=False)
+
+    _, results = run_ir(
+        h2,
+        calculator=EMT(),
+        optimize=False,
+        unique_name="h2_no_dipole",
+        vib_dir=str(tmp_path / "ir"),
+        delta=0.01,
+    )
+
+    assert "dipole" in results["error"].lower()
+    assert "implemented_properties" not in results  # sanity: error is human-readable
+
+
+def test_run_ir_falls_back_to_single_calculator(tmp_path, monkeypatch):
+    """When only `calculator` is given, all three roles use it."""
+    monkeypatch.chdir(tmp_path)
+    h2 = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]], cell=[10, 10, 10], pbc=False)
+
+    calls = {"forces": 0, "dipole": 0}
+
+    class _SingleCalc:
+        name = "single"
+
+        def get_forces(self, atoms):
+            calls["forces"] += 1
+            return np.zeros((len(atoms), 3))
+
+        def get_dipole_moment(self, atoms):
+            calls["dipole"] += 1
+            return np.zeros(3)
+
+    calc = _SingleCalc()
+    _, results = run_ir(
+        h2,
+        calculator=calc,
+        optimize=False,
+        unique_name="h2_single",
+        vib_dir=str(tmp_path / "ir"),
+        delta=0.01,
+    )
+
+    assert calls["forces"] > 0
+    assert calls["dipole"] > 0
+    assert results["error"] == ""

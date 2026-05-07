@@ -5,6 +5,7 @@ import pickle
 import re
 import sys
 import glob
+import uuid
 from datetime import datetime
 from pathlib import Path
 import yaml  # Import YAML
@@ -26,6 +27,24 @@ def _smiles_to_basename(smiles: str) -> str:
 
     safe = re.sub(r"[^A-Za-z0-9]+", "_", str(smiles)).strip("_")
     return safe[:32] or "smiles"
+
+
+def _make_run_id():
+    """Return a readable, collision-resistant identifier for this IQC run."""
+
+    return f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+
+
+def _unique_child_path(parent, child_name):
+    """Return an absolute child path that does not already exist."""
+
+    parent_path = Path(parent).expanduser()
+    candidate = parent_path / child_name
+    counter = 1
+    while candidate.exists():
+        candidate = parent_path / f"{child_name}_{counter}"
+        counter += 1
+    return os.path.abspath(os.path.expanduser(str(candidate)))
 
 
 class ComplexEncoder(json.JSONEncoder):
@@ -219,12 +238,16 @@ def main():
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
-
-    # Create a central directory for tmp folders
-    central_tmp_dir = os.path.abspath("iqc_tmp")
-    if rank == 0 and not os.path.exists(central_tmp_dir):
-        os.makedirs(central_tmp_dir, exist_ok=True)
-    comm.Barrier()
+    task = args.task
+    run_id = comm.bcast(_make_run_id() if rank == 0 else None, root=0)
+    direct_work_dir = comm.bcast(
+        (
+            _unique_child_path(args.scratch, f"iqc_{task}_{run_id}")
+            if rank == 0
+            else None
+        ),
+        root=0,
+    )
 
     # --- Logging Setup --- (Remains mostly the same)
     logger = logging.getLogger()
@@ -273,7 +296,6 @@ def main():
             logging.warning(
                 f"Parameter file specified ({args.params}) but not found. Using defaults."
             )
-    task = args.task
     # Extract specific parameter sections, defaulting to empty dicts
     calc_params = params.get("calculator_params", {})
     opt_params = params.get("optimization_params", {})
@@ -304,8 +326,6 @@ def main():
         except RuntimeError as e:
             logging.error(f"Failed to initialize calculator '{calculator_name}': {e}")
             comm.Abort(1)
-    time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
     input_mode = get_structure_input_mode(args)
     if rank == 0:
         if input_mode == "smiles":
@@ -397,10 +417,26 @@ def main():
         create_database(db_path)
 
     dir_name = None
-    if not args.direct_db:
-        dir_name = f"{'tmp'}_{task}_{rank}_{time_stamp}"
-        logging.debug(f"Creating directory: {dir_name}")
-        os.makedirs(dir_name, exist_ok=True)
+    work_dir_used = False
+
+    def get_rank_output_dir():
+        """Create this rank's result/scratch directory only when it is needed."""
+
+        nonlocal dir_name
+        if dir_name is None:
+            dir_name = _unique_child_path(".", f"tmp_{task}_{rank}_{run_id}")
+            logging.debug(f"Creating directory: {dir_name}")
+            os.makedirs(dir_name, exist_ok=True)
+        return dir_name
+
+    def get_work_dir():
+        """Return the directory for files that are required by this task."""
+
+        nonlocal work_dir_used
+        work_dir_used = True
+        if args.direct_db:
+            return direct_work_dir
+        return get_rank_output_dir()
 
     for xyz_index in range(start_index, end_index):
 
@@ -424,8 +460,8 @@ def main():
         else:  # only one file
             xyz_file = xyz_files[0]
             base_name = os.path.splitext(os.path.basename(xyz_file))[0]
-        time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_name = f"{base_name}_{xyz_index}_{rank}_{time_stamp}"
+        record_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_name = f"{base_name}_{xyz_index}_{rank}_{record_stamp}"
         logging.info(f"Processing input: {xyz_file} with unique ID: {unique_name}")
 
         # Read input
@@ -497,10 +533,15 @@ def main():
                 )
             elif task == "opt":
                 # Pass optimization parameters from file
+                opt_run_params = dict(opt_params)
                 trajectory_file = None
                 save_geometry = False
                 if args.save:
-                    trajectory_file = f"{unique_name}_opt_trajectory.traj"
+                    output_dir = get_work_dir()
+                    trajectory_file = os.path.join(
+                        output_dir, f"{unique_name}_opt_trajectory.traj"
+                    )
+                    opt_run_params["output_dir"] = output_dir
                     save_geometry = True
                 # Filter out explicit parameters to avoid conflicts
                 explicit_params = {
@@ -511,7 +552,9 @@ def main():
                     "save_geometry",
                 }
                 opt_params_filtered = {
-                    k: v for k, v in opt_params.items() if k not in explicit_params
+                    k: v
+                    for k, v in opt_run_params.items()
+                    if k not in explicit_params
                 }
                 atoms, task_results = run_optimization(
                     atoms=atoms,
@@ -526,14 +569,16 @@ def main():
             elif task == "vib":
                 # Pass vibration parameters if added to config later
                 # vib_params = params.get('vibration_params', {})
-                if args.direct_db:
-                    vib_params["vib_dir"] = central_tmp_dir
-                elif dir_name:
-                    vib_params["vib_dir"] = dir_name
+                vib_run_params = dict(vib_params)
+                output_dir = get_work_dir()
+                vib_run_params["vib_dir"] = output_dir
                 trajectory_file = None
                 save_geometry = False
                 if args.save:
-                    trajectory_file = f"{unique_name}_vib_trajectory.traj"
+                    trajectory_file = os.path.join(
+                        output_dir, f"{unique_name}_vib_trajectory.traj"
+                    )
+                    vib_run_params["output_dir"] = output_dir
                     save_geometry = True
                 # Filter out explicit parameters to avoid conflicts
                 explicit_params = {
@@ -545,7 +590,9 @@ def main():
                     "save_geometry",
                 }
                 vib_params_filtered = {
-                    k: v for k, v in vib_params.items() if k not in explicit_params
+                    k: v
+                    for k, v in vib_run_params.items()
+                    if k not in explicit_params
                 }
                 atoms, task_results = run_vibrations(
                     atoms=atoms,
@@ -559,25 +606,96 @@ def main():
                     **vib_params_filtered,
                 )
             elif task == "ir":
-                if args.direct_db:
-                    ir_params["vib_dir"] = central_tmp_dir
-                elif dir_name:
-                    ir_params["vib_dir"] = dir_name
+                ir_run_params = dict(ir_params)
+                output_dir = get_work_dir()
+                ir_run_params["vib_dir"] = output_dir
                 trajectory_file = None
                 save_geometry = False
                 if args.save:
-                    trajectory_file = f"{unique_name}_ir_trajectory.traj"
+                    trajectory_file = os.path.join(
+                        output_dir, f"{unique_name}_ir_trajectory.traj"
+                    )
+                    ir_run_params["output_dir"] = output_dir
                     save_geometry = True
+
+                # Per-role calculator overrides (YAML ir_params can specify a
+                # calculator *name* per role; we instantiate each here using
+                # the same calc_params as the main calculator).
+                supported_names = {
+                    "mace",
+                    "xtb",
+                    "emt",
+                    "orca",
+                    "uma",
+                    "uma-s-omol",
+                    "uma-s-omat",
+                    "uma-s-odac",
+                    "uma-m-omol",
+                    "uma-m-omat",
+                    "uma-m-odac",
+                }
+                role_calculators = {}
+                for role in (
+                    "optimization_calculator",
+                    "vibration_calculator",
+                    "dipole_calculator",
+                ):
+                    name = ir_run_params.pop(role, None)
+                    if name is None:
+                        continue
+                    if isinstance(name, str):
+                        if name.lower() not in supported_names:
+                            logging.error(
+                                f"Unknown calculator '{name}' for {role}. "
+                                f"Supported names: {sorted(supported_names)}. "
+                                "To use a calculator outside this list, pass an "
+                                "instantiated calculator via the Python API."
+                            )
+                            comm.Abort(1)
+                        try:
+                            instance = get_calculator(name=name, **calc_params)
+                        except RuntimeError as e:
+                            logging.error(
+                                f"Failed to initialize {role} '{name}': {e}"
+                            )
+                            comm.Abort(1)
+                        # get_calculator silently falls back to MACE when its
+                        # target fails. For per-role IR overrides that's a
+                        # bug-magnet: the user explicitly asked for X, and
+                        # quietly getting MACE gives a confusing error later
+                        # (e.g. "MACE has no dipole"). get_calculator tags
+                        # fallbacks with `_iqc_fallback_from`; check that
+                        # rather than the class name (SumCalculator wrapping
+                        # hides the MACE class).
+                        fallback_from = getattr(instance, "_iqc_fallback_from", None)
+                        if fallback_from is not None:
+                            logging.error(
+                                f"Requested {role}='{name}' but get_calculator "
+                                f"silently fell back to MACE (was: '{fallback_from}'). "
+                                "Check earlier warnings — typical causes: missing "
+                                "executable (e.g. ORCA not on PATH and "
+                                "ASE_ORCA_COMMAND unset), missing Python "
+                                "package, or initialization failure."
+                            )
+                            comm.Abort(1)
+                        role_calculators[role] = instance
+                    else:
+                        # Already an instantiated calculator object.
+                        role_calculators[role] = name
+
                 explicit_params = {
                     "atoms",
                     "calculator",
+                    "optimization_calculator",
+                    "vibration_calculator",
+                    "dipole_calculator",
                     "optimize",
                     "unique_name",
                     "trajectory",
                     "save_geometry",
                 }
                 ir_params_filtered = {
-                    k: v for k, v in ir_params.items() if k not in explicit_params
+                    k: v for k, v in ir_run_params.items() if k not in explicit_params
                 }
                 atoms, task_results = run_ir(
                     atoms=atoms,
@@ -588,6 +706,7 @@ def main():
                     save_geometry=save_geometry,
                     multiplicity=ase_multiplicity,
                     charge=ase_charge,
+                    **role_calculators,
                     **ir_params_filtered,
                 )
             elif task == "thermo":
@@ -598,14 +717,16 @@ def main():
                 ignore_imag = (
                     args.ignore_imag
                 )  # or thermo_params.get('ignore_imag_modes', args.ignore_imag)
-                if args.direct_db:
-                    thermo_params["vib_dir"] = central_tmp_dir
-                elif dir_name:
-                    thermo_params["vib_dir"] = dir_name
+                thermo_run_params = dict(thermo_params)
+                output_dir = get_work_dir()
+                thermo_run_params["vib_dir"] = output_dir
                 trajectory_file = None
                 save_geometry = False
                 if args.save:
-                    trajectory_file = f"{unique_name}_thermo_trajectory.traj"
+                    trajectory_file = os.path.join(
+                        output_dir, f"{unique_name}_thermo_trajectory.traj"
+                    )
+                    thermo_run_params["output_dir"] = output_dir
                     save_geometry = True
                 # Filter out explicit parameters to avoid conflicts
                 explicit_params = {
@@ -617,7 +738,9 @@ def main():
                     "save_geometry",
                 }
                 thermo_params_filtered = {
-                    k: v for k, v in thermo_params.items() if k not in explicit_params
+                    k: v
+                    for k, v in thermo_run_params.items()
+                    if k not in explicit_params
                 }
                 atoms, task_results = run_thermo(
                     atoms=atoms,
@@ -633,11 +756,9 @@ def main():
             elif task == "nmr":
                 nmr_run_params = {**nmr_params, **get_nmr_cli_overrides(args)}
                 if not nmr_run_params.get("output_dir"):
-                    base_output_dir = central_tmp_dir if args.direct_db else dir_name
-                    if base_output_dir:
-                        nmr_run_params["output_dir"] = os.path.join(
-                            base_output_dir, f"{unique_name}_nmr"
-                        )
+                    nmr_run_params["output_dir"] = os.path.join(
+                        get_work_dir(), f"{unique_name}_nmr"
+                    )
                 atoms, task_results = run_nmr_workflow(
                     atoms=atoms,
                     unique_name=unique_name,
@@ -657,8 +778,8 @@ def main():
         if args.direct_db and db_path and rank == 0:
             insert_entry(json.dumps(results), db_path)
         elif not args.direct_db:
-            output_file = f"{unique_name}_{task}_{time_stamp}_{rank}.json"
-            output_file = os.path.join(dir_name, output_file)
+            output_file = f"{unique_name}_{task}_{record_stamp}_{rank}.json"
+            output_file = os.path.join(get_rank_output_dir(), output_file)
             save_results(results, output_file)
 
     # Wait for all processes to finish before combining files
@@ -668,18 +789,22 @@ def main():
     logging.debug(f"Took { time.time() - barrier_start:.2f} seconds")
 
     if not args.direct_db:
+        rank_output_dirs = comm.gather(dir_name, root=0)
 
         # Define jsonl_file for all ranks
-        jsonl_file = f"iqc_{task}_results_{time_stamp}.jsonl"
+        jsonl_file = f"iqc_{task}_results_{run_id}.jsonl"
 
         if rank == 0:
             combine_start = time.time()
             logging.debug(f"Starting to combine JSON files")
 
             # Combine all JSON files into a single JSONL file
-            json_files = glob.glob(
-                os.path.join("tmp*", f"*_{task}_*.json"), recursive=True
-            )
+            json_files = []
+            for output_dir in rank_output_dirs:
+                if output_dir:
+                    json_files.extend(
+                        glob.glob(os.path.join(output_dir, f"*_{task}_*.json"))
+                    )
             logging.debug(f"Found {len(json_files)} JSON files to combine.")
             with open(jsonl_file, "w") as outfile:
                 for json_file in json_files:
@@ -727,7 +852,13 @@ def main():
         return 0
 
     else:
-        logging.info("Results were saved directly to the database. No files created.")
+        logging.info("Results were saved directly to the database.")
+        if work_dir_used:
+            logging.info(
+                f"Required scratch/output files were written under: {direct_work_dir}"
+            )
+        else:
+            logging.info("No IQC result files or folders were created.")
         return 0
 
 

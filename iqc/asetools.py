@@ -226,6 +226,77 @@ def _patch_e3nn_mace_compatibility():
     return codegen_patched or spherical_harmonics_patched or activation_patched
 
 
+def _patch_ase_orca_dipole():
+    """Make `ase.io.orca.read_orca_output` emit a dipole for ORCA 6 outputs.
+
+    ORCA 6 dropped the "The origin for moment calculation is the CENTER OF
+    MASS = (...)" line that ASE's parser scrapes. Without it, the parser
+    reads the dipole successfully but discards it because its
+    `if com is not None and dipole is not None` guard fails. The dipole as
+    printed by ORCA 6 is in the COM frame; for neutral molecules and for
+    finite-difference IR intensities (which only see derivatives) the COM
+    correction term is zero, so we can safely emit the dipole as-is when the
+    COM line is missing.
+    """
+
+    try:
+        from ase.io import orca as _orca_io
+        from ase.utils import reader as _ase_reader
+    except ImportError:
+        return False
+    if getattr(_orca_io, "_iqc_dipole_patched", False):
+        return False
+
+    _original_read_orca_output = getattr(
+        _orca_io, "_iqc_original_read_orca_output", _orca_io.read_orca_output
+    )
+    _orca_io._iqc_original_read_orca_output = _original_read_orca_output
+
+    def _read_orca_dipole_with_com_fallback(lines):
+        dipole = _orca_io.read_dipole(lines)
+        if dipole is None:
+            return None
+        com = _orca_io.read_center_of_mass(lines)
+        charge = _orca_io.read_charge(lines)
+        if com is None:
+            # ORCA 6: dipole is already in COM frame; for neutral systems
+            # the lab-frame value is identical, and IR derivatives are
+            # frame-independent regardless of charge.
+            return dipole
+        return dipole + com * (charge if charge is not None else 0)
+
+    def _attach_dipole(parsed, dipole):
+        if dipole is None:
+            return parsed
+        images = parsed if isinstance(parsed, list) else [parsed]
+        for image in images:
+            calc = getattr(image, "calc", None)
+            calc_results = getattr(calc, "results", None)
+            if isinstance(calc_results, dict) and calc_results.get("dipole") is None:
+                calc_results["dipole"] = dipole
+        return parsed
+
+    @_ase_reader
+    def _read_orca_output_with_dipole_fallback(fd, index=slice(None)):
+        # Let the original parser run first via its own path (so engrad and
+        # other branches stay unchanged), then patch the dipole in if it was
+        # dropped because ORCA 6 omitted the COM line.
+        try:
+            fd.seek(0)
+            lines = fd.readlines()
+        except Exception:
+            lines = None
+        fd.seek(0)
+        parsed = _original_read_orca_output(fd, index=index)
+        if lines is None:
+            return parsed
+        return _attach_dipole(parsed, _read_orca_dipole_with_com_fallback(lines))
+
+    _orca_io.read_orca_output = _read_orca_output_with_dipole_fallback
+    _orca_io._iqc_dipole_patched = True
+    return True
+
+
 UMA_DEFAULT_MODEL_BY_SIZE = {
     "s": "uma-s-1p1",
     "m": "uma-m-1p1",
@@ -280,7 +351,6 @@ def _get_uma_calculator(name, **kwargs):
     predictor = pretrained_mlip.get_predict_unit(predictor_name, **predictor_kwargs)
     calculator = FAIRChemCalculator(predictor, task_name=task, **uma_kwargs)
     calculator.model_name = predictor_name
-    calculator.task_name = task
     logging.info(
         "Using UMA calculator with model=%s, task=%s, predictor_args=%s, calculator_args=%s",
         predictor_name,
@@ -379,6 +449,50 @@ def get_calculator(name="mace", **kwargs):
         except Exception as e:
             logging.warning(f"UMA initialization failed: {e}. Falling back to MACE.")
 
+    elif name == "orca":
+        import shutil
+
+        try:
+            # ORCA 6 dropped the COM line ASE keys off of when extracting
+            # dipoles; without this patch IR intensities silently come back
+            # zero/missing.
+            _patch_ase_orca_dipole()
+            from ase.calculators.orca import ORCA, OrcaProfile
+
+            orca_kwargs = dict(kwargs)
+            # Resolve ORCA executable: explicit `command:` kwarg →
+            # ASE_ORCA_COMMAND env → first `orca` on PATH. ASE's config file
+            # is only consulted if all three of those miss.
+            command = (
+                orca_kwargs.pop("command", None)
+                or os.environ.get("ASE_ORCA_COMMAND")
+                or shutil.which("orca")
+            )
+            profile = orca_kwargs.pop("profile", None)
+            if profile is None and command:
+                profile = OrcaProfile(command=command)
+            orca_kwargs.setdefault("orcasimpleinput", "B3LYP def2-SVP")
+            orca_kwargs.setdefault("orcablocks", "%pal nprocs 1 end")
+            if profile is not None:
+                calculator = ORCA(profile=profile, **orca_kwargs)
+                logging.info(
+                    f"Using ORCA calculator (command={command}) with "
+                    f"arguments: {orca_kwargs}"
+                )
+            else:
+                # ASE will look up the executable in its config file.
+                calculator = ORCA(**orca_kwargs)
+                logging.info(
+                    f"Using ORCA calculator (ASE config) with "
+                    f"arguments: {orca_kwargs}"
+                )
+        except ImportError:
+            logging.warning(
+                "ASE ORCA calculator not available. Falling back to MACE."
+            )
+        except Exception as e:
+            logging.warning(f"ORCA initialization failed: {e}. Falling back to MACE.")
+
     else:
         logging.warning(f"Unknown calculator '{name}'. Falling back to MACE.")
 
@@ -411,6 +525,13 @@ def get_calculator(name="mace", **kwargs):
                 calculator = mace_mp(**mace_kwargs)
                 calculator.model_name = mace_kwargs["model"]
                 logging.info("Using MACE calculator as fallback (without dispersion).")
+            # Tag so callers can detect that they got a fallback rather than
+            # the calculator they asked for. SumCalculator(MACE+D3) hides the
+            # MACE class name from a naive `type()` check.
+            try:
+                calculator._iqc_fallback_from = name
+            except (AttributeError, TypeError):
+                pass
         except ImportError:
             logging.error(
                 "MACE fallback calculator could not be imported. MACE is a required dependency."
@@ -1369,6 +1490,7 @@ def run_optimization(
     max_steps=500,
     trajectory=None,
     save_geometry=False,
+    output_dir=None,
     multiplicity=None,
     charge=0,
 ):
@@ -1383,6 +1505,7 @@ def run_optimization(
         max_steps (int): Maximum number of optimization steps
         trajectory (str): Path to save trajectory file
         save_geometry (bool): Whether to save the final optimized geometry to xyz file
+        output_dir (str, optional): Directory for optimized geometry output.
         multiplicity (int, optional): Spin multiplicity 2S+1. Defaults from
             electron-count parity. Translated per-calculator by `apply_spin_charge`.
         charge (int): Total molecular charge. Defaults to 0.
@@ -1415,6 +1538,13 @@ def run_optimization(
     )
 
     try:
+        if trajectory:
+            trajectory_dir = os.path.dirname(os.path.abspath(trajectory))
+            if trajectory_dir:
+                os.makedirs(trajectory_dir, exist_ok=True)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
         # Ensure atoms positions and cell are float64 before optimization
         # This can help prevent type mismatches within the optimizer
         atoms.positions = atoms.positions.astype(np.float64)
@@ -1463,6 +1593,9 @@ def run_optimization(
         if save_geometry and results["opt_converged"]:
             try:
                 geometry_file = f"{unique_name}_optimized.xyz"
+                if output_dir:
+                    os.makedirs(output_dir, exist_ok=True)
+                    geometry_file = os.path.join(output_dir, geometry_file)
                 write(geometry_file, atoms, format="xyz")
                 results["optimized_geometry_file"] = geometry_file
                 logging.info(f"Optimized geometry saved to {geometry_file}")
@@ -1649,6 +1782,9 @@ def run_vibrations(
 def run_ir(
     atoms,
     calculator=None,
+    optimization_calculator=None,
+    vibration_calculator=None,
+    dipole_calculator=None,
     optimize=True,
     unique_name="",
     vib_dir=None,
@@ -1657,7 +1793,7 @@ def run_ir(
     delta=0.01,
     trajectory=None,
     save_geometry=False,
-    ir_spectrum_start=500,
+    ir_spectrum_start=300,
     ir_spectrum_end=4000,
     sparse_spectrum=False,
     intensity_threshold=0.0,
@@ -1668,9 +1804,22 @@ def run_ir(
     """
     Run infrared spectrum calculations for an ASE Atoms object.
 
+    Three independent calculators may be supplied: one for geometry
+    optimization, one for the vibrational forces (Hessian / normal modes),
+    and one for the dipole moments (IR intensities). Each falls back to
+    `calculator` if not provided. A typical mixed workflow is MACE for
+    optimization+vibrations and an electronic-structure backend for dipoles.
+
     Args:
         atoms (ase.Atoms): ASE Atoms object
-        calculator (ase.calculators.calculator.Calculator, optional): Calculator instance.
+        calculator: Default calculator used as a fallback for any of the
+            three roles below if they are not specified.
+        optimization_calculator: Calculator used for the optional geometry
+            optimization step.
+        vibration_calculator: Calculator used to compute forces at each
+            finite-difference displacement (Hessian / frequencies).
+        dipole_calculator: Calculator used to compute the dipole moment at
+            each displacement (IR intensities).
         optimize (bool): Whether to optimize geometry before IR calculation.
         unique_name (str): Unique name for the molecule
         vib_dir (str, optional): Directory to store IR files. Defaults to None.
@@ -1696,29 +1845,80 @@ def run_ir(
         "spectrum_intensities_units": "D/A^2 amu^-1",
     }
 
+    opt_calc = optimization_calculator or calculator
+    vib_calc = vibration_calculator or calculator
+    dip_calc = dipole_calculator or calculator
+
     try:
-        if calculator is None:
+        if opt_calc is None and vib_calc is None and dip_calc is None:
             if atoms.calc is None:
-                calc, calc_results = _prepare_calculation(
-                    atoms, calculator, unique_name, multiplicity=multiplicity, charge=charge
+                fallback, calc_results = _prepare_calculation(
+                    atoms,
+                    None,
+                    unique_name,
+                    multiplicity=multiplicity,
+                    charge=charge,
                 )
                 results.update(calc_results)
             else:
-                calc = atoms.calc
+                fallback = atoms.calc
+            opt_calc = vib_calc = dip_calc = fallback
         else:
-            calc = calculator
+            for role_calc in (opt_calc, vib_calc, dip_calc):
+                if role_calc is not None:
+                    apply_spin_charge(
+                        atoms,
+                        role_calc,
+                        multiplicity=multiplicity,
+                        charge=charge,
+                    )
     except Exception as e:
         error = f"Error in calculator preparation: {e}"
         results["error"] += error
         logging.error(error)
         return None, results
 
-    logging.debug(f"Starting IR calculations for {unique_name} with {str(calc)}")
+    results["calculator_optimization"] = str(opt_calc) if opt_calc else ""
+    results["calculator_vibration"] = str(vib_calc) if vib_calc else ""
+    results["calculator_dipole"] = str(dip_calc) if dip_calc else ""
+
+    # Fail fast if the dipole calculator does not actually expose dipoles.
+    # Every ASE Calculator subclass has the `get_dipole_moment` *method*, but
+    # it raises PropertyNotImplementedError unless 'dipole' is in
+    # `implemented_properties`. Without this check, ASE only complains after
+    # optimization and the first displacement, with a cryptic
+    # "dipole property not implemented".
+    if dip_calc is not None:
+        dip_props = getattr(dip_calc, "implemented_properties", None)
+        if dip_props is not None and "dipole" not in dip_props:
+            error = (
+                f"Dipole calculator {type(dip_calc).__name__} does not "
+                "implement the 'dipole' property; IR intensities cannot be "
+                "computed. MACE and EMT do not support dipoles. Use a "
+                "calculator that does (e.g. xtb), or pass an instance via the "
+                "Python API.\n"
+            )
+            results["error"] += error
+            logging.error(error)
+            return None, results
+
+    logging.debug(
+        f"Starting IR calculations for {unique_name}: "
+        f"opt={opt_calc}, vib={vib_calc}, dip={dip_calc}"
+    )
 
     if optimize:
+        if opt_calc is None:
+            error = (
+                "Optimization requested but no optimization_calculator or "
+                "calculator was provided.\n"
+            )
+            results["error"] += error
+            logging.error(error)
+            return None, results
         atoms, opt_results = run_optimization(
             atoms,
-            calculator=calc,
+            calculator=opt_calc,
             unique_name=unique_name,
             fmax=fmax,
             trajectory=trajectory,
@@ -1735,6 +1935,16 @@ def run_ir(
     else:
         logging.warning("No optimization requested, using given geometry for IR.")
 
+    if vib_calc is None or dip_calc is None:
+        error = (
+            "IR requires both a vibration calculator (for forces) and a "
+            "dipole calculator. Provide vibration_calculator/dipole_calculator "
+            "or a fallback calculator.\n"
+        )
+        results["error"] += error
+        logging.error(error)
+        return None, results
+
     try:
         from ase.vibrations import Infrared
     except ImportError as e:
@@ -1743,6 +1953,20 @@ def run_ir(
         logging.error(error)
         return None, results
 
+    class _DualCalcInfrared(Infrared):
+        """Infrared with separate calculators for forces and dipole moments."""
+
+        def __init__(self, atoms, vib_calc, dip_calc, **kwargs):
+            super().__init__(atoms, **kwargs)
+            self._vib_calc = vib_calc
+            self._dip_calc = dip_calc
+
+        def calculate(self, atoms, disp):
+            results = {"forces": self._vib_calc.get_forces(atoms)}
+            if self.ir:
+                results["dipole"] = self._dip_calc.get_dipole_moment(atoms)
+            return results
+
     try:
         start_time = time.time()
         ir_name = f"tmp_ir_{unique_name}"
@@ -1750,7 +1974,13 @@ def run_ir(
             os.makedirs(vib_dir, exist_ok=True)
             ir_name = os.path.join(vib_dir, ir_name)
 
-        ir = Infrared(atoms, name=ir_name, indices=indices, delta=delta)
+        # Attach the vibration calculator so atoms.calc is non-None for any
+        # ASE internals that inspect it; calculate() uses both calculators
+        # explicitly via the override above.
+        atoms.calc = vib_calc
+        ir = _DualCalcInfrared(
+            atoms, vib_calc, dip_calc, name=ir_name, indices=indices, delta=delta
+        )
         ir.clean()
         ir.run()
 
