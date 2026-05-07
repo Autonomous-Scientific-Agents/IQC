@@ -72,6 +72,17 @@ python -m pip install --no-deps mace-torch
 python -m pip install -e .
 ```
 
+On shared HPC systems, limit BLAS/OpenMP threads before importing NumPy,
+PyTorch, MACE, or FAIRChem. Otherwise OpenBLAS may try to create one thread
+per visible CPU and fail with `pthread_create failed`:
+
+```bash
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+```
+
 See [docs/calculators.md](docs/calculators.md) for calculator names, UMA model
 mapping, and Hugging Face setup.
 
@@ -102,6 +113,23 @@ shmem: mmap: an error occurred while determining whether or not /tmp/ompi.yv.100
 ```
 
 Try: `export OMPI_MCA_btl_sm_backing_directory=/tmp`
+
+### MACE checkpoint loading with PyTorch 2.6+
+
+PyTorch 2.6 changed `torch.load` to default to `weights_only=True`. Older MACE
+foundation checkpoints serialize MACE/e3nn/PyTorch model classes, so direct
+`mace_mp()` calls may fail with an error like:
+
+```text
+_pickle.UnpicklingError: Weights only load failed
+Unsupported global: GLOBAL mace.modules.models.ScaleShiftMACE
+```
+
+IQC's `get_calculator(name="mace")` applies a compatibility patch that
+allowlists the trusted MACE foundation checkpoint classes with
+`torch.serialization.add_safe_globals(...)`. If you load MACE checkpoints
+outside IQC, use the same safe-global approach for trusted checkpoint sources
+or install a MACE/PyTorch combination that handles PyTorch 2.6 safe loading.
 
 ## Available Tasks
 

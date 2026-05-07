@@ -220,10 +220,65 @@ def _patch_e3nn_activation_legacy_state(activation_cls=None):
 def _patch_e3nn_mace_compatibility():
     """Apply e3nn compatibility patches needed by MACE foundation checkpoints."""
 
+    mace_safe_globals_patched = False
+    try:
+        import importlib
+        import inspect
+        import torch
+
+        safe_globals = []
+        for module_name in (
+            "e3nn.math",
+            "e3nn.nn",
+            "e3nn.nn._activation",
+            "e3nn.nn._batchnorm",
+            "e3nn.nn._fc",
+            "e3nn.nn._gate",
+            "e3nn.nn._normact",
+            "e3nn.o3",
+            "e3nn.o3._irreps",
+            "e3nn.o3._linear",
+            "e3nn.o3._spherical_harmonics",
+            "e3nn.o3._tensor_product._sub",
+            "e3nn.o3._tensor_product._tensor_product",
+            "mace.modules.blocks",
+            "mace.modules.models",
+            "mace.modules.radial",
+            "mace.modules.symmetric_contraction",
+            "mace.modules.utils",
+            "torch.nn",
+            "torch.nn.functional",
+            "torch.nn.modules.activation",
+            "torch.nn.modules.container",
+            "torch.nn.modules.linear",
+            "torch.nn.modules.normalization",
+            "torch.fx._symbolic_trace",
+            "torch.fx.graph_module",
+        ):
+            module = importlib.import_module(module_name)
+            safe_globals.extend(
+                obj
+                for obj in vars(module).values()
+                if (inspect.isclass(obj) or inspect.isfunction(obj))
+                and getattr(obj, "__module__", "").startswith(
+                    ("e3nn.", "mace.modules.", "torch.nn.", "torch.fx.")
+                )
+            )
+        if safe_globals:
+            torch.serialization.add_safe_globals(safe_globals)
+            mace_safe_globals_patched = True
+    except Exception:
+        pass
+
     codegen_patched = _patch_e3nn_codegen_legacy_state()
     spherical_harmonics_patched = _patch_e3nn_spherical_harmonics_legacy_state()
     activation_patched = _patch_e3nn_activation_legacy_state()
-    return codegen_patched or spherical_harmonics_patched or activation_patched
+    return (
+        mace_safe_globals_patched
+        or codegen_patched
+        or spherical_harmonics_patched
+        or activation_patched
+    )
 
 
 def _patch_ase_orca_dipole():
