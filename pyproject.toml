@@ -63,6 +63,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 include = ["iqc*"]
+exclude = ["iqc.tests*"]
 namespaces = false
 
 [tool.pytest.ini_options]
