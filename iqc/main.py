@@ -318,7 +318,11 @@ def main():
         calculator_name = args.backend or nmr_params.get("backend", "orca")
     else:
         # Determine calculator name: CLI > Param file > Default ('mace')
-        calculator_name = args.calculator or params.get("calculator", "mace")
+        calculator_name = (
+            args.calculator
+            if args.calculator is not None
+            else params.get("calculator", "mace")
+        )
 
         # Initialize the calculator
         try:

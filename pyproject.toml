@@ -32,6 +32,7 @@ dependencies = [
 [project.optional-dependencies]
 mlip = [
     "fairchem-core>=2.0; python_version >= '3.11'",
+    "pydantic>=2.12,<3",
     "torch-dftd",
     "torch-ema",
     "prettytable",

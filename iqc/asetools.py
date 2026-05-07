@@ -441,10 +441,12 @@ def get_calculator(name="mace", **kwargs):
     elif name.startswith("uma"):
         try:
             calculator = _get_uma_calculator(name, **kwargs)
-        except ImportError:
+        except ImportError as e:
             logging.warning(
-                "FAIRChem UMA calculator not available. Install fairchem-core and "
-                "follow the MACE/UMA install workaround. Falling back to MACE."
+                "FAIRChem UMA calculator import failed: %s. Install fairchem-core "
+                "with compatible dependencies and follow the MACE/UMA install "
+                "workaround. Falling back to MACE.",
+                e,
             )
         except Exception as e:
             logging.warning(f"UMA initialization failed: {e}. Falling back to MACE.")

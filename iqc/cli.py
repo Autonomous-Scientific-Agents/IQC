@@ -152,8 +152,8 @@ def get_args(argv=None):
             "uma-m-omat",
             "uma-m-odac",
         ],
-        default="mace",
-        help="ASE calculator to use (default: mace)",
+        default=None,
+        help="ASE calculator to use. If omitted, uses --params calculator or mace.",
     )
     parser.add_argument(
         "-p",

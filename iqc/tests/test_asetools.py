@@ -570,9 +570,11 @@ def test_mace_uma_dependency_workaround_is_declared():
     assert '"mace-torch"' not in pyproject
     assert '"e3nn>=0.5"' in pyproject
     assert "fairchem-core>=2.0" in pyproject
+    assert '"pydantic>=2.12,<3"' in pyproject
     assert "torch-dftd" in pyproject
 
     assert "- e3nn>=0.5" in env_yml
+    assert "- pydantic>=2.12,<3" in env_yml
     assert "- fairchem-core" in env_yml
     assert "--no-deps mace-torch" in env_yml
 
