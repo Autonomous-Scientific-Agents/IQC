@@ -144,9 +144,98 @@ iqc --xyz molecule.xyz --calculator mace --task opt
 iqc --xyz molecule.xyz --calculator uma-s-omol --task single
 ```
 
-Supported names are `mace`, `xtb`, `emt`, `uma`, `uma-s-omol`, `uma-s-omat`,
-`uma-s-odac`, `uma-m-omol`, `uma-m-omat`, and `uma-m-odac`. `uma` is an alias
-for `uma-s-omol`.
+Supported names are `mace`, `xtb`, `emt`, `orca`, `uma`, `uma-s-omol`,
+`uma-s-omat`, `uma-s-odac`, `uma-m-omol`, `uma-m-omat`, and `uma-m-odac`.
+`uma` is an alias for `uma-s-omol`. `orca` requires the ORCA executable on
+PATH (or set `ASE_ORCA_COMMAND`, or pass `command:` under `calculator_params`
+in `--params`).
+
+## IR Workflow
+
+The `ir` task computes vibrational frequencies and infrared intensities by
+finite-difference displacement. The workflow has three independent steps —
+geometry optimization, force evaluation at each displacement (Hessian), and
+dipole-moment evaluation at each displacement (intensities) — and each step
+can use a *different* calculator. This is useful when a fast MLIP is good
+enough for forces but you want a more accurate electronic-structure method
+for dipoles.
+
+**Dipole support matters.** The dipole calculator must declare `'dipole'` in
+its `implemented_properties`. Of the built-in `--calculator` options, `xtb`
+and `orca` do. MACE, EMT, and the UMA models do not, so they cannot be used
+as the dipole calculator and cannot drive a single-calculator IR run.
+
+### Single calculator
+
+Use `--calculator` to apply one calculator to all three steps. Pick a
+calculator that supports dipoles:
+
+```bash
+iqc --task ir --xyz molecule.xyz --calculator xtb
+```
+
+`--calculator mace` (or `emt`, or any UMA model) will fail at the IR analysis
+step with a clear error explaining that the calculator does not implement the
+`'dipole'` property.
+
+### Mixed calculators (per-role override)
+
+Per-role calculators are configured through the YAML param file passed with
+`--params`. Any role left unset falls back to `--calculator`. Calculator names
+use the same vocabulary as `--calculator` (`mace`, `xtb`, `emt`, `orca`,
+`uma`, `uma-s-*`, `uma-m-*`); unknown names are rejected up-front instead of
+silently falling back.
+
+A practical mixed workflow uses a fast MLIP for the expensive Hessian and a
+DFT calculator for accurate dipoles. ORCA-specific options
+(`orcasimpleinput`, `orcablocks`, `command`) go under `calculator_params`,
+which is shared by every role that uses ORCA:
+
+```yaml
+# ir_params.yaml
+calculator: mace            # fallback for any role not overridden below
+calculator_params:
+  orcasimpleinput: B3LYP def2-SVP
+  orcablocks: "%pal nprocs 4 end"
+  command: /path/to/orca    # optional; honors $ASE_ORCA_COMMAND otherwise
+ir_params:
+  optimization_calculator: mace
+  vibration_calculator: mace
+  dipole_calculator: orca
+```
+
+```bash
+iqc --task ir --xyz molecule.xyz --params ir_params.yaml
+```
+
+The result dictionary records which calculator was used for each role under
+`calculator_optimization`, `calculator_vibration`, and `calculator_dipole`.
+
+### Python API
+
+The Python API additionally accepts pre-built calculator instances, which is
+useful when you want different ORCA settings per role (different basis for
+optimization vs. dipoles), or when wiring in a calculator IQC's CLI does not
+register:
+
+```python
+from ase.calculators.orca import ORCA, OrcaProfile
+from iqc.asetools import get_atoms_from_xyz, get_calculator, run_ir
+
+atoms = get_atoms_from_xyz("molecule.xyz")
+mace = get_calculator(name="mace")
+orca = ORCA(
+    profile=OrcaProfile(command="/path/to/orca"),
+    orcasimpleinput="B3LYP def2-SVP",
+)
+
+atoms, results = run_ir(
+    atoms,
+    optimization_calculator=mace,
+    vibration_calculator=mace,
+    dipole_calculator=orca,
+)
+```
 
 ## Tabular Data Input
 
