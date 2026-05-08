@@ -353,7 +353,7 @@ def _patch_ase_orca_dipole():
 
 
 UMA_DEFAULT_MODEL_BY_SIZE = {
-    "s": "uma-s-1p1",
+    "s": "uma-s-1p2",
     "m": "uma-m-1p1",
 }
 UMA_TASKS = {"omol", "omat", "odac"}
