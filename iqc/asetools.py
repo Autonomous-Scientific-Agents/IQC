@@ -353,6 +353,31 @@ def _patch_ase_orca_dipole():
     return True
 
 
+def _is_orca_calculator(calculator):
+    return calculator is not None and type(calculator).__name__ == "ORCA"
+
+
+def _ensure_orca_engrad_for_forces(calculator):
+    """Request ORCA gradient output when ASE will need forces."""
+
+    if not _is_orca_calculator(calculator):
+        return False
+
+    parameters = getattr(calculator, "parameters", None)
+    if parameters is None:
+        return False
+
+    simpleinput = str(
+        parameters.get("orcasimpleinput") or "B3LYP def2-TZVP"
+    ).strip()
+    if re.search(r"(?i)(^|\s)engrad($|\s)", simpleinput):
+        return False
+
+    parameters["orcasimpleinput"] = f"{simpleinput} ENGRAD".strip()
+    logging.info("Added ENGRAD to ORCA simple input for ASE force evaluation.")
+    return True
+
+
 UMA_DEFAULT_MODEL_BY_SIZE = {
     "s": "uma-s-1p2",
     "m": "uma-m-1p1",
@@ -1362,6 +1387,11 @@ def apply_spin_charge(atoms, calculator, multiplicity=None, charge=0):
     elif calc_class == "FAIRChemCalculator":
         atoms.info["charge"] = charge
         atoms.info["spin"] = multiplicity
+    elif calc_class == "ORCA":
+        parameters = getattr(calculator, "parameters", None)
+        if parameters is not None:
+            parameters["charge"] = charge
+            parameters["mult"] = multiplicity
     elif calc_class in {"MACECalculator", "EMT"}:
         default_mult = 2 if get_total_electrons(atoms) % 2 else 1
         if charge != 0 or multiplicity != default_mult:
@@ -1594,6 +1624,7 @@ def run_optimization(
     Returns:
         tuple: A tuple containing the optimized atoms and a dictionary with calculated properties
     """
+    _ensure_orca_engrad_for_forces(calculator or atoms.calc)
     calc, results = _prepare_calculation(
         atoms, calculator, unique_name, multiplicity=multiplicity, charge=charge
     )
@@ -1757,6 +1788,7 @@ def run_vibrations(
         logging.error(error)
         return None, results
 
+    _ensure_orca_engrad_for_forces(calc)
     logging.debug(
         f"Starting vibrational calculations for {unique_name} with {str(calc)}"
     )
@@ -1968,6 +2000,10 @@ def run_ir(
         results["error"] += error
         logging.error(error)
         return None, results
+
+    if optimize:
+        _ensure_orca_engrad_for_forces(opt_calc)
+    _ensure_orca_engrad_for_forces(vib_calc)
 
     results["calculator_optimization"] = str(opt_calc) if opt_calc else ""
     results["calculator_vibration"] = str(vib_calc) if vib_calc else ""

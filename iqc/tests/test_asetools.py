@@ -3,7 +3,7 @@ from pathlib import Path
 import types
 import numpy as np
 from ase import Atoms
-from ase.calculators.calculator import Calculator, all_changes
+from ase.calculators.calculator import Calculator, PropertyNotPresent, all_changes
 from ase.calculators.emt import EMT
 from ase.calculators.mixing import SumCalculator
 import pytest
@@ -33,6 +33,7 @@ from iqc.asetools import (
     is_linear_by_inertia,
     get_symmetry_info,
     run_ir,
+    run_optimization,
     run_single_point,
     run_vibrations,
     run_thermo,
@@ -181,6 +182,21 @@ def test_apply_spin_charge_fairchem_convention():
     assert atoms.info["spin"] == 3  # triplet multiplicity
 
 
+def test_apply_spin_charge_orca_convention():
+    """ORCA reads molecular charge/multiplicity from calculator parameters."""
+
+    class ORCA:
+        def __init__(self):
+            self.parameters = {}
+
+    calc = ORCA()
+    atoms = Atoms("OH", positions=[[0, 0, 0], [0, 0, 1]])
+    apply_spin_charge(atoms, calc, multiplicity=2, charge=-1)
+
+    assert calc.parameters["charge"] == -1
+    assert calc.parameters["mult"] == 2
+
+
 def test_run_single_point_keeps_energy_when_forces_missing(water_atoms):
     """Energy-only single-point work should not fail when forces are absent."""
 
@@ -204,6 +220,41 @@ def test_run_single_point_keeps_energy_when_forces_missing(water_atoms):
     assert results["energy_eV"] == pytest.approx(-1.23)
     assert results["forces"] == []
     assert any("Forces were not available" in item for item in results["warnings"])
+
+
+def test_run_optimization_adds_engrad_for_orca_forces(water_atoms):
+    """ASE ORCA optimization needs ENGRAD so forces can be parsed."""
+
+    class ORCA(Calculator):
+        implemented_properties = ["energy", "forces"]
+
+        def __init__(self):
+            super().__init__()
+            self.parameters["orcasimpleinput"] = "HF def2-SVP"
+
+        def calculate(
+            self, atoms=None, properties=("energy",), system_changes=all_changes
+        ):
+            super().calculate(atoms, properties, system_changes)
+            self.results["energy"] = -1.23
+            if "forces" in properties:
+                simpleinput = self.parameters["orcasimpleinput"].upper()
+                if "ENGRAD" not in simpleinput:
+                    raise PropertyNotPresent("forces")
+                self.results["forces"] = np.zeros((len(self.atoms), 3))
+
+    calc = ORCA()
+    _, results = run_optimization(
+        atoms=water_atoms.copy(),
+        calculator=calc,
+        unique_name="water",
+        fmax=100.0,
+        max_steps=1,
+    )
+
+    assert "ENGRAD" in calc.parameters["orcasimpleinput"].upper()
+    assert results["error"] == ""
+    assert bool(results["opt_converged"]) is True
 
 
 def test_parse_multiplicity_charge_from_comment():
