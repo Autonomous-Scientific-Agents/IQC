@@ -7,6 +7,7 @@ from datetime import datetime
 import numpy as np
 import ase
 from ase import Atoms, build
+from ase.calculators.calculator import PropertyNotImplementedError, PropertyNotPresent
 from ase.calculators.emt import EMT
 from ase.io import read, write
 from ase.optimize import BFGS
@@ -1519,21 +1520,44 @@ def run_single_point(
         atoms, calculator, unique_name, multiplicity=multiplicity, charge=charge
     )
 
+    start_time = time.time()
+    # Energy is already calculated in _prepare_calculation. Forces are useful
+    # when present, but single-point energy should not fail for energy-only
+    # backends or ORCA inputs without ENGRAD.
+    energy = results["initial_energy_eV"]
+    results["energy_eV"] = energy
+    results["forces"] = []
     try:
-        start_time = time.time()
-        # Energy is already calculated in _prepare_calculation
-        energy = results["initial_energy_eV"]
-        forces = atoms.get_forces()
-        results["calc_time"] = time.time() - start_time
-        results["energy_eV"] = energy
-        results["forces"] = forces.tolist()
-        logging.debug(
-            f"Single point calculation completed in {results['calc_time']} seconds."
+        implemented_properties = getattr(calc, "implemented_properties", None)
+        if implemented_properties is not None and "forces" not in implemented_properties:
+            warning = (
+                f"Forces are not implemented by {calc}; single-point energy was saved."
+            )
+            results["warnings"].append(warning)
+            logging.warning(warning)
+        else:
+            forces = atoms.get_forces()
+            results["forces"] = forces.tolist()
+    except (PropertyNotImplementedError, PropertyNotPresent) as e:
+        warning = (
+            f"Forces were not available for the single-point calculation ({e}); "
+            "single-point energy was saved."
         )
+        if calc.__class__.__name__ == "ORCA":
+            warning += " For ORCA forces, include ENGRAD in orcasimpleinput."
+        results["warnings"].append(warning)
+        logging.warning(warning)
     except Exception as e:
         error = f"Error in single point calculation: {e}\n"
         results["error"] += error
         logging.error(error)
+    finally:
+        results["calc_time"] = time.time() - start_time
+
+    if not results["error"]:
+        logging.debug(
+            f"Single point calculation completed in {results['calc_time']} seconds."
+        )
 
     logging.info(f"Single point calculation for {unique_name} completed")
     return atoms, results

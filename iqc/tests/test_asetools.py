@@ -3,6 +3,7 @@ from pathlib import Path
 import types
 import numpy as np
 from ase import Atoms
+from ase.calculators.calculator import Calculator, all_changes
 from ase.calculators.emt import EMT
 from ase.calculators.mixing import SumCalculator
 import pytest
@@ -32,6 +33,7 @@ from iqc.asetools import (
     is_linear_by_inertia,
     get_symmetry_info,
     run_ir,
+    run_single_point,
     run_vibrations,
     run_thermo,
     _get_uma_calculator,
@@ -177,6 +179,31 @@ def test_apply_spin_charge_fairchem_convention():
     apply_spin_charge(atoms, FakeFAIR(), multiplicity=3, charge=0)
     assert atoms.info["charge"] == 0
     assert atoms.info["spin"] == 3  # triplet multiplicity
+
+
+def test_run_single_point_keeps_energy_when_forces_missing(water_atoms):
+    """Energy-only single-point work should not fail when forces are absent."""
+
+    class MissingForcesCalculator(Calculator):
+        implemented_properties = ["energy", "forces"]
+
+        def calculate(
+            self, atoms=None, properties=("energy",), system_changes=all_changes
+        ):
+            super().calculate(atoms, properties, system_changes)
+            self.results["energy"] = -1.23
+
+    atoms, results = run_single_point(
+        atoms=water_atoms.copy(),
+        calculator=MissingForcesCalculator(),
+        unique_name="water",
+    )
+
+    assert atoms.get_chemical_formula() == "H2O"
+    assert results["error"] == ""
+    assert results["energy_eV"] == pytest.approx(-1.23)
+    assert results["forces"] == []
+    assert any("Forces were not available" in item for item in results["warnings"])
 
 
 def test_parse_multiplicity_charge_from_comment():

@@ -12,6 +12,7 @@ from ase.units import Hartree
 from iqc.cli import get_args
 from iqc.nmr import (
     ConformerCandidate,
+    _write_orca_input,
     build_nmr_settings,
     normalize_nuclei,
     optimize_conformer,
@@ -118,6 +119,47 @@ def test_simulate_nmr_spectrum_peak_position():
 def test_build_nmr_settings_rejects_direct_xtb_backend():
     with pytest.raises(ValueError, match="xTB is not supported as a direct NMR backend"):
         build_nmr_settings(backend="xtb")
+
+
+def test_write_orca_input_moves_eprnmr_after_coordinates(tmp_path):
+    atoms = Atoms(
+        "CH4",
+        positions=[
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [-1.0, 0.0, 0.0],
+        ],
+    )
+    path = tmp_path / "orca.inp"
+
+    _write_orca_input(
+        path,
+        atoms,
+        {
+            "orcasimpleinput": "PBE0 def2-TZVP TightSCF RIJCOSX DEF2/J NMR",
+            "charge": 0,
+            "mult": 1,
+            "orcablocks": "\n".join(
+                [
+                    "%PAL NPROCS 2 END",
+                    "%EPRNMR",
+                    "  Nuclei = all H {shift}",
+                    "END",
+                    "%cpcm",
+                    "  smd true",
+                    "end",
+                ]
+            ),
+        },
+    )
+
+    text = path.read_text(encoding="utf-8")
+    assert text.index("%PAL") < text.index("*xyz 0 1")
+    assert text.index("%cpcm") < text.index("*xyz 0 1")
+    assert text.index("*xyz 0 1") < text.index("%EPRNMR")
+    assert text.index("*\n%EPRNMR") > text.index("H -1.0 0.0 0.0")
 
 
 def test_optimize_conformer_with_xtb(monkeypatch, tmp_path):

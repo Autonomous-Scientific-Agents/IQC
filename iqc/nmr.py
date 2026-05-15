@@ -746,20 +746,21 @@ def _split_orca_blocks(orcablocks: str) -> Tuple[List[str], List[str]]:
 
     for line in lines:
         stripped = line.strip()
+        lower = stripped.lower()
         if stripped.startswith("%"):
             if current:
                 blocks.append("\n".join(current))
                 current = []
             current = [line]
             in_block = True
-            if stripped.endswith("end"):
+            if lower.endswith("end"):
                 blocks.append("\n".join(current))
                 current = []
                 in_block = False
             continue
         if in_block:
             current.append(line)
-            if stripped == "end":
+            if lower == "end":
                 blocks.append("\n".join(current))
                 current = []
                 in_block = False
@@ -772,7 +773,9 @@ def _split_orca_blocks(orcablocks: str) -> Tuple[List[str], List[str]]:
     pre_coords: List[str] = []
     post_coords: List[str] = []
     for block in blocks:
-        if block.lstrip().startswith("%eprnmr"):
+        # ORCA reads %eprnmr after coordinates; before *xyz it can fail with
+        # "nuclear properties are requested but no coordinates have been read".
+        if block.lstrip().lower().startswith("%eprnmr"):
             post_coords.append(block)
         else:
             pre_coords.append(block)
