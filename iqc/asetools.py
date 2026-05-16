@@ -4,6 +4,7 @@ import os
 import re
 import time
 from datetime import datetime
+from pathlib import Path
 import numpy as np
 import ase
 from ase import Atoms, build
@@ -300,6 +301,7 @@ def _patch_ase_orca_dipole():
         from ase.utils import reader as _ase_reader
     except ImportError:
         return False
+
     if getattr(_orca_io, "_iqc_dipole_patched", False):
         return False
 
@@ -376,6 +378,58 @@ def _ensure_orca_engrad_for_forces(calculator):
     parameters["orcasimpleinput"] = f"{simpleinput} ENGRAD".strip()
     logging.info("Added ENGRAD to ORCA simple input for ASE force evaluation.")
     return True
+
+
+def _safe_path_component(value):
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())
+    return safe.strip("._") or "calc"
+
+
+def _assign_orca_work_directory(calculator, unique_name, purpose="calc", base_dir=None):
+    """Give auto-managed ORCA calculators a per-record work directory."""
+
+    if not _is_orca_calculator(calculator):
+        return False
+
+    current = Path(getattr(calculator, "directory", "."))
+    auto_managed = getattr(calculator, "_iqc_auto_directory", False)
+    if not auto_managed and current != Path("."):
+        return False
+
+    root = Path(base_dir) if base_dir else Path(".")
+    directory = root / f"{_safe_path_component(unique_name)}_{purpose}_orca"
+    calculator.directory = directory
+    calculator._iqc_auto_directory = True
+    logging.debug("Using ORCA work directory: %s", directory)
+    return True
+
+
+def _read_file_tail(path, max_lines=40):
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    return "\n".join(lines[-max_lines:])
+
+
+def _orca_failure_context(calculator):
+    if not _is_orca_calculator(calculator):
+        return ""
+
+    directory = Path(getattr(calculator, "directory", "."))
+    template = getattr(calculator, "template", None)
+    names = []
+    for attr, default in (("errorname", "orca.err"), ("outputname", "orca.out")):
+        names.append(getattr(template, attr, default))
+
+    parts = [f"ORCA work directory: {directory}"]
+    for name in names:
+        path = directory / name
+        tail = _read_file_tail(path)
+        if tail:
+            parts.append(f"Tail of {path}:\n{tail}")
+    return "\n" + "\n".join(parts) if len(parts) > 1 else "\n" + parts[0]
 
 
 UMA_DEFAULT_MODEL_BY_SIZE = {
@@ -1474,6 +1528,8 @@ def _prepare_calculation(
 
     calc = calculator
 
+    _assign_orca_work_directory(calc, unique_name)
+
     # Apply spin/charge in the convention expected by this calculator before
     # attaching it; XTB and FAIRChem read these from the atoms object.
     multiplicity = apply_spin_charge(
@@ -1497,7 +1553,11 @@ def _prepare_calculation(
     try:
         initial_energy = atoms.get_potential_energy()
     except Exception as e:
-        logging.error(f"Failed to get initial potential energy with {str(calc)}: {e}")
+        context = _orca_failure_context(calc)
+        message = f"Failed to get initial potential energy with {str(calc)}: {e}{context}"
+        logging.error(message)
+        if context:
+            raise RuntimeError(message) from e
         raise
 
     # Prepare results dictionary
@@ -1788,6 +1848,7 @@ def run_vibrations(
         logging.error(error)
         return None, results
 
+    _assign_orca_work_directory(calc, unique_name, purpose="vib")
     _ensure_orca_engrad_for_forces(calc)
     logging.debug(
         f"Starting vibrational calculations for {unique_name} with {str(calc)}"
@@ -2000,6 +2061,17 @@ def run_ir(
         results["error"] += error
         logging.error(error)
         return None, results
+
+    seen_calculators = set()
+    for role, role_calc in (
+        ("ir_opt", opt_calc),
+        ("ir_vib", vib_calc),
+        ("ir_dipole", dip_calc),
+    ):
+        if role_calc is None or id(role_calc) in seen_calculators:
+            continue
+        seen_calculators.add(id(role_calc))
+        _assign_orca_work_directory(role_calc, unique_name, purpose=role)
 
     if optimize:
         _ensure_orca_engrad_for_forces(opt_calc)

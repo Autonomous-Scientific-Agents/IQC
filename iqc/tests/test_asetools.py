@@ -257,6 +257,36 @@ def test_run_optimization_adds_engrad_for_orca_forces(water_atoms):
     assert bool(results["opt_converged"]) is True
 
 
+def test_auto_orca_work_directory_is_unique_per_record(water_atoms):
+    """Reused ORCA calculators must not share one orca.out across records."""
+
+    class ORCA(Calculator):
+        implemented_properties = ["energy", "forces"]
+
+        def __init__(self):
+            super().__init__()
+            self.parameters["orcasimpleinput"] = "HF def2-SVP"
+            self.directory = Path(".")
+
+        def calculate(
+            self, atoms=None, properties=("energy",), system_changes=all_changes
+        ):
+            super().calculate(atoms, properties, system_changes)
+            self.results["energy"] = -1.23
+            if "forces" in properties:
+                self.results["forces"] = np.zeros((len(self.atoms), 3))
+
+    calc = ORCA()
+    run_single_point(water_atoms.copy(), calculator=calc, unique_name="mol_0_rank_0")
+    first_directory = calc.directory
+
+    run_single_point(water_atoms.copy(), calculator=calc, unique_name="mol_1_rank_0")
+
+    assert first_directory != calc.directory
+    assert Path(first_directory).name == "mol_0_rank_0_calc_orca"
+    assert Path(calc.directory).name == "mol_1_rank_0_calc_orca"
+
+
 def test_parse_multiplicity_charge_from_comment():
     """Comment-line parser handles multiplicity, uhf, and charge tokens."""
     assert parse_multiplicity_charge_from_comment("") == (None, None)
