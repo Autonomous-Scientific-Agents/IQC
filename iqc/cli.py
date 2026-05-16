@@ -4,6 +4,8 @@ import argparse
 import os
 import sys
 
+import argcomplete
+
 
 def add_bool_flag(parser, name, default=None, help_text=""):
     """Add paired --flag / --no-flag boolean options."""
@@ -320,6 +322,7 @@ def get_args(argv=None):
         help="Reference shielding override in the form nucleus=value, e.g. 1H=31.77",
     )
 
+    argcomplete.autocomplete(parser)
     args = parser.parse_args(argv)
     explicit_options = _explicit_option_names(sys.argv[1:] if argv is None else argv)
     args.input_only = bool(args.input) and explicit_options <= {"-i", "--input"}
