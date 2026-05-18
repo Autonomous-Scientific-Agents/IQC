@@ -320,6 +320,30 @@ Results written from tabular inputs include `input_mode`, `data_input_file`, `da
 
 See [docs/data_input.md](docs/data_input.md) for the full tabular input guide.
 
+## Skipping Existing Calculations
+
+Use `--skip-existing` to avoid rerunning calculations that IQC has already
+recorded. IQC checks the same calculation identity used by the SQLite unique
+key: normalized initial geometry, params, calculator, model, and task.
+
+When `--database` is provided, existing rows in that SQLite database are used:
+
+```bash
+iqc --xyz molecules --task single --calculator uma-s-omol \
+  --database results.db --skip-existing
+```
+
+IQC can also index prior IQC JSON/JSONL result files:
+
+```bash
+iqc --xyz molecules --task single --skip-existing \
+  --skip-existing-from iqc_single_results_20260501_120000_abcd1234.jsonl
+```
+
+If `--skip-existing-from` is omitted, IQC scans combined
+`iqc_*_results_*.jsonl` files in the current directory and per-rank JSON files
+under `tmp_*` result directories.
+
 ## NMR Workflow
 
 The `nmr` task runs a backend-aware solution-state NMR workflow for small and medium-sized molecules. It can:

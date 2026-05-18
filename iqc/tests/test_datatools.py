@@ -65,6 +65,10 @@ def test_data_input_modes_are_validated_without_mpi():
     sort_order_without_sort_args = get_args(
         ["--input", "data.csv", "--smiles", "smiles", "--sort_order", "down"]
     )
+    direct_db_without_database_args = get_args(["--direct-db", "--smiles", "O"])
+    skip_existing_from_without_skip_args = get_args(
+        ["--skip-existing-from", "old.jsonl", "--smiles", "O"]
+    )
 
     assert validate_input_args(inspect_args) is None
     assert "pass --xyz COLUMN or --smiles COLUMN" in validate_input_args(
@@ -78,6 +82,12 @@ def test_data_input_modes_are_validated_without_mpi():
     )
     assert "--sort_order requires --sort COLUMN" in validate_input_args(
         sort_order_without_sort_args
+    )
+    assert "--direct-db requires --database" in validate_input_args(
+        direct_db_without_database_args
+    )
+    assert "--skip-existing-from requires --skip-existing" in validate_input_args(
+        skip_existing_from_without_skip_args
     )
     assert get_structure_input_mode(xyz_args) == "data_xyz"
     assert get_structure_input_mode(smiles_args) == "data_smiles"

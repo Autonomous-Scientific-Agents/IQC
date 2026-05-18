@@ -188,6 +188,25 @@ def get_args(argv=None):
         action="store_true",
     )
     parser.add_argument(
+        "--skip-existing",
+        help=(
+            "Skip calculations already present in --database or in IQC result "
+            "JSON/JSONL files."
+        ),
+        action="store_true",
+    )
+    parser.add_argument(
+        "--skip-existing-from",
+        nargs="+",
+        default=None,
+        metavar="PATH",
+        help=(
+            "IQC result JSON/JSONL files or directories to scan when "
+            "--skip-existing is enabled. If omitted, IQC scans current "
+            "directory result JSONL files and tmp_* result directories."
+        ),
+    )
+    parser.add_argument(
         "--backend",
         type=str,
         choices=["orca", "nwchem", "gaussian", "xtb"],

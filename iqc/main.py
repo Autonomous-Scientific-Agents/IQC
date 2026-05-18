@@ -14,7 +14,14 @@ import time
 
 from iqc.cli import get_args
 
-from iqc.databasetools import create_database, insert_entry
+from iqc.databasetools import (
+    calculation_exists,
+    calculation_key,
+    calculation_key_from_record,
+    create_database,
+    insert_entries,
+    insert_entry,
+)
 from iqc.datatools import (
     read_smiles_column_records,
     read_xyz_column_records,
@@ -45,6 +52,92 @@ def _unique_child_path(parent, child_name):
         candidate = parent_path / f"{child_name}_{counter}"
         counter += 1
     return os.path.abspath(os.path.expanduser(str(candidate)))
+
+
+def _default_skip_existing_sources(cwd="."):
+    """Return default IQC result files to scan for completed calculations."""
+
+    root = Path(cwd).expanduser()
+    sources = list(root.glob("iqc_*_results_*.jsonl"))
+    for tmp_dir in root.glob("tmp_*"):
+        if tmp_dir.is_dir():
+            sources.extend(tmp_dir.glob("*.json"))
+    return sorted(sources)
+
+
+def _candidate_result_files(source):
+    """Return JSON/JSONL result files under a file or directory source."""
+
+    path = Path(source).expanduser()
+    if not path.exists():
+        return []
+    if path.is_file():
+        return [path] if path.suffix.lower() in {".json", ".jsonl"} else []
+
+    files = []
+    for pattern in ("*.json", "*.jsonl"):
+        files.extend(path.rglob(pattern))
+    return sorted(set(files))
+
+
+def _iter_result_records(result_file):
+    """Yield dict records from an IQC JSON or JSONL result file."""
+
+    suffix = result_file.suffix.lower()
+    try:
+        with open(result_file, "r") as handle:
+            if suffix == ".jsonl":
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        yield None
+                        continue
+                    yield record if isinstance(record, dict) else None
+            else:
+                try:
+                    data = json.load(handle)
+                except json.JSONDecodeError:
+                    yield None
+                    return
+                if isinstance(data, dict):
+                    yield data
+                elif isinstance(data, list):
+                    for record in data:
+                        yield record if isinstance(record, dict) else None
+                else:
+                    yield None
+    except OSError:
+        yield None
+
+
+def build_completed_calculation_index(sources):
+    """Build a set of calculation keys from existing IQC result files."""
+
+    index = set()
+    summary = {"sources": len(sources), "files": 0, "records": 0, "invalid": 0}
+    seen_files = set()
+
+    for source in sources:
+        for result_file in _candidate_result_files(source):
+            if result_file in seen_files:
+                continue
+            seen_files.add(result_file)
+            summary["files"] += 1
+            for record in _iter_result_records(result_file):
+                if record is None:
+                    summary["invalid"] += 1
+                    continue
+                try:
+                    index.add(calculation_key_from_record(record))
+                except (TypeError, ValueError):
+                    summary["invalid"] += 1
+                    continue
+                summary["records"] += 1
+
+    return index, summary
 
 
 class ComplexEncoder(json.JSONEncoder):
@@ -122,12 +215,13 @@ def save_results(results, output_file):
 
 def insert_jsonl_to_db(jsonl_file, db_path):
     with open(jsonl_file, "r") as f:
-        for line_num, line in enumerate(f, 1):
-            try:
-                insert_entry(line, db_path)
-                logging.debug(f"Inserted entry #{line_num} into database.")
-            except Exception as e:
-                logging.error(f"Error inserting entry: {e}")
+        summary = insert_entries(f, db_path)
+    logging.info(
+        "Database import complete: %s processed, %s inserted, %s duplicates skipped.",
+        summary["processed"],
+        summary["inserted"],
+        summary["duplicates"],
+    )
 
 
 def get_nmr_cli_overrides(args):
@@ -170,6 +264,10 @@ def validate_input_args(args):
         return "Error: --sort can only be used with --input."
     if args.sort_order_explicit and not args.sort:
         return "Error: --sort_order requires --sort COLUMN."
+    if args.direct_db and not args.database:
+        return "Error: --direct-db requires --database DB_PATH."
+    if args.skip_existing_from and not args.skip_existing:
+        return "Error: --skip-existing-from requires --skip-existing."
     if not args.input or args.input_only:
         return None
     if args.input_xyz_column and args.input_smiles_column:
@@ -224,6 +322,7 @@ def main():
         run_vibrations,
         get_atoms_from_xyz,
         get_atoms_from_smiles,
+        atoms2xyz,
         get_calculator,
         get_ase_version,
     )
@@ -419,9 +518,50 @@ def main():
     if db_path and rank == 0:
         logging.info(f"Checking/Creating database at: {db_path}")
         create_database(db_path)
+    if db_path:
+        comm.Barrier()
+
+    completed_file_index = set()
+    if args.skip_existing:
+        if rank == 0:
+            skip_sources = (
+                [Path(source).expanduser() for source in args.skip_existing_from]
+                if args.skip_existing_from
+                else _default_skip_existing_sources()
+            )
+            completed_file_index, skip_index_summary = build_completed_calculation_index(
+                skip_sources
+            )
+            if db_path or completed_file_index:
+                logging.info(
+                    "Skip-existing enabled: indexed %s completed calculation(s) "
+                    "from %s result record(s) in %s file(s).",
+                    len(completed_file_index),
+                    skip_index_summary["records"],
+                    skip_index_summary["files"],
+                )
+                if db_path:
+                    logging.info(
+                        "Skip-existing will also check database: %s", db_path
+                    )
+            else:
+                logging.info(
+                    "Skip-existing enabled, but no database was provided and no "
+                    "existing IQC result files were found."
+                )
+            if skip_index_summary["invalid"]:
+                logging.warning(
+                    "Ignored %s invalid or non-IQC record(s) while indexing "
+                    "existing result files.",
+                    skip_index_summary["invalid"],
+                )
+        completed_file_index = comm.bcast(
+            completed_file_index if rank == 0 else None, root=0
+        )
 
     dir_name = None
     work_dir_used = False
+    skipped_existing = 0
 
     def get_rank_output_dir():
         """Create this rank's result/scratch directory only when it is needed."""
@@ -489,6 +629,7 @@ def main():
             )
             continue
 
+        model_name = getattr(calculator, "model_name", "") if calculator else ""
         results = {
             "xyz_file": xyz_file,
             "smiles_input": smiles_input or "",
@@ -510,8 +651,41 @@ def main():
             "ase_version": get_ase_version(),
             "task": task,
             "calculator": calculator_name,
+            "model": model_name,
+            "initial_xyz": atoms2xyz(atoms),
             "params": params_str,
         }
+
+        if args.skip_existing:
+            current_key = calculation_key(
+                results["initial_xyz"],
+                results["params"],
+                results["calculator"],
+                results["model"],
+                results["task"],
+            )
+            skip_source = None
+            if current_key in completed_file_index:
+                skip_source = "result files"
+            elif db_path and calculation_exists(
+                db_path,
+                results["initial_xyz"],
+                results["params"],
+                results["calculator"],
+                results["model"],
+                results["task"],
+            ):
+                skip_source = "database"
+
+            if skip_source:
+                skipped_existing += 1
+                logging.info(
+                    "Skipping existing %s calculation for input %s; found in %s.",
+                    task,
+                    xyz_file,
+                    skip_source,
+                )
+                continue
 
         # Resolve multiplicity (2S+1) and charge: CLI > XYZ comment > default.
         ase_multiplicity = (
@@ -556,9 +730,7 @@ def main():
                     "save_geometry",
                 }
                 opt_params_filtered = {
-                    k: v
-                    for k, v in opt_run_params.items()
-                    if k not in explicit_params
+                    k: v for k, v in opt_run_params.items() if k not in explicit_params
                 }
                 atoms, task_results = run_optimization(
                     atoms=atoms,
@@ -594,9 +766,7 @@ def main():
                     "save_geometry",
                 }
                 vib_params_filtered = {
-                    k: v
-                    for k, v in vib_run_params.items()
-                    if k not in explicit_params
+                    k: v for k, v in vib_run_params.items() if k not in explicit_params
                 }
                 atoms, task_results = run_vibrations(
                     atoms=atoms,
@@ -659,9 +829,7 @@ def main():
                         try:
                             instance = get_calculator(name=name, **calc_params)
                         except RuntimeError as e:
-                            logging.error(
-                                f"Failed to initialize {role} '{name}': {e}"
-                            )
+                            logging.error(f"Failed to initialize {role} '{name}': {e}")
                             comm.Abort(1)
                         # get_calculator silently falls back to MACE when its
                         # target fails. For per-role IR overrides that's a
@@ -779,8 +947,8 @@ def main():
             logging.error(f"Task '{task}' failed for {xyz_file}: {e}", exc_info=True)
 
         # Save results
-        if args.direct_db and db_path and rank == 0:
-            insert_entry(json.dumps(results), db_path)
+        if args.direct_db and db_path:
+            insert_entry(json.dumps(results, cls=ComplexEncoder), db_path)
         elif not args.direct_db:
             output_file = f"{unique_name}_{task}_{record_stamp}_{rank}.json"
             output_file = os.path.join(get_rank_output_dir(), output_file)
@@ -791,6 +959,11 @@ def main():
     logging.debug(f"Waiting for all processes to finish before combining files.")
     comm.Barrier()
     logging.debug(f"Took { time.time() - barrier_start:.2f} seconds")
+    total_skipped_existing = comm.reduce(skipped_existing, op=MPI.SUM, root=0)
+    if args.skip_existing and rank == 0:
+        logging.info(
+            "Skipped %s existing calculation(s).", total_skipped_existing
+        )
 
     if not args.direct_db:
         rank_output_dirs = comm.gather(dir_name, root=0)
@@ -856,13 +1029,16 @@ def main():
         return 0
 
     else:
-        logging.info("Results were saved directly to the database.")
-        if work_dir_used:
-            logging.info(
-                f"Required scratch/output files were written under: {direct_work_dir}"
-            )
-        else:
-            logging.info("No IQC result files or folders were created.")
+        any_work_dir_used = comm.allreduce(1 if work_dir_used else 0, op=MPI.MAX)
+        comm.Barrier()
+        if rank == 0:
+            logging.info("Results were saved directly to the database.")
+            if any_work_dir_used:
+                logging.info(
+                    f"Required scratch/output files were written under: {direct_work_dir}"
+                )
+            else:
+                logging.info("No IQC result files or folders were created.")
         return 0
 
 

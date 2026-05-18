@@ -21,3 +21,10 @@ def test_calculator_cli_option_overrides_params_file():
     args = get_args(["--calculator", "uma-s-omol"])
 
     assert args.calculator == "uma-s-omol"
+
+
+def test_skip_existing_options_are_parsed():
+    args = get_args(["--skip-existing", "--skip-existing-from", "old.jsonl"])
+
+    assert args.skip_existing is True
+    assert args.skip_existing_from == ["old.jsonl"]

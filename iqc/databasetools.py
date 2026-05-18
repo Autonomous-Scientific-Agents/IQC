@@ -1,7 +1,96 @@
 import sqlite3
 import json
 import hashlib
+import time
+from pathlib import Path
 import pandas as pd
+
+
+SQLITE_TIMEOUT_SECONDS = 120
+SQLITE_BUSY_TIMEOUT_MS = SQLITE_TIMEOUT_SECONDS * 1000
+
+INSERT_CALCULATION_SQL = """
+    INSERT OR IGNORE INTO calculations (
+        geometry_hash, params_hash, calculator, model, task, blob_data
+    ) VALUES (?, ?, ?, ?, ?, ?)
+"""
+
+
+def _connect(db_path):
+    """Open a SQLite connection tuned for many small calculation inserts."""
+
+    path = Path(db_path).expanduser()
+    if str(path) != ":memory:":
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(str(path), timeout=SQLITE_TIMEOUT_SECONDS)
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+    _execute_with_busy_retry(conn, "PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    return conn
+
+
+def _execute_with_busy_retry(conn, sql, parameters=()):
+    deadline = time.monotonic() + SQLITE_TIMEOUT_SECONDS
+    while True:
+        try:
+            return conn.execute(sql, parameters)
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
+def _ensure_schema(conn):
+    _execute_with_busy_retry(
+        conn,
+        """
+        CREATE TABLE IF NOT EXISTS calculations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            geometry_hash TEXT NOT NULL,
+            params_hash TEXT NOT NULL,
+            calculator TEXT NOT NULL,
+            model TEXT NOT NULL DEFAULT '',
+            task TEXT NOT NULL,
+            blob_data TEXT NOT NULL,
+            UNIQUE(geometry_hash, params_hash, calculator, model, task)
+        )
+        """
+    )
+
+
+def calculation_key(initial_xyz, params, calculator="", model="", task=""):
+    """Return the natural key used to identify an IQC calculation."""
+
+    return (
+        hash_string(initial_xyz),
+        hash_string(params),
+        calculator or "",
+        model or "",
+        task or "",
+    )
+
+
+def calculation_key_from_record(data, debug=False):
+    """Return the calculation key for a result record after validation."""
+
+    is_valid, missing_keys, available_keys = validate_data_structure(data, debug)
+
+    if not is_valid:
+        raise ValueError(
+            f"Missing required keys in input data: {missing_keys}. "
+            f"Available keys: {available_keys}"
+        )
+
+    return calculation_key(
+        data["initial_xyz"],
+        data["params"],
+        data.get("calculator") or "",
+        data.get("model") or "",
+        data.get("task") or "",
+    )
+
 
 def create_database(db_path):
     """
@@ -13,26 +102,15 @@ def create_database(db_path):
         Path to the SQLite database file.
     """
 
-    with sqlite3.connect(db_path) as conn:
-
-        cursor = conn.cursor()
-
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS calculations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                geometry_hash TEXT,
-                params_hash TEXT,
-                calculator TEXT,
-                model TEXT,
-                task TEXT,
-                blob_data TEXT,
-                UNIQUE(geometry_hash, params_hash, calculator, model, task)
-            )
-        """
-        )
-
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
         conn.commit()
+
+
+def _hash_input(value):
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
 def hash_string(string):
@@ -51,8 +129,9 @@ def hash_string(string):
     """
 
     # generate a hash for a string to simplify the unique key
+    value = _hash_input(string)
     string_hash = "\n".join(
-        line.strip() for line in string.strip().splitlines() if line.strip()
+        line.strip() for line in value.strip().splitlines() if line.strip()
     )
 
     return hashlib.sha256(string_hash.encode()).hexdigest()
@@ -74,7 +153,7 @@ def validate_data_structure(data, debug=False):
     tuple
         (is_valid, missing_keys, available_keys)
     """
-    required_keys = ["initial_xyz", "calculator", "model", "task", "params"]
+    required_keys = ["initial_xyz", "calculator", "task", "params"]
     missing_keys = [key for key in required_keys if key not in data]
     available_keys = list(data.keys())
 
@@ -86,6 +165,7 @@ def validate_data_structure(data, debug=False):
             print(f"Data preview: {dict(list(data.items())[:3])}...")
 
     return len(missing_keys) == 0, missing_keys, available_keys
+
 
 def inspect_json_data(json_line, max_length=500):
     """
@@ -144,6 +224,52 @@ def inspect_json_data(json_line, max_length=500):
     except Exception as e:
         return {"error": "Unexpected error", "message": str(e)}
 
+
+def _prepare_calculation_row(json_line, debug=False):
+    data = json.loads(json_line)
+
+    geometry_hash, params_hash, calculator, model, task = calculation_key_from_record(
+        data, debug=debug
+    )
+    blob_data = json.dumps(data, separators=(",", ":"), default=str)
+
+    return (geometry_hash, params_hash, calculator, model, task, blob_data)
+
+
+def calculation_exists(db_path, initial_xyz, params, calculator="", model="", task=""):
+    """Return True if the calculation key already exists in the database."""
+
+    path = Path(db_path).expanduser()
+    if str(path) != ":memory:" and not path.exists():
+        return False
+
+    key = calculation_key(initial_xyz, params, calculator, model, task)
+
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM calculations
+            WHERE geometry_hash = ?
+              AND params_hash = ?
+              AND calculator = ?
+              AND model = ?
+              AND task = ?
+            LIMIT 1
+            """,
+            key,
+        ).fetchone()
+    return row is not None
+
+
+def _insert_rows(conn, rows):
+    before = conn.total_changes
+    conn.executemany(INSERT_CALCULATION_SQL, rows)
+    conn.commit()
+    return conn.total_changes - before
+
+
 def insert_entry(json_line, db_path, debug=False):
     """
     Insert a calculation entry into the database from a JSON string.
@@ -158,45 +284,46 @@ def insert_entry(json_line, db_path, debug=False):
         If True, print debug information during validation and insertion.
     """
 
-    try:
-        data = json.loads(json_line)
+    row = _prepare_calculation_row(json_line, debug=debug)
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        return bool(_insert_rows(conn, [row]))
 
-        is_valid, missing_keys, available_keys = validate_data_structure(data, debug)
 
-        if not is_valid:
-            raise ValueError(
-                f"Missing required keys in input data: {missing_keys}. Available keys: {available_keys}"
-            )
+def insert_entries(json_lines, db_path, debug=False, batch_size=1000):
+    """
+    Insert calculation entries from an iterable of JSON strings.
 
-        geometry_hash = hash_string(data["initial_xyz"])
-        params_hash = hash_string(data["params"])
-        calculator = data.get("calculator") # mace, xtb, emt
-        model = data.get("model") # small, medium, large
-        task = data.get("task") # single, opt, vib, thermo
-        blob_data = json.dumps(data)
+    Returns a summary dictionary with processed, inserted, and duplicate counts.
+    """
 
-        with sqlite3.connect(db_path) as conn:
-            cursor = conn.cursor()
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
 
-            cursor.execute(
-                """
-                INSERT OR IGNORE INTO calculations (
-                    geometry_hash, params_hash, calculator, model, task, blob_data
-                ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-                (geometry_hash, params_hash, calculator, model, task, blob_data),
-            )
+    processed = 0
+    inserted = 0
+    batch = []
 
-            conn.commit()
+    with _connect(db_path) as conn:
+        _ensure_schema(conn)
+        for json_line in json_lines:
+            if not json_line.strip():
+                continue
+            batch.append(_prepare_calculation_row(json_line, debug=debug))
+            processed += 1
+            if len(batch) >= batch_size:
+                inserted += _insert_rows(conn, batch)
+                batch.clear()
 
-    except json.JSONDecodeError as e:
-        print(f"JSON decode error: {e}")
+        if batch:
+            inserted += _insert_rows(conn, batch)
 
-    except sqlite3.DatabaseError as e:
-        print(f"Database error: {e}")
+    return {
+        "processed": processed,
+        "inserted": inserted,
+        "duplicates": processed - inserted,
+    }
 
-    except Exception as e:
-        print(f"Error inserting entry: {e}")
 
 def merge_databases(target_db_path, source_db_path):
     """
@@ -210,28 +337,24 @@ def merge_databases(target_db_path, source_db_path):
         Path to the source SQLite database file.
     """
 
-    try:
-        with sqlite3.connect(target_db_path) as conn:
-            cursor = conn.cursor()
+    create_database(target_db_path)
+    with _connect(target_db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("ATTACH DATABASE ? AS source_db", (str(source_db_path),))
 
-            cursor.execute(f"ATTACH DATABASE '{source_db_path}' AS source_db")
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO calculations (
+                geometry_hash, params_hash, calculator, model, task, blob_data
+            )
+            SELECT geometry_hash, params_hash, calculator, model, task, blob_data
+            FROM source_db.calculations
+            """
+        )
 
-            cursor.execute("""
-                INSERT OR IGNORE INTO calculations (
-                    geometry_hash, params_hash, calculator, model, task, blob_data
-                )
-                SELECT geometry_hash, params_hash, calculator, model, task, blob_data
-                FROM source_db.calculations
-            """)
+        conn.commit()
+        cursor.execute("DETACH DATABASE source_db")
 
-            cursor.execute("DETACH DATABASE source_db")
-            conn.commit()
-
-    except sqlite3.DatabaseError as e:
-        print(f"Database error during merge: {e}")
-
-    except Exception as e:
-        print(f"Unexpected error during merge: {e}")
 
 def database_to_dataframe(db):
     """
@@ -248,11 +371,12 @@ def database_to_dataframe(db):
         DataFrame containing all rows from the 'calculations' table.
     """
 
-    conn = sqlite3.connect(db)
-    db_dataframe = pd.read_sql("SELECT * FROM calculations", conn)
-    conn.close()
+    with _connect(db) as conn:
+        _ensure_schema(conn)
+        db_dataframe = pd.read_sql("SELECT * FROM calculations", conn)
 
     return db_dataframe
+
 
 def database_to_data(db):
     """
@@ -270,10 +394,11 @@ def database_to_data(db):
     """
 
     db_dataframe = database_to_dataframe(db)
-    blob_data_list = [json.loads(data) for data in db_dataframe['blob_data']]
+    blob_data_list = [json.loads(data) for data in db_dataframe["blob_data"]]
     db_data = pd.DataFrame(blob_data_list)
 
     return db_data
+
 
 def get_number_of_molecules(db):
     """
@@ -290,11 +415,10 @@ def get_number_of_molecules(db):
         Number of unique molecules in the database.
     """
 
-    db_dataframe = database_to_dataframe(db)
+    with _connect(db) as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT geometry_hash) FROM calculations"
+        ).fetchone()
 
-    if db_dataframe.empty:
-        return 0
-
-    num_molecules = db_dataframe['geometry_hash'].nunique()
-
-    return num_molecules
+    return int(row[0] or 0)
