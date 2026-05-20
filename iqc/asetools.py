@@ -438,13 +438,17 @@ UMA_DEFAULT_MODEL_BY_SIZE = {
 }
 UMA_TASKS = {"omol", "omat", "odac"}
 UMA_PREDICTOR_KWARGS = {
+    "atom_refs",
     "cache_dir",
     "device",
+    "form_elem_refs",
     "inference_settings",
     "overrides",
     "seed",
     "workers",
 }
+UMA_HOSTED_PREDICTOR_KWARGS = UMA_PREDICTOR_KWARGS - {"atom_refs", "form_elem_refs"}
+UMA_LOCAL_PREDICTOR_KWARGS = UMA_PREDICTOR_KWARGS - {"cache_dir", "seed"}
 
 
 def _parse_uma_calculator_name(name):
@@ -475,6 +479,7 @@ def _get_uma_calculator(name, **kwargs):
 
     predictor_name, task = _parse_uma_calculator_name(name)
     uma_kwargs = dict(kwargs)
+    checkpoint_path = uma_kwargs.pop("checkpoint_path", None)
     predictor_name = uma_kwargs.pop("model", predictor_name)
     task = uma_kwargs.pop("task_name", task)
     predictor_kwargs = {
@@ -483,7 +488,36 @@ def _get_uma_calculator(name, **kwargs):
         if key in UMA_PREDICTOR_KWARGS
     }
 
-    predictor = pretrained_mlip.get_predict_unit(predictor_name, **predictor_kwargs)
+    model_path = Path(str(checkpoint_path or predictor_name)).expanduser()
+    if checkpoint_path or model_path.exists():
+        from fairchem.core.units.mlip_unit import load_predict_unit
+
+        local_predictor_kwargs = {
+            key: value
+            for key, value in predictor_kwargs.items()
+            if key in UMA_LOCAL_PREDICTOR_KWARGS
+        }
+        ignored_keys = sorted(set(predictor_kwargs) - set(local_predictor_kwargs))
+        if ignored_keys:
+            logging.info(
+                "Ignoring hosted UMA predictor option(s) for local checkpoint: %s",
+                ignored_keys,
+            )
+        predictor = load_predict_unit(model_path, **local_predictor_kwargs)
+        predictor_name = str(model_path)
+        logging.info(
+            "Loaded UMA predictor from local checkpoint: %s", predictor_name
+        )
+    else:
+        hosted_predictor_kwargs = {
+            key: value
+            for key, value in predictor_kwargs.items()
+            if key in UMA_HOSTED_PREDICTOR_KWARGS
+        }
+        predictor = pretrained_mlip.get_predict_unit(
+            predictor_name, **hosted_predictor_kwargs
+        )
+
     calculator = FAIRChemCalculator(predictor, task_name=task, **uma_kwargs)
     calculator.model_name = predictor_name
     logging.info(

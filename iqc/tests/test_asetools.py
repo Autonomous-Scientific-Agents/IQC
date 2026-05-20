@@ -585,8 +585,8 @@ def test_patch_e3nn_activation_legacy_state_repairs_forward():
 def test_parse_uma_calculator_name():
     """Test compact IQC UMA calculator aliases."""
 
-    assert _parse_uma_calculator_name("uma") == ("uma-s-1p1", "omol")
-    assert _parse_uma_calculator_name("uma-s-omol") == ("uma-s-1p1", "omol")
+    assert _parse_uma_calculator_name("uma") == ("uma-s-1p2", "omol")
+    assert _parse_uma_calculator_name("uma-s-omol") == ("uma-s-1p2", "omol")
     assert _parse_uma_calculator_name("uma-m-odac") == ("uma-m-1p1", "odac")
 
     with pytest.raises(ValueError):
@@ -636,6 +636,64 @@ def test_get_uma_calculator_uses_fairchem_predictor_and_task():
     assert calculator.task_name == "odac"
     assert calculator.kwargs == {"foo": "bar"}
     assert calculator.model_name == "uma-m-1p1"
+
+
+def test_get_uma_calculator_can_load_local_checkpoint(tmp_path):
+    """Test UMA initialization can bypass hosted Hugging Face checkpoints."""
+
+    checkpoint = tmp_path / "uma-local.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    calls = []
+
+    class DummyFAIRChemCalculator:
+        def __init__(self, predictor, task_name, **kwargs):
+            self.predictor = predictor
+            self.task_name = task_name
+            self.kwargs = kwargs
+            self.name = "fairchem"
+
+    class DummyPretrainedMLIP:
+        @staticmethod
+        def get_predict_unit(model_name, **kwargs):
+            raise AssertionError("hosted checkpoint should not be requested")
+
+    def load_predict_unit(path, **kwargs):
+        calls.append((path, kwargs))
+        return {"checkpoint": path}
+
+    fairchem_module = types.ModuleType("fairchem")
+    fairchem_core_module = types.ModuleType("fairchem.core")
+    fairchem_units_module = types.ModuleType("fairchem.core.units")
+    fairchem_mlip_unit_module = types.ModuleType("fairchem.core.units.mlip_unit")
+    fairchem_core_module.FAIRChemCalculator = DummyFAIRChemCalculator
+    fairchem_core_module.pretrained_mlip = DummyPretrainedMLIP
+    fairchem_mlip_unit_module.load_predict_unit = load_predict_unit
+    fairchem_module.core = fairchem_core_module
+
+    with patch.dict(
+        sys.modules,
+        {
+            "fairchem": fairchem_module,
+            "fairchem.core": fairchem_core_module,
+            "fairchem.core.units": fairchem_units_module,
+            "fairchem.core.units.mlip_unit": fairchem_mlip_unit_module,
+        },
+    ):
+        calculator = _get_uma_calculator(
+            "uma-s-omol",
+            checkpoint_path=str(checkpoint),
+            device="cpu",
+            inference_settings="turbo",
+            cache_dir="/unused/hosted/cache",
+            seed=123,
+        )
+
+    assert calls == [
+        (checkpoint, {"device": "cpu", "inference_settings": "turbo"})
+    ]
+    assert calculator.predictor == {"checkpoint": checkpoint}
+    assert calculator.task_name == "omol"
+    assert calculator.model_name == str(checkpoint)
 
 
 def test_get_calculator_uma_unavailable_falls_back_to_mace():
