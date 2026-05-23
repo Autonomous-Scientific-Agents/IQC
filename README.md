@@ -332,6 +332,18 @@ Results written from tabular inputs include `input_mode`, `data_input_file`, `da
 
 See [docs/data_input.md](docs/data_input.md) for the full tabular input guide.
 
+## Parquet Utility Commands
+
+When IQC is installed, the Python utilities in `scripts/` are available as
+console commands:
+
+```bash
+iqc-jsonl2parquet results.jsonl results.parquet
+iqc-read-parquet results.parquet
+iqc-optimize-parquet results.parquet optimized.parquet
+iqc-reduce-parquet results.parquet --drop 2 5 -o reduced.parquet
+```
+
 ## Skipping Existing Calculations
 
 Use `--skip-existing` to avoid rerunning calculations that IQC has already

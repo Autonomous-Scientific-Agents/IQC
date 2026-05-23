@@ -64,7 +64,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["iqc*"]
+include = ["iqc*", "scripts"]
 exclude = ["iqc.tests*"]
 namespaces = false
 
@@ -84,3 +84,7 @@ multi_line_output = 3
 
 [project.scripts]
 iqc = "iqc.main:main"
+iqc-jsonl2parquet = "scripts.jsonl2parquet:run_cli"
+iqc-optimize-parquet = "scripts.optimize_parquet:run_cli"
+iqc-read-parquet = "scripts.read_parquet:run_cli"
+iqc-reduce-parquet = "scripts.reduce_parquet:run_cli"

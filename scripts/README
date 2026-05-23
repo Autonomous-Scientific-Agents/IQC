@@ -1,1 +1,11 @@
-This directory contains job scripts to submit jobs on queue managed systems.
+This directory contains IQC helper utilities and job scripts.
+
+Python utilities are exposed as console commands when IQC is installed:
+
+- iqc-jsonl2parquet
+- iqc-optimize-parquet
+- iqc-read-parquet
+- iqc-reduce-parquet
+
+The shell scripts are queue-system submission helpers and are not installed as
+Python console commands.
