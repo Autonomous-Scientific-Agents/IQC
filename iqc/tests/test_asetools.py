@@ -33,6 +33,7 @@ from iqc.asetools import (
     is_linear_by_inertia,
     get_symmetry_info,
     run_ir,
+    run_ir_thermo,
     run_optimization,
     run_single_point,
     run_vibrations,
@@ -1099,7 +1100,69 @@ def test_run_ir_uses_separate_dipole_calculator(tmp_path, monkeypatch):
     assert dip_calls["dipole"] > 0
     assert results["calculator_vibration"]
     assert results["calculator_dipole"]
+    assert "vib_energies" in results
+    assert "vibrational_frequencies_cm^-1" in results
     assert results["error"] == ""
+
+
+def test_run_ir_thermo_reuses_ir_vibrations(tmp_path):
+    """run_ir_thermo must add thermo properties without calling run_vibrations."""
+
+    h2 = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]], cell=[10, 10, 10])
+    h2.calc = EMT()
+    ir_results = {
+        "warnings": [],
+        "error": "",
+        "vib_energies": [0.01, 0.02, 0.03, 0.04, 0.05, 0.06],
+        "number_of_imaginary": 0,
+        "multiplicity": 1,
+        "opt_sym_number": 1,
+    }
+
+    with patch("iqc.asetools.run_ir", return_value=(h2, ir_results)) as mock_ir, patch(
+        "iqc.asetools.run_vibrations",
+        side_effect=AssertionError("run_ir_thermo should not recompute vibrations"),
+    ):
+        atoms, results = run_ir_thermo(
+            h2,
+            calculator=EMT(),
+            unique_name="h2_ir_thermo",
+            vib_dir=tmp_path / "ir",
+        )
+
+    assert atoms is h2
+    assert mock_ir.call_count == 1
+    assert results["error"] == ""
+    assert "G_eV" in results
+    assert "H_eV" in results
+    assert "S_eV/K" in results
+    assert "E_ZPE_eV" in results
+
+
+def test_run_ir_thermo_respects_imaginary_mode_policy(tmp_path):
+    h2 = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]], cell=[10, 10, 10])
+    h2.calc = EMT()
+    ir_results = {
+        "warnings": [],
+        "error": "",
+        "vib_energies": [0.01, 0.02, 0.03, 0.04, 0.05, 0.06],
+        "number_of_imaginary": 1,
+        "multiplicity": 1,
+        "opt_sym_number": 1,
+    }
+
+    with patch("iqc.asetools.run_ir", return_value=(h2, ir_results)):
+        atoms, results = run_ir_thermo(
+            h2,
+            calculator=EMT(),
+            ignore_imag_modes=False,
+            unique_name="h2_ir_thermo",
+            vib_dir=tmp_path / "ir",
+        )
+
+    assert atoms is h2
+    assert "imaginary" in results["error"].lower()
+    assert "G_eV" not in results
 
 
 def test_run_ir_filters_optimization_params(tmp_path):

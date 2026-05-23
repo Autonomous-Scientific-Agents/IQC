@@ -140,6 +140,7 @@ IQC provides several computational tasks that can be performed on molecular syst
 - `ir`: Infrared spectrum calculation
 - `opt`: Geometry optimization
 - `thermo`: Thermochemical analysis
+- `ir-thermo`: Infrared spectrum and thermochemistry from one shared Hessian
 - `nmr`: Solution-state NMR shielding and spectrum simulation using ORCA, NWChem, or Gaussian, with optional xTB pre-optimization
 
 These tasks can be specified when running calculations. For example:
@@ -205,6 +206,17 @@ iqc --task ir --xyz molecule.xyz --calculator xtb
 `--calculator mace` (or `emt`, or any UMA model) will fail at the IR analysis
 step with a clear error explaining that the calculator does not implement the
 `'dipole'` property.
+
+To compute both IR intensities and thermochemistry without repeating the
+optimization and Hessian calculation, use the composite `ir-thermo` task:
+
+```bash
+iqc --task ir-thermo --xyz molecule.xyz --calculator xtb
+```
+
+`ir-thermo` uses the same IR calculator-role settings described below and then
+derives thermochemistry from the vibrational energies produced by that same
+finite-difference run.
 
 ### Mixed calculators (per-role override)
 

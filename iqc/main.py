@@ -317,6 +317,7 @@ def main():
     from iqc.asetools import (
         run_optimization,
         run_ir,
+        run_ir_thermo,
         run_single_point,
         run_thermo,
         run_vibrations,
@@ -582,6 +583,60 @@ def main():
             return direct_work_dir
         return get_rank_output_dir()
 
+    supported_calculator_names = {
+        "mace",
+        "xtb",
+        "emt",
+        "orca",
+        "uma",
+        "uma-s-omol",
+        "uma-s-omat",
+        "uma-s-odac",
+        "uma-m-omol",
+        "uma-m-omat",
+        "uma-m-odac",
+    }
+
+    def resolve_role_calculators(run_params, roles):
+        """Instantiate per-role calculator overrides from YAML task params."""
+
+        role_calculators = {}
+        for role in roles:
+            name = run_params.pop(role, None)
+            if name is None:
+                continue
+            if isinstance(name, str):
+                if name.lower() not in supported_calculator_names:
+                    logging.error(
+                        f"Unknown calculator '{name}' for {role}. "
+                        f"Supported names: {sorted(supported_calculator_names)}. "
+                        "To use a calculator outside this list, pass an "
+                        "instantiated calculator via the Python API."
+                    )
+                    comm.Abort(1)
+                try:
+                    instance = get_calculator(name=name, **calc_params)
+                except RuntimeError as e:
+                    logging.error(f"Failed to initialize {role} '{name}': {e}")
+                    comm.Abort(1)
+                # get_calculator silently falls back to MACE when its target
+                # fails. For per-role overrides the user explicitly asked for
+                # a calculator, so fail instead of quietly changing methods.
+                fallback_from = getattr(instance, "_iqc_fallback_from", None)
+                if fallback_from is not None:
+                    logging.error(
+                        f"Requested {role}='{name}' but get_calculator silently "
+                        f"fell back to MACE (was: '{fallback_from}'). Check earlier "
+                        "warnings — typical causes: missing executable (e.g. ORCA "
+                        "not on PATH and ASE_ORCA_COMMAND unset), missing Python "
+                        "package, or initialization failure."
+                    )
+                    comm.Abort(1)
+                role_calculators[role] = instance
+            else:
+                role_calculators[role] = name
+        return role_calculators
+
     for xyz_index in range(start_index, end_index):
 
         smiles_input = None
@@ -792,68 +847,14 @@ def main():
                     ir_run_params["output_dir"] = output_dir
                     save_geometry = True
 
-                # Per-role calculator overrides (YAML ir_params can specify a
-                # calculator *name* per role; we instantiate each here using
-                # the same calc_params as the main calculator).
-                supported_names = {
-                    "mace",
-                    "xtb",
-                    "emt",
-                    "orca",
-                    "uma",
-                    "uma-s-omol",
-                    "uma-s-omat",
-                    "uma-s-odac",
-                    "uma-m-omol",
-                    "uma-m-omat",
-                    "uma-m-odac",
-                }
-                role_calculators = {}
-                for role in (
-                    "optimization_calculator",
-                    "vibration_calculator",
-                    "dipole_calculator",
-                ):
-                    name = ir_run_params.pop(role, None)
-                    if name is None:
-                        continue
-                    if isinstance(name, str):
-                        if name.lower() not in supported_names:
-                            logging.error(
-                                f"Unknown calculator '{name}' for {role}. "
-                                f"Supported names: {sorted(supported_names)}. "
-                                "To use a calculator outside this list, pass an "
-                                "instantiated calculator via the Python API."
-                            )
-                            comm.Abort(1)
-                        try:
-                            instance = get_calculator(name=name, **calc_params)
-                        except RuntimeError as e:
-                            logging.error(f"Failed to initialize {role} '{name}': {e}")
-                            comm.Abort(1)
-                        # get_calculator silently falls back to MACE when its
-                        # target fails. For per-role IR overrides that's a
-                        # bug-magnet: the user explicitly asked for X, and
-                        # quietly getting MACE gives a confusing error later
-                        # (e.g. "MACE has no dipole"). get_calculator tags
-                        # fallbacks with `_iqc_fallback_from`; check that
-                        # rather than the class name (SumCalculator wrapping
-                        # hides the MACE class).
-                        fallback_from = getattr(instance, "_iqc_fallback_from", None)
-                        if fallback_from is not None:
-                            logging.error(
-                                f"Requested {role}='{name}' but get_calculator "
-                                f"silently fell back to MACE (was: '{fallback_from}'). "
-                                "Check earlier warnings — typical causes: missing "
-                                "executable (e.g. ORCA not on PATH and "
-                                "ASE_ORCA_COMMAND unset), missing Python "
-                                "package, or initialization failure."
-                            )
-                            comm.Abort(1)
-                        role_calculators[role] = instance
-                    else:
-                        # Already an instantiated calculator object.
-                        role_calculators[role] = name
+                role_calculators = resolve_role_calculators(
+                    ir_run_params,
+                    (
+                        "optimization_calculator",
+                        "vibration_calculator",
+                        "dipole_calculator",
+                    ),
+                )
 
                 explicit_params = {
                     "atoms",
@@ -880,6 +881,59 @@ def main():
                     charge=ase_charge,
                     **role_calculators,
                     **ir_params_filtered,
+                )
+            elif task == "ir-thermo":
+                ignore_imag = args.ignore_imag
+                ir_thermo_run_params = {**thermo_params, **ir_params}
+                output_dir = get_work_dir()
+                ir_thermo_run_params["vib_dir"] = output_dir
+                trajectory_file = None
+                save_geometry = False
+                if args.save:
+                    trajectory_file = os.path.join(
+                        output_dir, f"{unique_name}_ir-thermo_trajectory.traj"
+                    )
+                    ir_thermo_run_params["output_dir"] = output_dir
+                    save_geometry = True
+
+                role_calculators = resolve_role_calculators(
+                    ir_thermo_run_params,
+                    (
+                        "optimization_calculator",
+                        "vibration_calculator",
+                        "dipole_calculator",
+                    ),
+                )
+
+                explicit_params = {
+                    "atoms",
+                    "calculator",
+                    "optimization_calculator",
+                    "vibration_calculator",
+                    "dipole_calculator",
+                    "optimize",
+                    "ignore_imag_modes",
+                    "unique_name",
+                    "trajectory",
+                    "save_geometry",
+                }
+                ir_thermo_params_filtered = {
+                    k: v
+                    for k, v in ir_thermo_run_params.items()
+                    if k not in explicit_params
+                }
+                atoms, task_results = run_ir_thermo(
+                    atoms=atoms,
+                    calculator=calculator,
+                    optimize=True,
+                    ignore_imag_modes=ignore_imag,
+                    unique_name=unique_name,
+                    trajectory=trajectory_file,
+                    save_geometry=save_geometry,
+                    multiplicity=ase_multiplicity,
+                    charge=ase_charge,
+                    **role_calculators,
+                    **ir_thermo_params_filtered,
                 )
             elif task == "thermo":
                 # Pass optimization and thermo parameters

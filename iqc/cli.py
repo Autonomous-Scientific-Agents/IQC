@@ -133,7 +133,7 @@ def get_args(argv=None):
         "-t",
         "--task",
         type=str,
-        choices=["single", "opt", "vib", "ir", "thermo", "nmr"],
+        choices=["single", "opt", "vib", "ir", "thermo", "ir-thermo", "nmr"],
         default="thermo",
         help="Calculation task to perform (default: thermo)",
     )

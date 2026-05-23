@@ -28,3 +28,9 @@ def test_skip_existing_options_are_parsed():
 
     assert args.skip_existing is True
     assert args.skip_existing_from == ["old.jsonl"]
+
+
+def test_ir_thermo_task_is_supported():
+    args = get_args(["--task", "ir-thermo"])
+
+    assert args.task == "ir-thermo"

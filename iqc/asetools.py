@@ -1997,6 +1997,62 @@ def run_vibrations(
     return atoms, results
 
 
+def _add_thermo_results_from_vibrations(
+    atoms,
+    results,
+    ignore_imag_modes=True,
+    multiplicity=None,
+):
+    """Append IdealGasThermo properties using vibrational data in results."""
+
+    thermo = None
+    try:
+        vib_energies = results.get("vib_energies", None)
+        if vib_energies is None:
+            logging.error(
+                "Vibrational energies not found in vibration results. Cannot calculate thermo properties."
+            )
+            results["error"] += "Missing vibrational energies for thermochemistry.\n"
+            return None, results
+
+        if not ignore_imag_modes:
+            n_imag = results.get("number_of_imaginary", 0)
+            if n_imag > 0:
+                error = (
+                    "Imaginary vibrational energies are present: "
+                    f"({n_imag} imaginary modes).\n"
+                )
+                results["error"] += error
+                logging.error(error)
+                return None, results
+
+        start_time = time.time()
+        thermo = IdealGasThermo(
+            vib_energies=vib_energies,
+            geometry=get_geometry_type(atoms),
+            atoms=atoms,
+            potentialenergy=atoms.get_potential_energy(),
+            spin=get_spin(atoms, results.get("multiplicity", multiplicity)),
+            symmetrynumber=results.get("opt_sym_number", 1),
+            ignore_imag_modes=ignore_imag_modes,
+        )
+        results["thermo_time"] = time.time() - start_time
+        results["G_eV"] = thermo.get_gibbs_energy(temperature=298.15, pressure=101325.0)
+        results["H_eV"] = thermo.get_enthalpy(temperature=298.15)
+        results["S_eV/K"] = thermo.get_entropy(temperature=298.15, pressure=101325.0)
+        results["E_ZPE_eV"] = thermo.get_ZPE_correction()
+        logging.debug(
+            f"Thermochemistry calculations completed in {results['thermo_time']} seconds."
+        )
+    except Exception as e:
+        error = f"Error in thermochemistry calculations: {e}\n"
+        results["error"] += error
+        logging.error(error)
+        return None, results
+
+    return thermo, results
+
+
 def run_ir(
     atoms,
     calculator=None,
@@ -2015,6 +2071,8 @@ def run_ir(
     ir_spectrum_end=4000,
     sparse_spectrum=False,
     intensity_threshold=0.0,
+    max_trans_rot=100,
+    max_vib_imag=50,
     multiplicity=None,
     charge=0,
     **params,
@@ -2217,6 +2275,41 @@ def run_ir(
         ir.clean()
         ir.run()
 
+        vib_data = ir.get_vibrations()
+        mode_frequencies = vib_data.get_frequencies()
+        try:
+            vib_energies, vib_modes = vib_data.get_energies_and_modes()
+        except (AttributeError, TypeError, ValueError):
+            vib_energies = (
+                vib_data.get_energies() if hasattr(vib_data, "get_energies") else []
+            )
+            vib_modes = []
+        results["frequencies_cm^-1"] = (
+            mode_frequencies.tolist()
+            if hasattr(mode_frequencies, "tolist")
+            else mode_frequencies
+        )
+        results["vib_energies"] = (
+            vib_energies.tolist() if hasattr(vib_energies, "tolist") else vib_energies
+        )
+        results["vib_modes"] = (
+            vib_modes.tolist() if hasattr(vib_modes, "tolist") else vib_modes
+        )
+        nrot = 2 if is_linear_by_inertia(atoms) else 3
+        if np.any(np.abs(mode_frequencies[: 3 + nrot]) > max_trans_rot):
+            logging.warning(
+                "Translational or rotational modes are too high: "
+                f"{mode_frequencies[:3+nrot]}"
+            )
+            results["warnings"].append("Translational or rotational modes are too high")
+        img_freqs = [
+            f for f in mode_frequencies[3 + nrot :] if abs(f.imag) > max_vib_imag
+        ]
+        results["number_of_imaginary"] = len(img_freqs)
+        results["vibrational_frequencies_cm^-1"] = [
+            f.real for f in mode_frequencies[3 + nrot :]
+        ]
+
         freq_intensity = ir.get_spectrum(
             start=ir_spectrum_start,
             end=ir_spectrum_end,
@@ -2275,6 +2368,74 @@ def run_ir(
     return atoms, results
 
 
+def run_ir_thermo(
+    atoms,
+    calculator=None,
+    optimization_calculator=None,
+    vibration_calculator=None,
+    dipole_calculator=None,
+    optimize=True,
+    ignore_imag_modes=True,
+    unique_name="",
+    vib_dir=None,
+    indices=None,
+    fmax=0.01,
+    delta=0.01,
+    trajectory=None,
+    save_geometry=False,
+    ir_spectrum_start=300,
+    ir_spectrum_end=4000,
+    sparse_spectrum=False,
+    intensity_threshold=0.0,
+    max_trans_rot=100,
+    max_vib_imag=50,
+    multiplicity=None,
+    charge=0,
+    **params,
+):
+    """Run IR and thermochemistry from one optimized Hessian calculation."""
+
+    atoms, results = run_ir(
+        atoms=atoms,
+        calculator=calculator,
+        optimization_calculator=optimization_calculator,
+        vibration_calculator=vibration_calculator,
+        dipole_calculator=dipole_calculator,
+        optimize=optimize,
+        unique_name=unique_name,
+        vib_dir=vib_dir,
+        indices=indices,
+        fmax=fmax,
+        delta=delta,
+        trajectory=trajectory,
+        save_geometry=save_geometry,
+        ir_spectrum_start=ir_spectrum_start,
+        ir_spectrum_end=ir_spectrum_end,
+        sparse_spectrum=sparse_spectrum,
+        intensity_threshold=intensity_threshold,
+        max_trans_rot=max_trans_rot,
+        max_vib_imag=max_vib_imag,
+        multiplicity=multiplicity,
+        charge=charge,
+        **params,
+    )
+    if results["error"]:
+        logging.error("IR analysis failed, cannot proceed with thermochemistry.")
+        return atoms, results
+
+    _, results = _add_thermo_results_from_vibrations(
+        atoms,
+        results,
+        ignore_imag_modes=ignore_imag_modes,
+        multiplicity=multiplicity,
+    )
+    if results["error"]:
+        return atoms, results
+
+    logging.info(f"IR thermochemistry calculation for {unique_name} completed")
+    return atoms, results
+
+
 def run_thermo(
     atoms,
     calculator=None,
@@ -2319,50 +2480,13 @@ def run_thermo(
         )
         return None, results
 
-    thermo = None
-
-    try:
-        start_time = time.time()
-        # Get energies directly from vib_results dictionary
-        vib_energies = results.get("vib_energies", None)
-        if vib_energies is None:
-            # This case indicates an issue in run_vibrations not storing energies
-            logging.error(
-                "Vibrational energies not found in vibration results. Cannot calculate thermo properties."
-            )
-            results["error"] += "Missing vibrational energies for thermochemistry.\n"
-            return None, results
-
-        # Check for imaginary frequencies if not ignoring them
-        if not ignore_imag_modes:
-            n_imag = results.get("number_of_imaginary", 0)
-            if n_imag > 0:
-                error = f"Imaginary vibrational energies are present: ({n_imag} imaginary modes).\n"
-                results["error"] = error
-                logging.error(error)
-                return None, results
-
-        thermo = IdealGasThermo(
-            vib_energies=vib_energies,
-            geometry=get_geometry_type(atoms),
-            atoms=atoms,
-            potentialenergy=atoms.get_potential_energy(),
-            spin=get_spin(atoms, results.get("multiplicity")),
-            symmetrynumber=results.get("opt_sym_number", 1),  # Use optimized symmetry
-            ignore_imag_modes=ignore_imag_modes,
-        )
-        results["thermo_time"] = time.time() - start_time
-        results["G_eV"] = thermo.get_gibbs_energy(temperature=298.15, pressure=101325.0)
-        results["H_eV"] = thermo.get_enthalpy(temperature=298.15)
-        results["S_eV/K"] = thermo.get_entropy(temperature=298.15, pressure=101325.0)
-        results["E_ZPE_eV"] = thermo.get_ZPE_correction()
-        logging.debug(
-            f"Thermochemistry calculations completed in {results['thermo_time']} seconds."
-        )
-    except Exception as e:
-        error = f"Error in thermochemistry calculations: {e}\n"
-        results["error"] += error
-        logging.error(error)
+    thermo, results = _add_thermo_results_from_vibrations(
+        atoms,
+        results,
+        ignore_imag_modes=ignore_imag_modes,
+        multiplicity=multiplicity,
+    )
+    if results["error"]:
         return None, results
 
     logging.info(f"Thermochemistry calculation for {unique_name} completed")
