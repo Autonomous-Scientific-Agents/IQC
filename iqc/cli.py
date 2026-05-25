@@ -105,7 +105,8 @@ def get_args(argv=None):
         default="xyz",
         help=(
             "Path for an .xyz file or a directory containing .xyz files. When "
-            "--input is provided, this is the column name containing XYZ text."
+            "--input is provided, this is the column name containing XYZ text; "
+            "if omitted for an --input calculation, defaults to opt_xyz."
         ),
     )
     parser.add_argument(
@@ -344,11 +345,15 @@ def get_args(argv=None):
     argcomplete.autocomplete(parser)
     args = parser.parse_args(argv)
     explicit_options = _explicit_option_names(sys.argv[1:] if argv is None else argv)
+    explicit_xyz = bool(explicit_options.intersection({"-x", "--xyz"}))
+    explicit_smiles = "--smiles" in explicit_options
     args.input_only = bool(args.input) and explicit_options <= {"-i", "--input"}
-    args.input_xyz_column = bool(args.input) and bool(
-        explicit_options.intersection({"-x", "--xyz"})
-    )
-    args.input_smiles_column = bool(args.input) and "--smiles" in explicit_options
+    if args.input and not args.input_only and not explicit_xyz and not explicit_smiles:
+        args.xyz = "opt_xyz"
+        args.input_xyz_column = True
+    else:
+        args.input_xyz_column = bool(args.input) and explicit_xyz
+    args.input_smiles_column = bool(args.input) and explicit_smiles
     args.sort_order_explicit = bool(
         explicit_options.intersection({"--sort-order", "--sort_order"})
     )

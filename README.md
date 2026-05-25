@@ -295,6 +295,14 @@ Run a calculation from a column containing XYZ text:
 iqc --input molecules.parquet --xyz geometry --task single
 ```
 
+For IQC-generated JSONL or parquet files, `--xyz` can be omitted. IQC then
+uses the `opt_xyz` column by default, which reuses the optimized geometry from
+a previous run:
+
+```bash
+iqc --input iqc_opt_results.parquet --task single
+```
+
 Run a calculation from a column containing SMILES strings:
 
 ```bash
@@ -309,10 +317,14 @@ iqc --input molecules.parquet --smiles smiles --sort energy --sort_order up --ta
 
 Supported input formats include parquet (`.parquet`, `.pq`), CSV/TSV text files, Excel files (`.xls`, `.xlsx`, `.xlsm`, `.ods`), JSON/JSONL, Feather, and Arrow IPC. For parquet, CSV/TSV, Feather, and Arrow IPC, IQC reads only the requested structure and sort columns where possible.
 
-When `--input` is used for a calculation, pass exactly one structure selector:
+When `--input` is used for a calculation, pass one structure selector or omit
+both to use the IQC result default:
 
 - `--xyz COLUMN`: read XYZ-format geometry strings from `COLUMN`
 - `--smiles COLUMN`: read SMILES strings from `COLUMN` and build 3D geometries with RDKit
+
+If neither selector is provided, IQC uses `--xyz opt_xyz`. This is intended for
+rerunning calculations from IQC result files that contain optimized geometries.
 
 Use `--sort COLUMN` to sort rows before processing. `--sort_order up` sorts ascending and `--sort_order down` sorts descending; the default is `up`. Missing sort values are rejected.
 

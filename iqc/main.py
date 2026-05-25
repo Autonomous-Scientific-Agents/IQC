@@ -278,7 +278,8 @@ def validate_input_args(args):
     if not args.input_xyz_column and not args.input_smiles_column:
         return (
             "Error: when using --input for calculations, pass --xyz COLUMN "
-            "or --smiles COLUMN to identify the structure column."
+            "or --smiles COLUMN to identify the structure column. If --xyz "
+            "is omitted, IQC defaults to the opt_xyz column."
         )
     return None
 

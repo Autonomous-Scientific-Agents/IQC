@@ -39,9 +39,11 @@ def test_cli_marks_input_only_for_short_and_long_options():
     assert short_args.input_smiles_column is False
     assert long_args.input_only is True
     assert mixed_args.input_only is False
-    assert mixed_args.input_xyz_column is False
+    assert mixed_args.xyz == "opt_xyz"
+    assert mixed_args.input_xyz_column is True
     assert mixed_args.input_smiles_column is False
     assert xyz_calculation_args.input_only is False
+    assert xyz_calculation_args.xyz == "structure"
     assert xyz_calculation_args.input_xyz_column is True
     assert xyz_calculation_args.input_smiles_column is False
     assert smiles_calculation_args.input_only is False
@@ -54,7 +56,7 @@ def test_cli_marks_input_only_for_short_and_long_options():
 
 def test_data_input_modes_are_validated_without_mpi():
     inspect_args = get_args(["--input", "data.csv"])
-    missing_column_args = get_args(["--input", "data.csv", "--task", "single"])
+    default_xyz_args = get_args(["--input", "data.csv", "--task", "single"])
     both_columns_args = get_args(
         ["--input", "data.csv", "--xyz", "geometry", "--smiles", "smiles"]
     )
@@ -71,9 +73,7 @@ def test_data_input_modes_are_validated_without_mpi():
     )
 
     assert validate_input_args(inspect_args) is None
-    assert "pass --xyz COLUMN or --smiles COLUMN" in validate_input_args(
-        missing_column_args
-    )
+    assert validate_input_args(default_xyz_args) is None
     assert "but not both" in validate_input_args(both_columns_args)
     assert validate_input_args(xyz_args) is None
     assert validate_input_args(smiles_args) is None
@@ -89,32 +89,21 @@ def test_data_input_modes_are_validated_without_mpi():
     assert "--skip-existing-from requires --skip-existing" in validate_input_args(
         skip_existing_from_without_skip_args
     )
+    assert default_xyz_args.xyz == "opt_xyz"
+    assert get_structure_input_mode(default_xyz_args) == "data_xyz"
     assert get_structure_input_mode(xyz_args) == "data_xyz"
     assert get_structure_input_mode(smiles_args) == "data_smiles"
     assert get_structure_input_mode(direct_smiles_args) == "smiles"
 
 
-def test_data_input_validation_sets_cli_exit_code(tmp_path):
-    input_path = tmp_path / "molecules.csv"
-    input_path.write_text("smiles\nO\n", encoding="utf-8")
+def test_data_input_calculation_defaults_to_opt_xyz_column():
+    args = get_args(["--input", "iqc_opt_results.jsonl", "--task", "single"])
 
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "iqc.main",
-            "--input",
-            str(input_path),
-            "--task",
-            "single",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 1
-    assert "pass --xyz COLUMN or --smiles COLUMN" in result.stderr
+    assert args.xyz == "opt_xyz"
+    assert args.input_xyz_column is True
+    assert args.input_smiles_column is False
+    assert validate_input_args(args) is None
+    assert get_structure_input_mode(args) == "data_xyz"
 
 
 def test_sort_without_input_sets_cli_exit_code():

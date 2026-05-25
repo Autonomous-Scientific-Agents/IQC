@@ -34,12 +34,20 @@ For parquet, CSV/TSV, Feather, and Arrow IPC files, IQC reads only the requested
 
 ## Running Calculations From Data Columns
 
-When `--input` is used with a calculation task, pass exactly one structure column selector.
+When `--input` is used with a calculation task, pass one structure column
+selector or omit both to use the IQC result default.
 
 Use `--xyz COLUMN` when the data file contains XYZ-format geometry text:
 
 ```bash
 iqc --input molecules.parquet --xyz geometry --task single
+```
+
+For IQC-generated result JSONL or parquet files, omit `--xyz` to reuse the
+stored optimized geometry. IQC defaults to the `opt_xyz` column:
+
+```bash
+iqc --input iqc_opt_results.parquet --task single
 ```
 
 Use `--smiles COLUMN` when the data file contains SMILES strings:
@@ -58,7 +66,8 @@ iqc --input molecules.parquet \
   --output-dir nmr_results
 ```
 
-`--xyz` and `--smiles` are mutually exclusive when `--input` is provided. Passing neither selector with calculation options is also an error because IQC cannot infer which column contains the structure.
+`--xyz` and `--smiles` are mutually exclusive when `--input` is provided. When
+neither selector is passed with calculation options, IQC assumes `--xyz opt_xyz`.
 
 ## Sorting Rows Before Processing
 
