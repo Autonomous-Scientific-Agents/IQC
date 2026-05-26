@@ -26,16 +26,38 @@ iqc --xyz molecule.xyz --calculator orca --task ir --params orca_params.yaml
 ## MACE and UMA in One Environment
 
 MACE package metadata pins `e3nn==0.4.4`, while FAIRChem UMA needs a newer
-`e3nn` stack. IQC follows the workaround discussed in
-[ACEsuit/mace#555](https://github.com/ACEsuit/mace/issues/555): install the
-shared runtime and UMA dependencies normally, then install `mace-torch` without
-letting its dependency metadata downgrade `e3nn`.
+`e3nn` stack. IQC's base install does not install PyTorch or `e3nn`; those are
+kept in the `mlip` optional dependency group. IQC follows the workaround
+discussed in [ACEsuit/mace#555](https://github.com/ACEsuit/mace/issues/555):
+install the shared runtime and UMA dependencies normally, then install
+`mace-torch` without letting its dependency metadata downgrade `e3nn`.
+
+On Linux, resolving PyTorch from the default PyPI index can install CUDA/NVIDIA
+runtime wheels even on Intel GPU or CPU-only systems. Install the PyTorch wheel
+for your hardware first, then install IQC's MLIP dependencies.
+
+CPU-only PyTorch:
+
+```bash
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+uv pip install -e ".[mlip]"
+uv pip install --no-deps mace-torch
+```
+
+Intel GPU / XPU PyTorch:
+
+```bash
+uv pip install torch --index-url https://download.pytorch.org/whl/xpu
+uv pip install -e ".[mlip]"
+uv pip install --no-deps mace-torch
+```
 
 With `uv`:
 
 ```bash
 uv venv --python 3.12
 source .venv/bin/activate
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
 uv pip install -e ".[mlip]"
 uv pip install --no-deps mace-torch
 ```
@@ -52,7 +74,8 @@ python -m pip install -e .
 The `mlip` extra and `env.yml` include the runtime packages MACE expects, plus
 `fairchem-core`, `torch-dftd`, and `e3nn>=0.5`. `mace-torch` is intentionally
 not declared as a normal dependency because a resolver would try to satisfy its
-old `e3nn==0.4.4` pin.
+old `e3nn==0.4.4` pin. If you need NVIDIA CUDA wheels, install the matching
+PyTorch build before `.[mlip]`; otherwise use the CPU or XPU index above.
 
 At runtime IQC also applies narrow e3nn compatibility patches before loading
 MACE. They let newer e3nn versions read the older raw-byte codegen buffers

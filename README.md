@@ -55,10 +55,39 @@ Interactive Quantum Chemistry
 
 ### MACE and UMA Calculators
 
-To install MACE and FAIRChem UMA in the same Python 3.11+ environment, install
-IQC's MLIP runtime dependencies first, then install `mace-torch` without
-dependencies so its old `e3nn==0.4.4` metadata does not downgrade the newer
-UMA-compatible `e3nn` stack:
+The base IQC install does not install PyTorch, MACE, UMA, or `e3nn`. Install
+the `mlip` extra only when you need MLIP calculators.
+
+On Linux, installing PyTorch dependencies from the default PyPI index can pull
+CUDA/NVIDIA wheels even on systems without NVIDIA GPUs. For CPU-only or Intel
+GPU systems, install the appropriate PyTorch wheel first, then install IQC's
+MLIP runtime dependencies.
+
+CPU-only PyTorch:
+
+```bash
+uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+uv pip install -e ".[mlip]"
+uv pip install --no-deps mace-torch
+```
+
+Intel GPU / XPU PyTorch:
+
+```bash
+uv pip install torch --index-url https://download.pytorch.org/whl/xpu
+uv pip install -e ".[mlip]"
+uv pip install --no-deps mace-torch
+```
+
+For NVIDIA GPU systems, install the CUDA PyTorch wheel appropriate for the
+machine, then run the same `.[mlip]` and `mace-torch --no-deps` steps.
+
+When installing MACE and FAIRChem UMA in the same Python 3.11+ environment,
+install a hardware-appropriate PyTorch build first, install IQC's MLIP runtime
+dependencies, then install `mace-torch` without dependencies so its old
+`e3nn==0.4.4` metadata does not downgrade the newer UMA-compatible `e3nn`
+stack. If PyTorch is already installed correctly for your machine, the MLIP
+steps are:
 
 ```bash
 uv pip install -e ".[mlip]"
@@ -81,6 +110,21 @@ export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
+```
+
+For normal one-process commands, IQC now runs without initializing MPI. This
+avoids PMIx/PMI startup failures when running `iqc` directly on a login or
+compute node. For parallel runs, launch IQC through the system MPI launcher:
+
+```bash
+mpiexec -n 4 iqc --xyz molecules --task single
+```
+
+If a cluster environment exposes broken PMI/PMIx variables for a serial command,
+force serial mode:
+
+```bash
+IQC_DISABLE_MPI=1 iqc --smiles CCC --task opt --calculator uma-s-omol
 ```
 
 See [docs/calculators.md](docs/calculators.md) for calculator names, UMA model

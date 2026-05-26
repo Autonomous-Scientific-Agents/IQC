@@ -733,9 +733,11 @@ def test_mace_uma_dependency_workaround_is_declared():
     root = Path(__file__).resolve().parents[2]
     pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
     env_yml = (root / "env.yml").read_text(encoding="utf-8")
+    base_dependencies = pyproject.split("[project.optional-dependencies]", 1)[0]
 
     assert '"mace-torch"' not in pyproject
     assert '"e3nn>=0.5"' in pyproject
+    assert '"e3nn>=0.5"' not in base_dependencies
     assert "fairchem-core>=2.0" in pyproject
     assert '"pydantic>=2.12,<3"' in pyproject
     assert "torch-dftd" in pyproject

@@ -26,13 +26,13 @@ dependencies = [
     "xlrd",
     "pymatgen",
     "pubchempy",
-    # Keep e3nn unpinned for UMA/fairchem compatibility. MACE metadata pins
-    # e3nn==0.4.4, so install mace-torch separately with --no-deps.
-    "e3nn>=0.5",
 ]
 
 [project.optional-dependencies]
 mlip = [
+    # Keep e3nn unpinned for UMA/fairchem compatibility. MACE metadata pins
+    # e3nn==0.4.4, so install mace-torch separately with --no-deps.
+    "e3nn>=0.5",
     "fairchem-core>=2.0; python_version >= '3.11'",
     "pydantic>=2.12,<3",
     "torch-dftd",

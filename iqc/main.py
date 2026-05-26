@@ -331,12 +331,9 @@ def main():
     from iqc.nmr import run_nmr_workflow
     from iqc.xyztools import count_xyz_frames
 
-    # Initialize MPI only for calculation workflows.
-    from mpi4py import MPI
+    from iqc.mpitools import get_mpi_context, get_start_end
 
-    from iqc.mpitools import get_start_end
-
-    comm = MPI.COMM_WORLD
+    comm, mpi = get_mpi_context()
     rank = comm.Get_rank()
     size = comm.Get_size()
     task = args.task
@@ -531,8 +528,8 @@ def main():
                 if args.skip_existing_from
                 else _default_skip_existing_sources()
             )
-            completed_file_index, skip_index_summary = build_completed_calculation_index(
-                skip_sources
+            completed_file_index, skip_index_summary = (
+                build_completed_calculation_index(skip_sources)
             )
             if db_path or completed_file_index:
                 logging.info(
@@ -543,9 +540,7 @@ def main():
                     skip_index_summary["files"],
                 )
                 if db_path:
-                    logging.info(
-                        "Skip-existing will also check database: %s", db_path
-                    )
+                    logging.info("Skip-existing will also check database: %s", db_path)
             else:
                 logging.info(
                     "Skip-existing enabled, but no database was provided and no "
@@ -1014,11 +1009,9 @@ def main():
     logging.debug(f"Waiting for all processes to finish before combining files.")
     comm.Barrier()
     logging.debug(f"Took { time.time() - barrier_start:.2f} seconds")
-    total_skipped_existing = comm.reduce(skipped_existing, op=MPI.SUM, root=0)
+    total_skipped_existing = comm.reduce(skipped_existing, op=mpi.SUM, root=0)
     if args.skip_existing and rank == 0:
-        logging.info(
-            "Skipped %s existing calculation(s).", total_skipped_existing
-        )
+        logging.info("Skipped %s existing calculation(s).", total_skipped_existing)
 
     if not args.direct_db:
         rank_output_dirs = comm.gather(dir_name, root=0)
@@ -1084,7 +1077,7 @@ def main():
         return 0
 
     else:
-        any_work_dir_used = comm.allreduce(1 if work_dir_used else 0, op=MPI.MAX)
+        any_work_dir_used = comm.allreduce(1 if work_dir_used else 0, op=mpi.MAX)
         comm.Barrier()
         if rank == 0:
             logging.info("Results were saved directly to the database.")
