@@ -33,7 +33,7 @@ Interactive Quantum Chemistry
 
    Or in a single command:
    ```bash
-   uv pip install -e . --python 3.8
+   uv pip install -e . --python 3.12
    ```
 
 ### Option 2: Using Conda
