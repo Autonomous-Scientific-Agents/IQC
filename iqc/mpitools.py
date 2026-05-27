@@ -20,7 +20,6 @@ _MPI_SIZE_ENV_VARS = (
     "OMPI_COMM_WORLD_SIZE",
     "MV2_COMM_WORLD_SIZE",
     "SLURM_NTASKS",
-    "PALS_WORLD_SIZE",
 )
 
 
@@ -97,7 +96,11 @@ def should_initialize_mpi(env=os.environ):
 
     rank = _first_int_env(_MPI_RANK_ENV_VARS, env)
     size = _first_int_env(_MPI_SIZE_ENV_VARS, env)
-    return rank is not None and size is not None and size > 1
+    if size is not None:
+        return rank is not None and size > 1
+    # Some launchers (e.g. Aurora PALS) set a rank var but no global-size var.
+    # A launcher-provided rank is itself proof of a multi-rank launch.
+    return rank is not None
 
 
 def get_mpi_context():

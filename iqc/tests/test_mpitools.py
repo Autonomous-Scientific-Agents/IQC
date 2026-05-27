@@ -58,7 +58,6 @@ def clear_mpi_env(monkeypatch):
         "OMPI_COMM_WORLD_SIZE",
         "MV2_COMM_WORLD_SIZE",
         "SLURM_NTASKS",
-        "PALS_WORLD_SIZE",
         "IQC_DISABLE_MPI",
         "IQC_ENABLE_MPI",
     ]
