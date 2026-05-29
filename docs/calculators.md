@@ -171,6 +171,13 @@ For local `checkpoint_path` loading, IQC routes the supported local predictor
 options `device`, `inference_settings`, `overrides`, `atom_refs`,
 `form_elem_refs`, and `workers` to FAIRChem's `load_predict_unit`.
 
+For UMA, `device` is constrained by FAIRChem, not by PyTorch alone. Even when
+PyTorch is installed with Intel XPU support, current FAIRChem UMA initialization
+accepts `device: cpu` or `device: cuda`; `device: xpu` is rejected before IQC can
+run a calculation. On Intel GPU systems, use the XPU PyTorch wheel to avoid
+NVIDIA packages, but set UMA `device: cpu` unless your FAIRChem version
+explicitly supports XPU.
+
 For `omol`, FAIRChem uses molecular `charge` and spin multiplicity from
 `atoms.info` when present. IQC defaults generated SMILES geometries to neutral
 closed-shell molecules unless your input or workflow supplies different values.

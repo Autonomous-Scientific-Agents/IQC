@@ -484,6 +484,11 @@ UMA_PREDICTOR_KWARGS = {
 }
 UMA_HOSTED_PREDICTOR_KWARGS = UMA_PREDICTOR_KWARGS - {"atom_refs", "form_elem_refs"}
 UMA_LOCAL_PREDICTOR_KWARGS = UMA_PREDICTOR_KWARGS - {"cache_dir", "seed"}
+UMA_SUPPORTED_DEVICES = {"cpu", "cuda"}
+
+
+class CalculatorConfigurationError(RuntimeError):
+    """Raised when calculator parameters are valid YAML but unsupported."""
 
 
 def _parse_uma_calculator_name(name):
@@ -507,8 +512,30 @@ def _parse_uma_calculator_name(name):
     return UMA_DEFAULT_MODEL_BY_SIZE[size], task
 
 
+def _validate_uma_device(kwargs):
+    """Fail early for FAIRChem UMA device values IQC cannot support."""
+
+    if "device" not in kwargs:
+        return
+
+    device = str(kwargs["device"])
+    if device in UMA_SUPPORTED_DEVICES:
+        return
+
+    supported = ", ".join(sorted(UMA_SUPPORTED_DEVICES))
+    raise CalculatorConfigurationError(
+        f"FAIRChem UMA does not support device={device!r} in this IQC path. "
+        f"Use one of: {supported}. On Intel GPU systems, install the XPU "
+        "PyTorch wheel to avoid NVIDIA dependencies, but set UMA "
+        "calculator_params.device to 'cpu' unless your FAIRChem version "
+        "explicitly supports XPU."
+    )
+
+
 def _get_uma_calculator(name, **kwargs):
     """Initialize a FAIRChem UMA calculator with IQC's compact name aliases."""
+
+    _validate_uma_device(kwargs)
 
     from fairchem.core import FAIRChemCalculator, pretrained_mlip
 
@@ -661,6 +688,9 @@ def get_calculator(name="mace", **kwargs):
     elif name.startswith("uma"):
         try:
             calculator = _get_uma_calculator(name, **kwargs)
+        except CalculatorConfigurationError as e:
+            logging.error(str(e))
+            raise RuntimeError(str(e)) from e
         except ImportError as e:
             logging.warning(
                 "FAIRChem UMA calculator import failed: %s. Install fairchem-core "
