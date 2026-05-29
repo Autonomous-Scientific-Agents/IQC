@@ -1,19 +1,19 @@
+import glob
 import json
 import logging
 import os
 import pickle
 import re
 import sys
-import glob
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-import yaml  # Import YAML
+
 import numpy as np
-import time
+import yaml  # Import YAML
 
 from iqc.cli import get_args
-
 from iqc.databasetools import (
     calculation_exists,
     calculation_key,
@@ -54,15 +54,25 @@ def _unique_child_path(parent, child_name):
     return os.path.abspath(os.path.expanduser(str(candidate)))
 
 
+def _rank_output_parent(cwd="."):
+    """Return the directory that contains per-rank tmp_* result directories."""
+
+    return Path(cwd).expanduser() / "tmp"
+
+
 def _default_skip_existing_sources(cwd="."):
     """Return default IQC result files to scan for completed calculations."""
 
     root = Path(cwd).expanduser()
     sources = list(root.glob("iqc_*_results_*.jsonl"))
-    for tmp_dir in root.glob("tmp_*"):
-        if tmp_dir.is_dir():
-            sources.extend(tmp_dir.glob("*.json"))
-    return sorted(sources)
+    tmp_parents = [root, _rank_output_parent(root)]
+    for tmp_parent in tmp_parents:
+        if not tmp_parent.is_dir():
+            continue
+        for tmp_dir in tmp_parent.glob("tmp_*"):
+            if tmp_dir.is_dir():
+                sources.extend(tmp_dir.glob("*.json"))
+    return sorted(set(sources))
 
 
 def _candidate_result_files(source):
@@ -224,6 +234,21 @@ def insert_jsonl_to_db(jsonl_file, db_path):
     )
 
 
+def convert_jsonl_results_to_parquet(jsonl_file):
+    """Convert a completed IQC JSONL result file to parquet."""
+
+    from scripts.jsonl2parquet import (
+        convert_jsonl_to_parquet,
+        infer_output_path,
+    )
+
+    jsonl_path = Path(jsonl_file)
+    parquet_path = infer_output_path(jsonl_path)
+    convert_jsonl_to_parquet(str(jsonl_path), str(parquet_path))
+    logging.info(f"Parquet results saved to {parquet_path}")
+    return parquet_path
+
+
 def get_nmr_cli_overrides(args):
     """Collect NMR-specific CLI overrides."""
 
@@ -316,22 +341,21 @@ def main():
     asepar.world = asepar.DummyMPI()
 
     from iqc.asetools import (
-        run_optimization,
+        atoms2xyz,
+        get_ase_version,
+        get_atoms_from_smiles,
+        get_atoms_from_xyz,
+        get_calculator,
         run_ir,
         run_ir_thermo,
+        run_optimization,
         run_single_point,
         run_thermo,
         run_vibrations,
-        get_atoms_from_xyz,
-        get_atoms_from_smiles,
-        atoms2xyz,
-        get_calculator,
-        get_ase_version,
     )
+    from iqc.mpitools import get_mpi_context, get_start_end
     from iqc.nmr import run_nmr_workflow
     from iqc.xyztools import count_xyz_frames
-
-    from iqc.mpitools import get_mpi_context, get_start_end
 
     comm, mpi = get_mpi_context()
     rank = comm.Get_rank()
@@ -565,7 +589,9 @@ def main():
 
         nonlocal dir_name
         if dir_name is None:
-            dir_name = _unique_child_path(".", f"tmp_{task}_{rank}_{run_id}")
+            dir_name = _unique_child_path(
+                _rank_output_parent(), f"tmp_{task}_{rank}_{run_id}"
+            )
             logging.debug(f"Creating directory: {dir_name}")
             os.makedirs(dir_name, exist_ok=True)
         return dir_name
@@ -1054,6 +1080,16 @@ def main():
                 f"Finished combining JSON files in {combine_end - combine_start:.2f} seconds"
             )
             logging.info(f"Combined results saved to {jsonl_file}")
+            try:
+                convert_jsonl_results_to_parquet(jsonl_file)
+            except ValueError as e:
+                logging.warning(f"Skipping parquet conversion: {e}")
+            except Exception as e:
+                logging.error(
+                    f"Failed to convert JSONL results to parquet: {e}",
+                    exc_info=True,
+                )
+                comm.Abort(1)
             logging.info(f"Total time: {time.time() - start_time} seconds.")
 
         # Wait for rank 0 to finish creating the JSONL file

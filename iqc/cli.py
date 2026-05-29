@@ -204,7 +204,7 @@ def get_args(argv=None):
         help=(
             "IQC result JSON/JSONL files or directories to scan when "
             "--skip-existing is enabled. If omitted, IQC scans current "
-            "directory result JSONL files and tmp_* result directories."
+            "directory result JSONL files and tmp/tmp_* result directories."
         ),
     )
     parser.add_argument(

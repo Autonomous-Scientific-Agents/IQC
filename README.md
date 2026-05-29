@@ -422,7 +422,8 @@ iqc --xyz molecules --task single --skip-existing \
 
 If `--skip-existing-from` is omitted, IQC scans combined
 `iqc_*_results_*.jsonl` files in the current directory and per-rank JSON files
-under `tmp_*` result directories.
+under `tmp/tmp_*` result directories. Older top-level `tmp_*` result directories
+are also indexed.
 
 ## NMR Workflow
 

@@ -1,11 +1,15 @@
 import json
 
+import pyarrow.parquet as pq
+
 from iqc.databasetools import calculation_key_from_record
 from iqc.main import (
     _default_skip_existing_sources,
     _make_run_id,
+    _rank_output_parent,
     _unique_child_path,
     build_completed_calculation_index,
+    convert_jsonl_results_to_parquet,
 )
 
 
@@ -37,6 +41,10 @@ def test_unique_child_path_adds_suffix_for_existing_path(tmp_path):
     assert path == str(tmp_path / "tmp_single_0_run_1")
 
 
+def test_rank_output_parent_is_current_directory_tmp(tmp_path):
+    assert _rank_output_parent(tmp_path) == tmp_path / "tmp"
+
+
 def test_make_run_id_has_timestamp_and_random_suffix():
     run_id = _make_run_id()
     stamp, token = run_id.rsplit("_", 1)
@@ -50,14 +58,22 @@ def test_make_run_id_has_timestamp_and_random_suffix():
 def test_default_skip_existing_sources_finds_iqc_result_files(tmp_path):
     combined = tmp_path / "iqc_single_results_20260101_000000_abcd1234.jsonl"
     combined.write_text("", encoding="utf-8")
-    tmp_dir = tmp_path / "tmp_single_0_20260101_000000_abcd1234"
-    tmp_dir.mkdir()
-    per_rank = tmp_dir / "water_single_20260101_000001_0.json"
-    per_rank.write_text("{}", encoding="utf-8")
+    old_tmp_dir = tmp_path / "tmp_single_0_20260101_000000_abcd1234"
+    old_tmp_dir.mkdir()
+    old_per_rank = old_tmp_dir / "water_single_20260101_000001_0.json"
+    old_per_rank.write_text("{}", encoding="utf-8")
+    new_tmp_dir = tmp_path / "tmp" / "tmp_single_1_20260101_000000_abcd1234"
+    new_tmp_dir.mkdir(parents=True)
+    new_per_rank = new_tmp_dir / "methane_single_20260101_000001_1.json"
+    new_per_rank.write_text("{}", encoding="utf-8")
     ignored = tmp_path / "other.json"
     ignored.write_text("{}", encoding="utf-8")
 
-    assert _default_skip_existing_sources(tmp_path) == [combined, per_rank]
+    assert _default_skip_existing_sources(tmp_path) == [
+        combined,
+        new_per_rank,
+        old_per_rank,
+    ]
 
 
 def test_build_completed_calculation_index_reads_json_and_jsonl(tmp_path):
@@ -82,3 +98,25 @@ def test_build_completed_calculation_index_reads_json_and_jsonl(tmp_path):
     assert calculation_key_from_record(record_from_json) in index
     assert calculation_key_from_record(record_from_jsonl) in index
     assert summary == {"sources": 2, "files": 2, "records": 2, "invalid": 2}
+
+
+def test_convert_jsonl_results_to_parquet_writes_neighbor_file(tmp_path):
+    jsonl_file = tmp_path / "iqc_single_results_20260101_000000_abcd1234.jsonl"
+    jsonl_file.write_text(
+        "\n".join(
+            [
+                json.dumps({"id": 1, "task": "single", "energy_eV": -1.0}),
+                json.dumps({"id": 2, "task": "single", "energy_eV": -2.0}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    parquet_file = convert_jsonl_results_to_parquet(jsonl_file)
+    table = pq.read_table(parquet_file)
+
+    expected_file = tmp_path / "iqc_single_results_20260101_000000_abcd1234.parquet"
+    assert parquet_file == expected_file
+    assert table.num_rows == 2
+    assert table.column_names == ["id", "task", "energy_eV"]
