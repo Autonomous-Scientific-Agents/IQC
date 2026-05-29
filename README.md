@@ -106,7 +106,9 @@ loader, which is not part of the current PyPI `mace-torch` release. Install MACE
 from the upstream `main` branch and install `graph_electrostatics` so the
 `graph_longrange` module is available. IQC defaults this calculator to
 `model: polar-1-m`, `device: cpu`, and `default_dtype: float64`; override those
-under `calculator_params` if needed.
+under `calculator_params` if needed. For the large checkpoint, set
+`model: polar-1-l`, or pass a shared local checkpoint path in
+`calculator_params.model` to avoid repeated downloads in MPI jobs.
 
 On shared HPC systems, limit BLAS/OpenMP threads before importing NumPy,
 PyTorch, MACE, or FAIRChem. Otherwise OpenBLAS may try to create one thread

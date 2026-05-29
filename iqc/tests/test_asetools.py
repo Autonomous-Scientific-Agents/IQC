@@ -40,6 +40,7 @@ from iqc.asetools import (
     run_thermo,
     _get_uma_calculator,
     _get_mace_polar_calculator,
+    _ensure_mace_polar_model_cached,
     _normalize_calculator_compatibility,
     _patch_e3nn_activation_legacy_state,
     _patch_e3nn_codegen_legacy_state,
@@ -513,10 +514,13 @@ def test_get_calculator_mace_unavailable_fallback():
             pytest.skip("Neither MACE nor EMT fallback available.")
 
 
-def test_get_mace_polar_calculator_uses_mace_polar_loader():
+def test_get_mace_polar_calculator_uses_mace_polar_loader(monkeypatch):
     """MACE-Polar should call the Electrostatic MACE loader and expose dipoles."""
 
     calls = {}
+    monkeypatch.setattr(
+        "iqc.asetools._ensure_mace_polar_model_cached", lambda model: None
+    )
 
     class FakePolarCalculator(Calculator):
         implemented_properties = ["energy", "forces"]
@@ -545,6 +549,31 @@ def test_get_mace_polar_calculator_uses_mace_polar_loader():
     assert calculator.model_name == "polar-1-l"
     assert calculator._iqc_spin_charge_convention == "mace_polar"
     assert "dipole" in calculator.implemented_properties
+
+
+def test_mace_polar_model_prefetch_uses_cache_lock(tmp_path, monkeypatch):
+    """Only the first rank/process should download a missing Polar checkpoint."""
+
+    cache_path = tmp_path / "MACEPOLAR1Lmodel"
+    calls = []
+
+    def fake_download(model):
+        calls.append(model)
+        cache_path.write_text("model", encoding="utf-8")
+        return str(cache_path)
+
+    monkeypatch.setattr(
+        "iqc.asetools._mace_polar_cached_model_path", lambda model: cache_path
+    )
+    monkeypatch.setattr(
+        "iqc.asetools._download_mace_polar_checkpoint", fake_download
+    )
+
+    _ensure_mace_polar_model_cached("polar-1-l")
+    _ensure_mace_polar_model_cached("polar-1-l")
+
+    assert calls == ["polar-1-l"]
+    assert cache_path.exists()
 
 
 def test_normalize_calculator_exposes_sumcalculator_calcs():

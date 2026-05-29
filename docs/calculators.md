@@ -115,6 +115,26 @@ calculator_params:
   default_dtype: float64
 ```
 
+Use `model: polar-1-l` for the large checkpoint. In MPI runs, IQC serializes
+the first checkpoint download with a file lock, but a shared pre-cached model
+is still more robust on clusters where compute nodes have limited internet
+access:
+
+```bash
+mkdir -p /path/to/shared/mace-models
+curl -L \
+  https://github.com/ACEsuit/mace-foundations/releases/download/mace_polar_1/MACE-POLAR-1-L.model \
+  -o /path/to/shared/mace-models/MACE-POLAR-1-L.model
+```
+
+```yaml
+calculator: mace-polar
+calculator_params:
+  model: /path/to/shared/mace-models/MACE-POLAR-1-L.model
+  device: cpu
+  default_dtype: float64
+```
+
 IQC passes total molecular charge and spin to MACE-Polar through `atoms.info`.
 MACE-Polar's `spin` input is total spin S, so IQC translates its public
 `--multiplicity` convention before calculation. When MACE-Polar exposes them,

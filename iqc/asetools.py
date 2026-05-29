@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 import numpy as np
@@ -433,6 +434,105 @@ def _orca_failure_context(calculator):
 
 
 MACE_POLAR_DEFAULT_MODEL = "polar-1-m"
+MACE_POLAR_MODEL_URLS = {
+    "polar-1-s": "https://github.com/ACEsuit/mace-foundations/releases/download/mace_polar_1/MACE-POLAR-1-S.model",
+    "polar-1-m": "https://github.com/ACEsuit/mace-foundations/releases/download/mace_polar_1/MACE-POLAR-1-M.model",
+    "polar-1-l": "https://github.com/ACEsuit/mace-foundations/releases/download/mace_polar_1/MACE-POLAR-1-L.model",
+}
+
+
+def _default_mace_cache_dir():
+    """Return MACE's checkpoint cache directory without requiring a new MACE API."""
+
+    try:
+        from mace.tools.utils import get_cache_dir
+
+        return Path(get_cache_dir()).expanduser()
+    except Exception:
+        cache_home = os.environ.get("XDG_CACHE_HOME")
+        if cache_home:
+            return Path(cache_home).expanduser() / "mace"
+        return Path.home().expanduser() / ".cache" / "mace"
+
+
+def _mace_polar_cache_name(checkpoint_url):
+    """Match MACE's sanitized checkpoint cache filename convention."""
+
+    return "".join(
+        c for c in os.path.basename(str(checkpoint_url)) if c.isalnum() or c in "_"
+    )
+
+
+def _mace_polar_cached_model_path(model):
+    """Return the cached checkpoint path for a MACE-Polar model key or URL."""
+
+    model = str(model)
+    try:
+        from mace.calculators import foundations_models
+
+        polar_model_paths = getattr(foundations_models, "polar_model_paths", {})
+        cached_path = polar_model_paths.get(model)
+        if cached_path is not None:
+            return Path(cached_path).expanduser()
+    except Exception:
+        pass
+
+    checkpoint_url = MACE_POLAR_MODEL_URLS.get(model)
+    if checkpoint_url is None and model.startswith("https:"):
+        checkpoint_url = model
+    if checkpoint_url is None:
+        return None
+    return _default_mace_cache_dir() / _mace_polar_cache_name(checkpoint_url)
+
+
+def _download_mace_polar_checkpoint(model):
+    """Download or locate a MACE-Polar checkpoint using MACE's own resolver."""
+
+    from mace.calculators import foundations_models
+
+    return foundations_models.download_mace_polar_checkpoint(model)
+
+
+@contextmanager
+def _file_lock(lock_path):
+    """Advisory lock used to serialize first-time checkpoint downloads."""
+
+    lock_path = Path(lock_path).expanduser()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w", encoding="utf-8") as lock_file:
+        try:
+            import fcntl
+        except ImportError:
+            yield
+            return
+
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _ensure_mace_polar_model_cached(model):
+    """Avoid MPI download races by prefetching a missing checkpoint under a lock."""
+
+    cached_path = _mace_polar_cached_model_path(model)
+    if cached_path is None or Path(str(model)).expanduser().exists():
+        return
+    if cached_path.exists():
+        return
+
+    lock_path = cached_path.with_name(f"{cached_path.name}.iqc-download.lock")
+    logging.info(
+        "Waiting for MACE-Polar checkpoint cache lock: %s", lock_path
+    )
+    with _file_lock(lock_path):
+        if cached_path.exists():
+            return
+        logging.info(
+            "Caching MACE-Polar checkpoint '%s' at %s", model, cached_path
+        )
+        _download_mace_polar_checkpoint(model)
 
 
 def _enable_mace_polar_metadata(calculator, model_name):
@@ -461,6 +561,7 @@ def _get_mace_polar_calculator(**kwargs):
         **kwargs,
     }
     model_name = polar_kwargs["model"]
+    _ensure_mace_polar_model_cached(model_name)
     calculator = mace_polar(**polar_kwargs)
     _enable_mace_polar_metadata(calculator, model_name)
     logging.info(f"Using MACE-Polar calculator with arguments: {polar_kwargs}")
