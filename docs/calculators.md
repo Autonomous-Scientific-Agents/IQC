@@ -5,6 +5,7 @@ IQC can use ASE calculators through `--calculator`.
 Supported calculator names:
 
 - `mace`: MACE Materials Project foundation model
+- `mace-polar`: Electrostatic MACE / MACE-Polar foundation model
 - `xtb`: GFN2-xTB through `xtb-python`
 - `emt`: ASE EMT fallback calculator
 - `orca`: ORCA via ASE's wrapper; needs the ORCA executable on PATH or in
@@ -18,6 +19,7 @@ Examples:
 
 ```bash
 iqc --xyz molecule.xyz --calculator mace --task opt
+iqc --xyz molecule.xyz --calculator mace-polar --task single
 iqc --xyz molecule.xyz --calculator uma-s-omol --task single
 iqc --xyz bulk.xyz --calculator uma-m-omat --task opt
 iqc --xyz molecule.xyz --calculator orca --task ir --params orca_params.yaml
@@ -98,6 +100,28 @@ print("fairchem-core", version("fairchem-core"))
 PY
 ```
 
+## MACE-Polar Parameters
+
+`mace-polar` uses `mace.calculators.mace_polar`, which currently requires MACE
+from the upstream `main` branch rather than the PyPI `mace-torch` release. It
+also requires `graph_electrostatics`, which provides the `graph_longrange`
+runtime module.
+
+```yaml
+calculator: mace-polar
+calculator_params:
+  model: polar-1-m
+  device: cpu
+  default_dtype: float64
+```
+
+IQC passes total molecular charge and spin to MACE-Polar through `atoms.info`.
+MACE-Polar's `spin` input is total spin S, so IQC translates its public
+`--multiplicity` convention before calculation. When MACE-Polar exposes them,
+IQC stores `dipole`, `partial_charges`, `partial_dipoles`,
+`density_coefficients`, `spin_charge_density`, and spin-channel partial charges
+in JSON/JSONL/Parquet results.
+
 UMA checkpoints are gated Hugging Face assets. Before using a UMA calculator,
 request access to the UMA model repository and log in:
 
@@ -174,11 +198,11 @@ Constraints:
 
 - The dipole calculator must declare `'dipole'` in its
   `implemented_properties`. Of the built-in calculator names exposed via
-  `--calculator` (`mace`, `xtb`, `emt`, `orca`, `uma*`), only `xtb` and
-  `orca` qualify. MACE, EMT, and the UMA models cannot be used as the
-  dipole calculator. Asking for one in `--calculator` for an `ir` task —
-  or via the per-role override — produces an immediate error rather than
-  a cryptic "dipole property not implemented" deep inside ASE.
+  `--calculator` (`mace`, `mace-polar`, `xtb`, `emt`, `orca`, `uma*`), `xtb`,
+  `orca`, and `mace-polar` qualify. MACE, EMT, and the UMA models cannot be
+  used as the dipole calculator. Asking for one in `--calculator` for an `ir`
+  task, or via the per-role override, produces an immediate error rather than a
+  cryptic "dipole property not implemented" deep inside ASE.
 - The CLI rejects unknown names in the IR per-role overrides instead of
   silently falling back to MACE (the behavior of `get_calculator` for the
   main `--calculator` flag). To use a calculator that IQC does not register,

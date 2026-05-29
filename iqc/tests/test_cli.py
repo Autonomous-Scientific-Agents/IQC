@@ -23,6 +23,12 @@ def test_calculator_cli_option_overrides_params_file():
     assert args.calculator == "uma-s-omol"
 
 
+def test_mace_polar_calculator_option_is_supported():
+    args = get_args(["--calculator", "mace-polar"])
+
+    assert args.calculator == "mace-polar"
+
+
 def test_skip_existing_options_are_parsed():
     args = get_args(["--skip-existing", "--skip-existing-from", "old.jsonl"])
 

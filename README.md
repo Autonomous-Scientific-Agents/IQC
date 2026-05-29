@@ -101,6 +101,13 @@ python -m pip install --no-deps mace-torch
 python -m pip install -e .
 ```
 
+MACE-Polar support (`--calculator mace-polar`) requires the Electrostatic MACE
+loader, which is not part of the current PyPI `mace-torch` release. Install MACE
+from the upstream `main` branch and install `graph_electrostatics` so the
+`graph_longrange` module is available. IQC defaults this calculator to
+`model: polar-1-m`, `device: cpu`, and `default_dtype: float64`; override those
+under `calculator_params` if needed.
+
 On shared HPC systems, limit BLAS/OpenMP threads before importing NumPy,
 PyTorch, MACE, or FAIRChem. Otherwise OpenBLAS may try to create one thread
 per visible CPU and fail with `pthread_create failed`:
@@ -215,13 +222,14 @@ Use `--calculator` to choose the ASE calculator for `single`, `opt`, `vib`,
 ```bash
 iqc --xyz molecule.xyz --calculator mace --task opt
 iqc --xyz molecule.xyz --calculator uma-s-omol --task single
+iqc --xyz molecule.xyz --calculator mace-polar --task single
 ```
 
-Supported names are `mace`, `xtb`, `emt`, `orca`, `uma`, `uma-s-omol`,
-`uma-s-omat`, `uma-s-odac`, `uma-m-omol`, `uma-m-omat`, and `uma-m-odac`.
-`uma` is an alias for `uma-s-omol`. `orca` requires the ORCA executable on
-PATH (or set `ASE_ORCA_COMMAND`, or pass `command:` under `calculator_params`
-in `--params`).
+Supported names are `mace`, `mace-polar`, `xtb`, `emt`, `orca`, `uma`,
+`uma-s-omol`, `uma-s-omat`, `uma-s-odac`, `uma-m-omol`, `uma-m-omat`, and
+`uma-m-odac`. `uma` is an alias for `uma-s-omol`. `orca` requires the ORCA
+executable on PATH (or set `ASE_ORCA_COMMAND`, or pass `command:` under
+`calculator_params` in `--params`).
 
 ## IR Workflow
 
@@ -234,9 +242,10 @@ enough for forces but you want a more accurate electronic-structure method
 for dipoles.
 
 **Dipole support matters.** The dipole calculator must declare `'dipole'` in
-its `implemented_properties`. Of the built-in `--calculator` options, `xtb`
-and `orca` do. MACE, EMT, and the UMA models do not, so they cannot be used
-as the dipole calculator and cannot drive a single-calculator IR run.
+its `implemented_properties`. Of the built-in `--calculator` options, `xtb`,
+`orca`, and `mace-polar` do. Regular MACE, EMT, and the UMA models do not, so
+they cannot be used as the dipole calculator and cannot drive a
+single-calculator IR run.
 
 ### Single calculator
 
@@ -249,7 +258,8 @@ iqc --task ir --xyz molecule.xyz --calculator xtb
 
 `--calculator mace` (or `emt`, or any UMA model) will fail at the IR analysis
 step with a clear error explaining that the calculator does not implement the
-`'dipole'` property.
+`'dipole'` property. `--calculator mace-polar` can be used for IR if your MACE
+installation includes the Electrostatic MACE loader.
 
 To compute both IR intensities and thermochemistry without repeating the
 optimization and Hessian calculation, use the composite `ir-thermo` task:
@@ -266,9 +276,9 @@ finite-difference run.
 
 Per-role calculators are configured through the YAML param file passed with
 `--params`. Any role left unset falls back to `--calculator`. Calculator names
-use the same vocabulary as `--calculator` (`mace`, `xtb`, `emt`, `orca`,
-`uma`, `uma-s-*`, `uma-m-*`); unknown names are rejected up-front instead of
-silently falling back.
+use the same vocabulary as `--calculator` (`mace`, `mace-polar`, `xtb`, `emt`,
+`orca`, `uma`, `uma-s-*`, `uma-m-*`); unknown names are rejected up-front
+instead of silently falling back.
 
 A practical mixed workflow uses a fast MLIP for the expensive Hessian and a
 DFT calculator for accurate dipoles. ORCA-specific options

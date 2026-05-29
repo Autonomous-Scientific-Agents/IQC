@@ -144,6 +144,7 @@ def get_args(argv=None):
         type=str,
         choices=[
             "mace",
+            "mace-polar",
             "xtb",
             "emt",
             "orca",

@@ -39,6 +39,7 @@ from iqc.asetools import (
     run_vibrations,
     run_thermo,
     _get_uma_calculator,
+    _get_mace_polar_calculator,
     _normalize_calculator_compatibility,
     _patch_e3nn_activation_legacy_state,
     _patch_e3nn_codegen_legacy_state,
@@ -146,6 +147,8 @@ def test_get_spin(water_atoms, methane_atoms):
 def test_get_multiplicity(water_atoms):
     """Defaults to electron-count parity, override with explicit value."""
     assert get_multiplicity(water_atoms) == 1  # singlet
+    assert get_multiplicity(water_atoms, charge=1) == 2  # cation doublet
+    assert get_spin(water_atoms, charge=1) == 0.5
     oh_radical = Atoms("OH", positions=[[0, 0, 0], [0, 0, 1]])
     assert get_multiplicity(oh_radical) == 2  # doublet
     # Triplet override on a closed-shell parity molecule (e.g. O2)
@@ -183,6 +186,20 @@ def test_apply_spin_charge_fairchem_convention():
     assert atoms.info["spin"] == 3  # triplet multiplicity
 
 
+def test_apply_spin_charge_mace_polar_convention():
+    """MACE-Polar reads charge and total spin S from atoms.info."""
+
+    class FakeMACEPolar:
+        _iqc_spin_charge_convention = "mace_polar"
+
+    atoms = Atoms("O2", positions=[[0, 0, 0], [0, 0, 1.2]])
+    apply_spin_charge(atoms, FakeMACEPolar(), multiplicity=3, charge=-1)
+
+    assert atoms.info["charge"] == -1
+    assert atoms.info["spin"] == 1.0
+    assert atoms.info["external_field"] == [0.0, 0.0, 0.0]
+
+
 def test_apply_spin_charge_orca_convention():
     """ORCA reads molecular charge/multiplicity from calculator parameters."""
 
@@ -196,6 +213,49 @@ def test_apply_spin_charge_orca_convention():
 
     assert calc.parameters["charge"] == -1
     assert calc.parameters["mult"] == 2
+
+
+def test_run_single_point_stores_mace_polar_observables(water_atoms):
+    """MACE-Polar result arrays should be serialized into IQC records."""
+
+    class PolarLikeCalculator(Calculator):
+        implemented_properties = ["energy", "forces", "dipole"]
+
+        def calculate(
+            self, atoms=None, properties=("energy",), system_changes=all_changes
+        ):
+            super().calculate(atoms, properties, system_changes)
+            n_atoms = len(self.atoms)
+            self.results["energy"] = -1.23
+            self.results["forces"] = np.zeros((n_atoms, 3))
+            self.results["dipole"] = np.array([1.0, 2.0, 3.0])
+            self.results["density_coefficients"] = np.array(
+                [
+                    [0.2, 0.3, 0.4, 0.5],
+                    [-0.1, -0.2, -0.3, -0.4],
+                    [-0.1, -0.1, -0.1, -0.1],
+                ]
+            )
+            self.results["spin_charge_density"] = np.array(
+                [
+                    [[0.15, 0, 0, 0], [0.05, 0, 0, 0]],
+                    [[-0.05, 0, 0, 0], [-0.05, 0, 0, 0]],
+                    [[-0.02, 0, 0, 0], [-0.08, 0, 0, 0]],
+                ]
+            )
+
+    _, results = run_single_point(water_atoms, calculator=PolarLikeCalculator())
+
+    assert results["dipole"] == [1.0, 2.0, 3.0]
+    assert results["partial_charges"] == [0.2, -0.1, -0.1]
+    assert results["partial_dipoles"] == [
+        [0.5, 0.3, 0.4],
+        [-0.4, -0.2, -0.3],
+        [-0.1, -0.1, -0.1],
+    ]
+    assert results["partial_spin_up_charges"] == [0.15, -0.05, -0.02]
+    assert results["partial_spin_down_charges"] == [0.05, -0.05, -0.08]
+    assert results["partial_spin_charges"] == pytest.approx([0.1, 0.0, 0.06])
 
 
 def test_run_single_point_keeps_energy_when_forces_missing(water_atoms):
@@ -450,6 +510,40 @@ def test_get_calculator_mace_unavailable_fallback():
         except ImportError:
             # This could happen if EMT also fails to import
             pytest.skip("Neither MACE nor EMT fallback available.")
+
+
+def test_get_mace_polar_calculator_uses_mace_polar_loader():
+    """MACE-Polar should call the Electrostatic MACE loader and expose dipoles."""
+
+    calls = {}
+
+    class FakePolarCalculator(Calculator):
+        implemented_properties = ["energy", "forces"]
+
+    def fake_mace_polar(**kwargs):
+        calls.update(kwargs)
+        return FakePolarCalculator()
+
+    mace_calculators_module = types.ModuleType("mace.calculators")
+    mace_calculators_module.mace_polar = fake_mace_polar
+    mace_module = types.ModuleType("mace")
+    mace_module.calculators = mace_calculators_module
+
+    with patch.dict(
+        sys.modules,
+        {
+            "mace": mace_module,
+            "mace.calculators": mace_calculators_module,
+        },
+    ):
+        calculator = _get_mace_polar_calculator(model="polar-1-l", device="cuda")
+
+    assert calls["model"] == "polar-1-l"
+    assert calls["device"] == "cuda"
+    assert calls["default_dtype"] == "float64"
+    assert calculator.model_name == "polar-1-l"
+    assert calculator._iqc_spin_charge_convention == "mace_polar"
+    assert "dipole" in calculator.implemented_properties
 
 
 def test_normalize_calculator_exposes_sumcalculator_calcs():

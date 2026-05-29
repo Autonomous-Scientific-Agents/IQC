@@ -432,6 +432,41 @@ def _orca_failure_context(calculator):
     return "\n" + "\n".join(parts) if len(parts) > 1 else "\n" + parts[0]
 
 
+MACE_POLAR_DEFAULT_MODEL = "polar-1-m"
+
+
+def _enable_mace_polar_metadata(calculator, model_name):
+    """Tag a MACE-Polar calculator with IQC-specific behavior hints."""
+
+    calculator.model_name = model_name
+    calculator._iqc_spin_charge_convention = "mace_polar"
+    calculator._iqc_calculator_family = "mace-polar"
+
+    implemented = getattr(calculator, "implemented_properties", None)
+    if implemented is not None and "dipole" not in implemented:
+        calculator.implemented_properties = list(implemented) + ["dipole"]
+    return calculator
+
+
+def _get_mace_polar_calculator(**kwargs):
+    """Initialize the MACE-Polar ASE calculator when the loader is available."""
+
+    _patch_e3nn_mace_compatibility()
+    from mace.calculators import mace_polar
+
+    polar_kwargs = {
+        "model": MACE_POLAR_DEFAULT_MODEL,
+        "default_dtype": "float64",
+        "device": "cpu",
+        **kwargs,
+    }
+    model_name = polar_kwargs["model"]
+    calculator = mace_polar(**polar_kwargs)
+    _enable_mace_polar_metadata(calculator, model_name)
+    logging.info(f"Using MACE-Polar calculator with arguments: {polar_kwargs}")
+    return calculator
+
+
 UMA_DEFAULT_MODEL_BY_SIZE = {
     "s": "uma-s-1p2",
     "m": "uma-m-1p1",
@@ -534,8 +569,8 @@ def get_calculator(name="mace", **kwargs):
     """Initializes and returns the specified ASE calculator.
 
     Args:
-        name (str): The name of the calculator ('mace', 'xtb', 'emt', 'uma',
-                    'uma-s-omol', 'uma-s-omat', 'uma-s-odac',
+        name (str): The name of the calculator ('mace', 'mace-polar', 'xtb',
+                    'emt', 'uma', 'uma-s-omol', 'uma-s-omat', 'uma-s-odac',
                     'uma-m-omol', 'uma-m-omat', or 'uma-m-odac').
         **kwargs: Additional keyword arguments passed to the calculator constructor.
 
@@ -579,6 +614,22 @@ def get_calculator(name="mace", **kwargs):
             )
         except RuntimeError as e:
             logging.warning(f"MACE initialization failed: {e}. Falling back to EMT.")
+
+    elif name == "mace-polar":
+        try:
+            calculator = _get_mace_polar_calculator(**kwargs)
+        except ImportError as e:
+            message = (
+                f"MACE-Polar could not be imported: {e}. Electrostatic MACE "
+                "requires MACE from the latest main branch and "
+                "graph_electrostatics/graph_longrange."
+            )
+            logging.error(message)
+            raise RuntimeError(message) from e
+        except Exception as e:
+            message = f"MACE-Polar initialization failed: {e}"
+            logging.error(message)
+            raise RuntimeError(message) from e
 
     elif name == "xtb":
         try:
@@ -1405,36 +1456,38 @@ def get_total_electrons(atoms):
     return total_electrons
 
 
-def get_multiplicity(atoms, multiplicity=None):
+def get_multiplicity(atoms, multiplicity=None, charge=0):
     """Resolve spin multiplicity (2S+1, integer >= 1).
 
     Defaults to 2 for an odd electron count (doublet), 1 for an even count
-    (singlet). Pass an explicit `multiplicity` to override (e.g. 3 for
-    triplet O2).
+    (singlet), after applying the total molecular charge. Pass an explicit
+    `multiplicity` to override (e.g. 3 for triplet O2).
     """
     if multiplicity is None:
-        return 2 if get_total_electrons(atoms) % 2 else 1
+        electron_count = get_total_electrons(atoms) - int(charge)
+        return 2 if electron_count % 2 else 1
     multiplicity = int(multiplicity)
     if multiplicity < 1:
         raise ValueError(f"multiplicity must be >= 1, got {multiplicity}")
     return multiplicity
 
 
-def get_spin(atoms, multiplicity=None):
+def get_spin(atoms, multiplicity=None, charge=0):
     """Return total spin S = (multiplicity - 1) / 2 (ASE thermo convention).
 
-    If `multiplicity` is None, defaults from electron count parity (singlet
-    for even, doublet for odd).
+    If `multiplicity` is None, defaults from charged electron count parity
+    (singlet for even, doublet for odd).
 
     Args:
         atoms: ASE Atoms object
         multiplicity (int, optional): Spin multiplicity 2S+1. When provided,
             overrides the parity-based default (e.g. for triplet O2 pass 3).
+        charge (int): Total molecular charge used only for defaulting.
 
     Returns:
         float: Spin S (e.g. 0.0 for singlet, 0.5 for doublet, 1.0 for triplet).
     """
-    return (get_multiplicity(atoms, multiplicity) - 1) / 2.0
+    return (get_multiplicity(atoms, multiplicity, charge=charge) - 1) / 2.0
 
 
 def apply_spin_charge(atoms, calculator, multiplicity=None, charge=0):
@@ -1452,16 +1505,20 @@ def apply_spin_charge(atoms, calculator, multiplicity=None, charge=0):
       - FAIRChem UMA (`fairchem.core.FAIRChemCalculator`): reads
         `atoms.info["charge"]` and `atoms.info["spin"]` where its `spin` is
         the spin multiplicity. We set `atoms.info["spin"] = multiplicity`.
+      - MACE-Polar (`mace.calculators.mace_polar`): reads
+        `atoms.info["charge"]` and `atoms.info["spin"]`; its spin input is
+        the total spin S, so we set `atoms.info["spin"] = (multiplicity-1)/2`.
       - MACE (`MACECalculator` from mace_mp) and ASE EMT: no spin/charge
         support; a warning is logged if non-default values are requested.
 
     Returns:
         int: Resolved multiplicity that was applied (after defaulting).
     """
-    multiplicity = get_multiplicity(atoms, multiplicity)
-    unpaired = multiplicity - 1
     charge = int(charge)
+    multiplicity = get_multiplicity(atoms, multiplicity, charge=charge)
+    unpaired = multiplicity - 1
     calc_class = type(calculator).__name__
+    spin_charge_convention = getattr(calculator, "_iqc_spin_charge_convention", "")
     n = len(atoms)
 
     if calc_class == "XTB":
@@ -1475,13 +1532,17 @@ def apply_spin_charge(atoms, calculator, multiplicity=None, charge=0):
     elif calc_class == "FAIRChemCalculator":
         atoms.info["charge"] = charge
         atoms.info["spin"] = multiplicity
+    elif spin_charge_convention == "mace_polar":
+        atoms.info["charge"] = charge
+        atoms.info["spin"] = get_spin(atoms, multiplicity, charge=charge)
+        atoms.info.setdefault("external_field", [0.0, 0.0, 0.0])
     elif calc_class == "ORCA":
         parameters = getattr(calculator, "parameters", None)
         if parameters is not None:
             parameters["charge"] = charge
             parameters["mult"] = multiplicity
     elif calc_class in {"MACECalculator", "EMT"}:
-        default_mult = 2 if get_total_electrons(atoms) % 2 else 1
+        default_mult = get_multiplicity(atoms, charge=charge)
         if charge != 0 or multiplicity != default_mult:
             logging.warning(
                 "%s does not support spin/charge; ignoring charge=%d, "
@@ -1491,7 +1552,7 @@ def apply_spin_charge(atoms, calculator, multiplicity=None, charge=0):
                 multiplicity,
             )
     else:
-        default_mult = 2 if get_total_electrons(atoms) % 2 else 1
+        default_mult = get_multiplicity(atoms, charge=charge)
         if charge != 0 or multiplicity != default_mult:
             logging.warning(
                 "Spin/charge convention for calculator '%s' is unknown; "
@@ -1528,6 +1589,82 @@ def get_inchikey(atoms):
 
 
 atoms2inchikey = get_inchikey
+
+
+def _to_serializable_array(value):
+    """Convert tensor/array-like calculator results to JSON-friendly values."""
+
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (list, tuple)):
+        return [_to_serializable_array(item) for item in value]
+    return value
+
+
+def _as_numpy_array(value):
+    """Return a NumPy array view of tensor/array-like calculator results."""
+
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    try:
+        return np.asarray(value)
+    except Exception:
+        return None
+
+
+def _store_calculator_observables(results, calc, prefix=""):
+    """Persist dipoles and MACE-Polar density outputs when present."""
+
+    calc_results = getattr(calc, "results", None)
+    if not isinstance(calc_results, dict):
+        return results
+
+    if "dipole" in calc_results:
+        results[f"{prefix}dipole"] = _to_serializable_array(calc_results["dipole"])
+
+    density = _as_numpy_array(calc_results.get("density_coefficients"))
+    if density is not None and density.ndim >= 2 and density.shape[-1] >= 4:
+        results[f"{prefix}density_coefficients"] = _to_serializable_array(density)
+        results[f"{prefix}partial_charges"] = _to_serializable_array(density[:, 0])
+        results[f"{prefix}partial_dipoles"] = _to_serializable_array(
+            density[:, [3, 1, 2]]
+        )
+
+    spin_density = _as_numpy_array(calc_results.get("spin_charge_density"))
+    if (
+        spin_density is not None
+        and spin_density.ndim >= 3
+        and spin_density.shape[1] >= 2
+        and spin_density.shape[2] >= 1
+    ):
+        spin_up = spin_density[:, 0, 0]
+        spin_down = spin_density[:, 1, 0]
+        results[f"{prefix}spin_charge_density"] = _to_serializable_array(spin_density)
+        results[f"{prefix}partial_spin_up_charges"] = _to_serializable_array(spin_up)
+        results[f"{prefix}partial_spin_down_charges"] = _to_serializable_array(
+            spin_down
+        )
+        results[f"{prefix}partial_spin_charges"] = _to_serializable_array(
+            spin_up - spin_down
+        )
+
+    return results
 
 
 def _prepare_calculation(
@@ -1613,6 +1750,7 @@ def _prepare_calculation(
         "calculator_name": str(calc),
         "model": getattr(calc, "model_name", ""),
     }
+    _store_calculator_observables(results, calc, prefix="initial_")
 
     return calc, results
 
@@ -1677,6 +1815,8 @@ def run_single_point(
         logging.error(error)
     finally:
         results["calc_time"] = time.time() - start_time
+
+    _store_calculator_observables(results, calc)
 
     if not results["error"]:
         logging.debug(
@@ -1794,6 +1934,7 @@ def run_optimization(
         results["opt_sym"] = str(opt_sym)
         results["opt_sym_number"] = opt_sym_number
         results["smiles_changed"] = results["initial_smiles"] != results["opt_smiles"]
+        _store_calculator_observables(results, calc, prefix="opt_")
 
         # Save optimized geometry if requested and optimization converged
         if save_geometry and results["opt_converged"]:
@@ -2185,9 +2326,9 @@ def run_ir(
             error = (
                 f"Dipole calculator {type(dip_calc).__name__} does not "
                 "implement the 'dipole' property; IR intensities cannot be "
-                "computed. MACE and EMT do not support dipoles. Use a "
-                "calculator that does (e.g. xtb), or pass an instance via the "
-                "Python API.\n"
+                "computed. Regular MACE and EMT do not support dipoles. Use "
+                "a calculator that does (e.g. xtb, orca, or mace-polar), or "
+                "pass an instance via the Python API.\n"
             )
             results["error"] += error
             logging.error(error)

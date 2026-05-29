@@ -607,6 +607,7 @@ def main():
 
     supported_calculator_names = {
         "mace",
+        "mace-polar",
         "xtb",
         "emt",
         "orca",
