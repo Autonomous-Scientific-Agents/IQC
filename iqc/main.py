@@ -293,6 +293,26 @@ def validate_input_args(args):
         return "Error: --direct-db requires --database DB_PATH."
     if args.skip_existing_from and not args.skip_existing:
         return "Error: --skip-existing-from requires --skip-existing."
+    if not args.input and not args.smiles:
+        xyz_path = Path(str(args.xyz))
+        if xyz_path.suffix.lower() in {
+            ".json",
+            ".jsonl",
+            ".parquet",
+            ".csv",
+            ".tsv",
+            ".xlsx",
+            ".xls",
+            ".feather",
+            ".arrow",
+            ".ipc",
+        }:
+            return (
+                f"Error: {args.xyz!r} looks like a tabular/result file, not an "
+                "XYZ file. Use --input FILE for JSONL/parquet/CSV inputs. For "
+                "IQC result files, omit --xyz to use the opt_xyz column or pass "
+                "--xyz COLUMN explicitly."
+            )
     if not args.input or args.input_only:
         return None
     if args.input_xyz_column and args.input_smiles_column:
@@ -341,6 +361,8 @@ def main():
     asepar.world = asepar.DummyMPI()
 
     from iqc.asetools import (
+        MACE_POLAR_DEFAULT_MODEL,
+        _ensure_mace_polar_model_cached,
         atoms2xyz,
         get_ase_version,
         get_atoms_from_smiles,
@@ -445,6 +467,23 @@ def main():
             if args.calculator is not None
             else params.get("calculator", "mace")
         )
+
+        if str(calculator_name).lower() == "mace-polar":
+            prefetch_error = None
+            if rank == 0:
+                try:
+                    _ensure_mace_polar_model_cached(
+                        calc_params.get("model", MACE_POLAR_DEFAULT_MODEL)
+                    )
+                except Exception as e:
+                    prefetch_error = str(e)
+            prefetch_error = comm.bcast(prefetch_error, root=0)
+            if prefetch_error:
+                logging.error(
+                    "Failed to cache MACE-Polar checkpoint before MPI startup: %s",
+                    prefetch_error,
+                )
+                comm.Abort(1)
 
         # Initialize the calculator
         try:

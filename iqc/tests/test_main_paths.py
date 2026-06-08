@@ -2,6 +2,7 @@ import json
 
 import pyarrow.parquet as pq
 
+from iqc.cli import get_args
 from iqc.databasetools import calculation_key_from_record
 from iqc.main import (
     _default_skip_existing_sources,
@@ -10,6 +11,7 @@ from iqc.main import (
     _unique_child_path,
     build_completed_calculation_index,
     convert_jsonl_results_to_parquet,
+    validate_input_args,
 )
 
 
@@ -74,6 +76,15 @@ def test_default_skip_existing_sources_finds_iqc_result_files(tmp_path):
         new_per_rank,
         old_per_rank,
     ]
+
+
+def test_validate_input_args_rejects_jsonl_as_xyz():
+    args = get_args(["--xyz", "iqc_single_results_20260101_000000.jsonl"])
+
+    message = validate_input_args(args)
+
+    assert "looks like a tabular/result file" in message
+    assert "Use --input FILE" in message
 
 
 def test_build_completed_calculation_index_reads_json_and_jsonl(tmp_path):

@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import socket
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -494,23 +496,48 @@ def _download_mace_polar_checkpoint(model):
 
 
 @contextmanager
-def _file_lock(lock_path):
-    """Advisory lock used to serialize first-time checkpoint downloads."""
+def _file_lock(lock_path, poll_interval=0.25):
+    """Directory-based lock for filesystems where `flock` is unreliable."""
 
     lock_path = Path(lock_path).expanduser()
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w", encoding="utf-8") as lock_file:
+    stale_seconds = float(os.environ.get("IQC_MACE_POLAR_LOCK_STALE_SECONDS", 43200))
+    acquired = False
+    while not acquired:
         try:
-            import fcntl
-        except ImportError:
-            yield
-            return
+            lock_path.mkdir()
+            acquired = True
+        except FileExistsError:
+            if lock_path.is_file():
+                lock_path.unlink()
+                continue
+            try:
+                age = time.time() - lock_path.stat().st_mtime
+            except OSError:
+                age = 0
+            if age > stale_seconds:
+                logging.warning(
+                    "Removing stale MACE-Polar checkpoint lock older than %.0f s: %s",
+                    stale_seconds,
+                    lock_path,
+                )
+                shutil.rmtree(lock_path, ignore_errors=True)
+                continue
+            time.sleep(poll_interval)
 
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    owner_file = lock_path / "owner"
+    try:
+        owner_file.write_text(
+            f"host={socket.gethostname()} pid={os.getpid()} time={time.time()}\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+    try:
+        yield
+    finally:
+        shutil.rmtree(lock_path, ignore_errors=True)
 
 
 def _ensure_mace_polar_model_cached(model):

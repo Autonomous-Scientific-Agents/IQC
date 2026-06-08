@@ -41,6 +41,7 @@ from iqc.asetools import (
     _get_uma_calculator,
     _get_mace_polar_calculator,
     _ensure_mace_polar_model_cached,
+    _file_lock,
     _normalize_calculator_compatibility,
     _patch_e3nn_activation_legacy_state,
     _patch_e3nn_codegen_legacy_state,
@@ -574,6 +575,19 @@ def test_mace_polar_model_prefetch_uses_cache_lock(tmp_path, monkeypatch):
 
     assert calls == ["polar-1-l"]
     assert cache_path.exists()
+
+
+def test_file_lock_uses_directory_and_replaces_old_lock_file(tmp_path):
+    """Parallel filesystems do not always honor flock for shared downloads."""
+
+    lock_path = tmp_path / "model.iqc-download.lock"
+    lock_path.write_text("old file lock", encoding="utf-8")
+
+    with _file_lock(lock_path):
+        assert lock_path.is_dir()
+        assert (lock_path / "owner").exists()
+
+    assert not lock_path.exists()
 
 
 def test_normalize_calculator_exposes_sumcalculator_calcs():
