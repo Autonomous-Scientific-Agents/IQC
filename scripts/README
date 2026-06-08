@@ -6,6 +6,7 @@ Python utilities are exposed as console commands when IQC is installed:
 - iqc-optimize-parquet
 - iqc-read-parquet
 - iqc-reduce-parquet
+- iqc-sort-opt-xyz-parquet
 
 The shell scripts are queue-system submission helpers and are not installed as
 Python console commands.

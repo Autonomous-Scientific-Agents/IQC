@@ -5,7 +5,13 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from scripts import jsonl2parquet, optimize_parquet, read_parquet, reduce_parquet
+from scripts import (
+    jsonl2parquet,
+    optimize_parquet,
+    read_parquet,
+    reduce_parquet,
+    sort_opt_xyz_parquet,
+)
 
 
 def write_sample_parquet(path: Path) -> pa.Table:
@@ -110,6 +116,71 @@ def test_optimize_and_read_parquet_cli_entry_points(tmp_path, capsys):
     assert "Constant Columns (stored in metadata):" in captured.out
 
 
+def test_sort_opt_xyz_parquet_writes_sorted_structure_columns(tmp_path, capsys):
+    """The sorter should order by atom count and keep structure columns."""
+    input_path = tmp_path / "results.parquet"
+    output_path = tmp_path / "sorted.parquet"
+    table = pa.table(
+        {
+            "xyz_file": [
+                "six_lower_electrons.xyz",
+                "smallest.xyz",
+                "middle.xyz",
+                "six_higher_electrons.xyz",
+            ],
+            "number_of_atoms": [6, 1, 3, 6],
+            "number_of_electrons": [30, 2, 14, 34],
+            "formula": ["C6", "H", "C3H2", "C6H4"],
+            "unique_name": [
+                "six_lower_electrons",
+                "smallest",
+                "middle",
+                "six_higher_electrons",
+            ],
+            "opt_xyz": [
+                "six lower electrons",
+                "one atom",
+                "three atoms",
+                "six higher electrons",
+            ],
+            "extra": ["drop", "drop", "drop", "drop"],
+        }
+    )
+    pq.write_table(table, input_path, compression="snappy")
+
+    exit_code = sort_opt_xyz_parquet.main([str(input_path), "-o", str(output_path)])
+    captured = capsys.readouterr()
+    sorted_table = pq.read_table(output_path)
+
+    assert exit_code == 0
+    assert sorted_table.column_names == [
+        "xyz_file",
+        "number_of_atoms",
+        "number_of_electrons",
+        "formula",
+        "unique_name",
+        "opt_xyz",
+    ]
+    assert sorted_table["xyz_file"].to_pylist() == [
+        "six_higher_electrons.xyz",
+        "six_lower_electrons.xyz",
+        "middle.xyz",
+        "smallest.xyz",
+    ]
+    assert sorted_table["number_of_atoms"].to_pylist() == [6, 6, 3, 1]
+    assert sorted_table["number_of_electrons"].to_pylist() == [34, 30, 14, 2]
+    assert sorted_table["opt_xyz"].to_pylist() == [
+        "six higher electrons",
+        "six lower electrons",
+        "three atoms",
+        "one atom",
+    ]
+    assert "number_of_atoms distribution:" in captured.out
+    assert "Rows       : 4" in captured.out
+    assert "Max        : 6" in captured.out
+    assert "Mean       : 4.00" in captured.out
+
+
 def test_pyproject_exposes_script_entry_points():
     """The utility scripts should be available as package console commands."""
     pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
@@ -119,3 +190,7 @@ def test_pyproject_exposes_script_entry_points():
     assert 'iqc-optimize-parquet = "scripts.optimize_parquet:run_cli"' in text
     assert 'iqc-read-parquet = "scripts.read_parquet:run_cli"' in text
     assert 'iqc-reduce-parquet = "scripts.reduce_parquet:run_cli"' in text
+    assert (
+        'iqc-sort-opt-xyz-parquet = "scripts.sort_opt_xyz_parquet:run_cli"'
+        in text
+    )
