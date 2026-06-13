@@ -1825,6 +1825,72 @@ def _store_calculator_observables(results, calc, prefix=""):
     return results
 
 
+class InvalidGeometryError(ValueError):
+    """Raised when an input geometry fails a pre-flight sanity check."""
+
+
+def _validate_geometry(
+    atoms,
+    unique_name="",
+    min_distance=None,
+    max_extent=None,
+):
+    """Reject obviously corrupt geometries before handing them to a calculator.
+
+    Catches inputs that have historically triggered uncatchable GPU page
+    faults or O(GiB) host-memory blowups inside MACE/matscipy (atoms on top
+    of each other, NaN coordinates, molecules sprawling across hundreds of
+    Angstroms). Thresholds can be overridden via environment variables so
+    operators can tighten or loosen them per run.
+
+    Args:
+        atoms (ase.Atoms): geometry to validate.
+        unique_name (str): label used in the error message.
+        min_distance (float, optional): minimum interatomic distance in Å.
+            Defaults to ``IQC_MIN_INTERATOMIC_DIST`` (env) or 0.3 Å.
+        max_extent (float, optional): maximum bounding-box edge in Å.
+            Defaults to ``IQC_MAX_GEOMETRY_EXTENT`` (env) or 100 Å.
+
+    Raises:
+        InvalidGeometryError: if the geometry fails any check.
+    """
+    if min_distance is None:
+        min_distance = float(os.environ.get("IQC_MIN_INTERATOMIC_DIST", 0.3))
+    if max_extent is None:
+        max_extent = float(os.environ.get("IQC_MAX_GEOMETRY_EXTENT", 100.0))
+
+    positions = np.asarray(atoms.get_positions(), dtype=float)
+    if positions.size == 0:
+        raise InvalidGeometryError(
+            f"Geometry '{unique_name}' has zero atoms"
+        )
+    if not np.all(np.isfinite(positions)):
+        raise InvalidGeometryError(
+            f"Geometry '{unique_name}' contains non-finite coordinates (NaN/Inf)"
+        )
+
+    if len(positions) >= 2:
+        diffs = positions[:, None, :] - positions[None, :, :]
+        d2 = np.einsum("ijk,ijk->ij", diffs, diffs)
+        np.fill_diagonal(d2, np.inf)
+        dmin = float(np.sqrt(d2.min()))
+        if dmin < min_distance:
+            i, j = np.unravel_index(np.argmin(d2), d2.shape)
+            raise InvalidGeometryError(
+                f"Geometry '{unique_name}' has degenerate atom pair "
+                f"({int(i)}, {int(j)}) separated by {dmin:.4g} Å < "
+                f"{min_distance:g} Å (set IQC_MIN_INTERATOMIC_DIST to override)"
+            )
+
+    extent = positions.max(axis=0) - positions.min(axis=0)
+    extent_max = float(extent.max())
+    if extent_max > max_extent:
+        raise InvalidGeometryError(
+            f"Geometry '{unique_name}' bounding box {extent.round(2).tolist()} Å "
+            f"exceeds limit {max_extent:g} Å (set IQC_MAX_GEOMETRY_EXTENT to override)"
+        )
+
+
 def _prepare_calculation(
     atoms, calculator=None, unique_name="", multiplicity=None, charge=0
 ):
@@ -1845,6 +1911,8 @@ def _prepare_calculation(
     """
     if unique_name == "":
         unique_name = get_inchikey(atoms)
+
+    _validate_geometry(atoms, unique_name=unique_name)
 
     # Get calculator if not provided
     if calculator is None:
