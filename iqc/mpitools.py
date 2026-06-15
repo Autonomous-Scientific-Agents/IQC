@@ -145,10 +145,9 @@ def get_mpi_rank(comm=None):
             pass
 
     # 2. Check environment variables
-    env_vars = _MPI_RANK_ENV_VARS
-    for var in env_vars:
-        if os.getenv(var) is not None:
-            return int(os.getenv(var))
+    rank = _first_int_env(_MPI_RANK_ENV_VARS)
+    if rank is not None:
+        return rank
 
     if MPI is not None:
         return MPI.COMM_WORLD.Get_rank()
@@ -178,10 +177,9 @@ def get_mpi_size(comm=None, default=1):
             pass
 
     # 2. Check environment variables
-    env_vars = _MPI_SIZE_ENV_VARS
-    for var in env_vars:
-        if os.getenv(var) is not None:
-            return int(os.getenv(var))
+    size = _first_int_env(_MPI_SIZE_ENV_VARS)
+    if size is not None:
+        return size
 
     if MPI is not None:
         return MPI.COMM_WORLD.Get_size()
@@ -212,11 +210,8 @@ def get_mpi_local_rank(default=0):
     See https://www.open-mpi.org/faq/?category=running#mpi-environmental-variables
     for more information about MPI environment variables.
     """
-    if os.getenv("OMPI_COMM_WORLD_LOCAL_RANK") is not None:
-        rank = int(os.getenv("OMPI_COMM_WORLD_LOCAL_RANK"))
-    else:
-        rank = default
-    return rank
+    rank = _first_int_env(["OMPI_COMM_WORLD_LOCAL_RANK"])
+    return rank if rank is not None else default
 
 
 def get_mpi_local_size(default=1):
@@ -240,11 +235,8 @@ def get_mpi_local_size(default=1):
     See https://www.open-mpi.org/faq/?category=running#mpi-environmental-variables
     for more information about MPI environment variables.
     """
-    if os.getenv("OMPI_COMM_WORLD_LOCAL_SIZE") is not None:
-        size = int(os.getenv("OMPI_COMM_WORLD_LOCAL_SIZE"))
-    else:
-        size = default
-    return size
+    size = _first_int_env(["OMPI_COMM_WORLD_LOCAL_SIZE"])
+    return size if size is not None else default
 
 
 def get_ppn():

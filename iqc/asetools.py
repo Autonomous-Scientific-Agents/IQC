@@ -512,9 +512,9 @@ def _file_lock(lock_path, poll_interval=0.25):
                 lock_path.unlink()
                 continue
             try:
-                age = time.time() - lock_path.stat().st_mtime
+                age = max(0.0, time.time() - lock_path.stat().st_mtime)
             except OSError:
-                age = 0
+                age = 0.0
             if age > stale_seconds:
                 logging.warning(
                     "Removing stale MACE-Polar checkpoint lock older than %.0f s: %s",

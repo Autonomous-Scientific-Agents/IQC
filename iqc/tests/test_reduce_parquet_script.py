@@ -181,6 +181,32 @@ def test_sort_opt_xyz_parquet_writes_sorted_structure_columns(tmp_path, capsys):
     assert "Mean       : 4.00" in captured.out
 
 
+def test_sort_opt_xyz_parquet_ascending_tiebreak_direction(tmp_path):
+    """In ascending mode the tie-break column must also be ascending."""
+    input_path = tmp_path / "asc.parquet"
+    output_path = tmp_path / "asc_sorted.parquet"
+    table = pa.table(
+        {
+            "xyz_file": ["a.xyz", "b.xyz"],
+            "number_of_atoms": [6, 6],  # tie on primary key
+            "number_of_electrons": [10, 30],  # tie-break decides ordering
+            "formula": ["A", "B"],
+            "unique_name": ["a", "b"],
+            "opt_xyz": ["a", "b"],
+        }
+    )
+    pq.write_table(table, input_path, compression="snappy")
+
+    exit_code = sort_opt_xyz_parquet.main(
+        [str(input_path), "-o", str(output_path), "--ascending"]
+    )
+    sorted_table = pq.read_table(output_path)
+
+    assert exit_code == 0
+    # Ascending primary + ascending tie-break ⇒ low electrons first.
+    assert sorted_table["number_of_electrons"].to_pylist() == [10, 30]
+
+
 def test_pyproject_exposes_script_entry_points():
     """The utility scripts should be available as package console commands."""
     pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"

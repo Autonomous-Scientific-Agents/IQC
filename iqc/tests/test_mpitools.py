@@ -153,6 +153,33 @@ def test_get_mpi_local_size_default():
         assert get_mpi_local_size(default=1) == 1
 
 
+def test_get_mpi_rank_ignores_non_integer_env(monkeypatch):
+    """Junk in an MPI rank env var must not crash; should fall through to 0."""
+    for var in ["PMI_RANK", "PMI_ID", "PMIX_RANK", "OMPI_COMM_WORLD_RANK",
+                "MV2_COMM_WORLD_RANK", "SLURM_PROCID", "PALS_RANKID"]:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("PMI_RANK", "not-an-int")
+    assert get_mpi_rank() == 0
+
+
+def test_get_mpi_size_ignores_non_integer_env(monkeypatch):
+    for var in ["PMI_SIZE", "PMIX_SIZE", "OMPI_COMM_WORLD_SIZE",
+                "MV2_COMM_WORLD_SIZE", "SLURM_NTASKS"]:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("PMI_SIZE", "garbage")
+    assert get_mpi_size(default=7) == 7
+
+
+def test_get_mpi_local_rank_ignores_non_integer_env(monkeypatch):
+    monkeypatch.setenv("OMPI_COMM_WORLD_LOCAL_RANK", "garbage")
+    assert get_mpi_local_rank(default=3) == 3
+
+
+def test_get_mpi_local_size_ignores_non_integer_env(monkeypatch):
+    monkeypatch.setenv("OMPI_COMM_WORLD_LOCAL_SIZE", "garbage")
+    assert get_mpi_local_size(default=5) == 5
+
+
 def test_get_ppn():
     with patch("os.cpu_count", return_value=8):
         assert get_ppn() == 8

@@ -68,7 +68,7 @@ def format_bytes(size: int) -> str:
                 return f"{int(value)} {unit}"
             return f"{value:.1f} {unit}"
         value /= 1024
-    return f"{size} B"
+    return f"{size} B"  # unreachable; satisfies type checkers
 
 
 def truncate(text: Any, width: int) -> str:
@@ -268,6 +268,8 @@ def _coerce_text_value(
             f"Column '{column_name}' contains a blank {value_label} value "
             f"at row {row_index}."
         )
+    # XYZ records preserve their original formatting (trailing newlines,
+    # internal whitespace); SMILES are single-line and get trimmed.
     return value.strip() if value_label == "SMILES" else value
 
 
@@ -485,17 +487,7 @@ def inspect_data_file(input_file: str | Path) -> DataSummary:
         rows = table.num_rows
         columns = table.num_columns
         column_summaries = _arrow_column_summaries(table)
-    except ImportError:
-        frame, format_name, engine = _read_pandas_frame(path, suffix)
-        rows = len(frame)
-        columns = len(frame.columns)
-        column_summaries = _pandas_column_summaries(frame)
     except Exception:
-        frame, format_name, engine = _read_pandas_frame(path, suffix)
-        rows = len(frame)
-        columns = len(frame.columns)
-        column_summaries = _pandas_column_summaries(frame)
-    except ValueError:
         frame, format_name, engine = _read_pandas_frame(path, suffix)
         rows = len(frame)
         columns = len(frame.columns)

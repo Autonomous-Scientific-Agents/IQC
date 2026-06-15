@@ -201,10 +201,10 @@ def write_sorted_opt_xyz_parquet(
     order = "descending" if descending else "ascending"
     sorted_indices = pc.sort_indices(
         table,
-        sort_keys=[(SORT_COLUMN, order), (TIE_BREAK_COLUMN, "descending")],
+        sort_keys=[(SORT_COLUMN, order), (TIE_BREAK_COLUMN, order)],
         null_placement="at_end",
     )
-    sorted_table = table.take(sorted_indices).select(OUTPUT_COLUMNS)
+    sorted_table = table.take(sorted_indices)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(

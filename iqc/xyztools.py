@@ -192,25 +192,28 @@ class XYZReader:
                     try:
                         # Parse atom count
                         num_atoms = int(mmapped_file[pos:line_end].decode().strip())
-                        pos = line_end + 1
-
-                        # Skip comment line
-                        comment_end = mmapped_file.find(b"\n", pos)
-                        if comment_end == -1:
-                            break
-                        pos = comment_end + 1
-
-                        # Skip atom lines
-                        for _ in range(num_atoms):
-                            atom_end = mmapped_file.find(b"\n", pos)
-                            if atom_end == -1:
-                                return count
-                            pos = atom_end + 1
-
-                        count += 1
                     except (ValueError, UnicodeDecodeError):
-                        # Skip malformed lines
-                        pos = line_end + 1
+                        # Without a valid count we cannot resynchronize on the
+                        # next frame boundary; stop counting rather than
+                        # silently misalign all subsequent frames.
+                        return count
+
+                    pos = line_end + 1
+
+                    # Skip comment line
+                    comment_end = mmapped_file.find(b"\n", pos)
+                    if comment_end == -1:
+                        break
+                    pos = comment_end + 1
+
+                    # Skip atom lines
+                    for _ in range(num_atoms):
+                        atom_end = mmapped_file.find(b"\n", pos)
+                        if atom_end == -1:
+                            return count
+                        pos = atom_end + 1
+
+                    count += 1
 
         return count
 
@@ -227,24 +230,32 @@ class XYZReader:
 
                     try:
                         num_atoms = int(mmapped_file[pos:line_end].decode().strip())
-                        atom_counts.append(num_atoms)
-                        pos = line_end + 1
-
-                        # Skip comment line
-                        comment_end = mmapped_file.find(b"\n", pos)
-                        if comment_end == -1:
-                            break
-                        pos = comment_end + 1
-
-                        # Skip atom lines
-                        for _ in range(num_atoms):
-                            atom_end = mmapped_file.find(b"\n", pos)
-                            if atom_end == -1:
-                                return atom_counts
-                            pos = atom_end + 1
-
                     except (ValueError, UnicodeDecodeError):
-                        pos = line_end + 1
+                        # See count_configurations: stop rather than misalign.
+                        return atom_counts
+
+                    pos = line_end + 1
+
+                    # Skip comment line
+                    comment_end = mmapped_file.find(b"\n", pos)
+                    if comment_end == -1:
+                        break
+                    pos = comment_end + 1
+
+                    # Skip atom lines
+                    incomplete = False
+                    for _ in range(num_atoms):
+                        atom_end = mmapped_file.find(b"\n", pos)
+                        if atom_end == -1:
+                            incomplete = True
+                            break
+                        pos = atom_end + 1
+                    if incomplete:
+                        # Frame header promised num_atoms but file truncated;
+                        # only record counts that match real configurations.
+                        return atom_counts
+
+                    atom_counts.append(num_atoms)
 
         return atom_counts
 
@@ -260,17 +271,24 @@ class XYZReader:
                 try:
                     num_atoms = int(line.strip())
                 except ValueError:
-                    continue
+                    # Cannot resynchronize without a valid count; stop here.
+                    return
 
                 # Read comment
-                comment = f.readline().strip()
+                comment_line = f.readline()
+                if not comment_line:
+                    return
+                comment = comment_line.strip()
 
-                # Read atoms
+                # Read atoms — always consume num_atoms lines, even on parse
+                # failure, so the next frame's header lines up correctly.
                 atoms = []
+                incomplete = False
                 for _ in range(num_atoms):
                     atom_line = f.readline()
                     if not atom_line:
-                        return
+                        incomplete = True
+                        break
 
                     parts = atom_line.strip().split()
                     if len(parts) >= 4:
@@ -279,7 +297,14 @@ class XYZReader:
                             x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
                             atoms.append((symbol, x, y, z))
                         except ValueError:
-                            continue
+                            pass
+
+                if incomplete or len(atoms) != num_atoms:
+                    # Skip malformed/truncated frame rather than yield a
+                    # configuration whose atom list disagrees with num_atoms.
+                    if incomplete:
+                        return
+                    continue
 
                 yield XYZConfiguration(num_atoms, comment, atoms)
 

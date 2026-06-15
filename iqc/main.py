@@ -424,16 +424,18 @@ def main():
         try:
             with open(args.params, "r") as f:
                 params_str = f.read()
-                params = yaml.safe_load(params_str)
+                params = yaml.safe_load(params_str) or {}
             if rank == 0:
                 logging.info(f"Loaded parameters from {args.params}")
                 logging.debug(f"Parameters: {params}")
 
         except Exception as e:
             logging.error(f"Error loading parameters from {args.params}: {e}")
-            # Decide if execution should stop if params file is bad
+            # Decide if execution should stop if params file is bad.
+            # Use comm.Abort under MPI so peer ranks aren't left waiting.
+            if size > 1:
+                comm.Abort(1)
             sys.exit(1)
-            comm.Abort(1)
 
     elif args.params:
         if rank == 0:
