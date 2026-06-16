@@ -1,0 +1,181 @@
+"""Parsl configurations for IQC dispatch.
+
+Two factories are exposed:
+
+- ``make_aurora_config(...)``: production config for ALCF Aurora — one Parsl
+  worker per Intel GPU tile (12/node), PALS-aware launcher, retries on failure.
+- ``make_local_config(...)``: laptop/compute-node config using LocalProvider
+  with a configurable worker count — for smoke tests without a PBS allocation.
+
+Both return a ``parsl.config.Config`` ready to pass to ``parsl.load(cfg)``.
+"""
+from __future__ import annotations
+
+import os
+from typing import Optional
+
+from parsl.config import Config
+from parsl.executors import HighThroughputExecutor
+from parsl.launchers import MpiExecLauncher
+from parsl.providers import LocalProvider, PBSProProvider
+
+
+# 6 GPUs x 2 tiles = 12 tile identifiers, one per worker.
+AURORA_TILE_NAMES = [f"{g}.{t}" for g in range(6) for t in range(2)]
+
+# ALCF-recommended core-pinning string for the Parsl worker pool: skips the
+# kernel-reserved cores 49-52 and the matching SMT siblings 153-156. Copy
+# verbatim from the Aurora Parsl docs.
+AURORA_CPU_AFFINITY = (
+    "list:"
+    "1-8,105-112:9-16,113-120:17-24,121-128:25-32,129-136:"
+    "33-40,137-144:41-48,145-152:53-60,157-164:61-68,165-172:"
+    "69-76,173-180:77-84,181-188:85-92,189-196:93-100,197-204"
+)
+
+
+def _default_worker_init(venv_activate: str, execute_dir: str) -> str:
+    """Worker-init shell snippet used inside every PBSPro job on Aurora.
+
+    ``export TMPDIR=/tmp`` is the documented Aurora workaround for the AF_UNIX
+    "path too long" Parsl bug that started appearing in Oct 2025.
+    """
+    return (
+        "export TMPDIR=/tmp; "
+        "module load frameworks; "
+        f"source {venv_activate}; "
+        f"cd {execute_dir}"
+    )
+
+
+def make_aurora_config(
+    *,
+    venv_activate: str,
+    nodes_per_block: int = 1,
+    max_blocks: int = 1,
+    queue: str = "debug",
+    walltime: str = "0:30:00",
+    account: str = "IQC",
+    filesystems: str = "home:flare",
+    execute_dir: Optional[str] = None,
+    extra_worker_init: str = "",
+    retries: int = 2,
+    run_dir: Optional[str] = None,
+) -> Config:
+    """Build a Parsl Config tuned for ALCF Aurora.
+
+    Each Parsl worker is pinned to one Intel Data Center GPU Max 1550 tile (12
+    workers per node); ``MpiExecLauncher`` with ``--ppn 1`` runs one Parsl
+    process manager per node, which in turn forks the worker pool.
+
+    Parameters
+    ----------
+    venv_activate
+        Absolute path to the venv's ``bin/activate`` (sourced inside every PBS
+        block before tasks run).
+    nodes_per_block
+        Aurora nodes requested per PBS submission. The smoke test should use 1.
+    max_blocks
+        Upper bound on concurrent PBS jobs Parsl will queue.
+    queue
+        Aurora queue name (``debug``, ``debug-scaling``, ``prod``,
+        ``EarlyAppAccess``).
+    walltime
+        PBS walltime, format ``H:MM:SS``.
+    account
+        Charging account.
+    filesystems
+        PBS ``-l filesystems=`` value.
+    execute_dir
+        Worker working directory. Defaults to ``os.getcwd()``.
+    extra_worker_init
+        Extra shell appended to the default ``worker_init`` (semicolon-prefixed).
+    retries
+        Re-queue count for failed tasks. The whole point of this prototype: a
+        single rank's GPU abort no longer kills the job.
+    run_dir
+        Optional ``runinfo`` directory override.
+    """
+
+    if execute_dir is None:
+        execute_dir = os.getcwd()
+    worker_init = _default_worker_init(venv_activate, execute_dir)
+    if extra_worker_init:
+        worker_init = f"{worker_init}; {extra_worker_init}"
+
+    cfg_kwargs = {
+        "executors": [
+            HighThroughputExecutor(
+                label="aurora_htex",
+                available_accelerators=AURORA_TILE_NAMES,
+                max_workers_per_node=len(AURORA_TILE_NAMES),
+                cpu_affinity=AURORA_CPU_AFFINITY,
+                prefetch_capacity=0,
+                provider=PBSProProvider(
+                    account=account,
+                    queue=queue,
+                    worker_init=worker_init,
+                    walltime=walltime,
+                    scheduler_options=f"#PBS -l filesystems={filesystems}",
+                    launcher=MpiExecLauncher(
+                        bind_cmd="--cpu-bind",
+                        overrides="--ppn 1",
+                    ),
+                    select_options="",
+                    nodes_per_block=nodes_per_block,
+                    min_blocks=0,
+                    max_blocks=max_blocks,
+                    cpus_per_node=208,
+                ),
+            ),
+        ],
+        "retries": retries,
+    }
+    if run_dir is not None:
+        cfg_kwargs["run_dir"] = run_dir
+    return Config(**cfg_kwargs)
+
+
+def make_local_config(
+    *,
+    max_workers: int = 4,
+    available_accelerators: Optional[list] = None,
+    retries: int = 1,
+    run_dir: Optional[str] = None,
+    label: str = "local_htex",
+) -> Config:
+    """Build a Parsl Config that runs workers locally (no PBS).
+
+    Use for smoke tests on a single compute node (or a laptop) without
+    submitting through PBS. Each worker is a child process of the driver.
+
+    Parameters
+    ----------
+    max_workers
+        Number of concurrent worker processes.
+    available_accelerators
+        Optional accelerator IDs (e.g. Aurora tile names like ``"0.0"``). When
+        set, Parsl exports ``ZE_AFFINITY_MASK`` (or ``CUDA_VISIBLE_DEVICES``,
+        etc.) per worker, mirroring the production tile-pin behavior.
+    retries
+        Per-task retry count.
+    run_dir
+        Optional ``runinfo`` directory override.
+    label
+        Executor label.
+    """
+
+    htex_kwargs = {
+        "label": label,
+        "max_workers_per_node": max_workers,
+        "provider": LocalProvider(init_blocks=1, min_blocks=1, max_blocks=1),
+    }
+    if available_accelerators is not None:
+        htex_kwargs["available_accelerators"] = available_accelerators
+    cfg_kwargs = {
+        "executors": [HighThroughputExecutor(**htex_kwargs)],
+        "retries": retries,
+    }
+    if run_dir is not None:
+        cfg_kwargs["run_dir"] = run_dir
+    return Config(**cfg_kwargs)

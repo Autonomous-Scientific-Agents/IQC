@@ -341,6 +341,508 @@ def get_structure_input_mode(args):
     return "xyz"
 
 
+class _SkipExisting:
+    """Sentinel: ``_process_one_row`` returns this when the row matched a
+    skip-existing key. Lets the caller distinguish it from a ``None`` return
+    (which means the input could not be read) so ``skipped_existing`` only
+    counts the cases the user asked about with ``--skip-existing``.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self):
+        return "<SKIPPED_EXISTING>"
+
+
+SKIPPED_EXISTING = _SkipExisting()
+
+
+SUPPORTED_CALCULATOR_NAMES = {
+    "mace",
+    "mace-polar",
+    "xtb",
+    "emt",
+    "orca",
+    "uma",
+    "uma-s-omol",
+    "uma-s-omat",
+    "uma-s-odac",
+    "uma-m-omol",
+    "uma-m-omat",
+    "uma-m-odac",
+}
+
+
+def _resolve_role_calculators(run_params, roles, calc_params):
+    """Instantiate per-role calculator overrides from YAML task params.
+
+    Mutates ``run_params`` by popping recognised role keys. Raises RuntimeError
+    on any failure so the caller (MPI rank or Parsl @python_app) can decide
+    whether to abort the world or fail just this row.
+    """
+
+    from iqc.asetools import get_calculator
+
+    role_calculators = {}
+    for role in roles:
+        name = run_params.pop(role, None)
+        if name is None:
+            continue
+        if isinstance(name, str):
+            if name.lower() not in SUPPORTED_CALCULATOR_NAMES:
+                raise RuntimeError(
+                    f"Unknown calculator '{name}' for {role}. "
+                    f"Supported names: {sorted(SUPPORTED_CALCULATOR_NAMES)}. "
+                    "To use a calculator outside this list, pass an "
+                    "instantiated calculator via the Python API."
+                )
+            try:
+                instance = get_calculator(name=name, **calc_params)
+            except RuntimeError as e:
+                raise RuntimeError(
+                    f"Failed to initialize {role} '{name}': {e}"
+                ) from e
+            # get_calculator silently falls back to MACE when its target fails.
+            # For per-role overrides the user explicitly asked for a calculator,
+            # so fail instead of quietly changing methods.
+            fallback_from = getattr(instance, "_iqc_fallback_from", None)
+            if fallback_from is not None:
+                raise RuntimeError(
+                    f"Requested {role}='{name}' but get_calculator silently "
+                    f"fell back to MACE (was: '{fallback_from}'). Check earlier "
+                    "warnings — typical causes: missing executable (e.g. ORCA "
+                    "not on PATH and ASE_ORCA_COMMAND unset), missing Python "
+                    "package, or initialization failure."
+                )
+            role_calculators[role] = instance
+        else:
+            role_calculators[role] = name
+    return role_calculators
+
+
+def _process_one_row(
+    xyz_index,
+    *,
+    args,
+    params_str,
+    task,
+    calculator_name,
+    calc_params,
+    opt_params,
+    vib_params,
+    ir_params,
+    thermo_params,
+    nmr_params,
+    xyz_files,
+    input_mode,
+    number_of_files,
+    calculator,
+    worker_id,
+    n_workers,
+    rank_output_dir_factory,
+    direct_work_dir,
+    completed_file_index,
+    db_path,
+):
+    """Process a single input row.
+
+    Three possible returns:
+
+    - **dict** — task ran (possibly with ``{task}_error`` set on failure).
+      Includes helper keys ``_unique_name``, ``_record_stamp``,
+      ``_work_dir_used`` for the caller to consume and strip.
+    - **None** — input could not be read (bad xyz / unknown error). Caller
+      should not persist anything and should not bump skip counters.
+    - **SKIPPED_EXISTING** sentinel — skip-existing matched. Caller should
+      not persist anything but should increment its ``skipped_existing`` count.
+
+    The caller is responsible for persisting the returned dict (per-rank JSON
+    file in MPI mode; appended to a shared JSONL in the Parsl head).
+    """
+
+    from iqc.asetools import (
+        atoms2xyz,
+        get_ase_version,
+        get_atoms_from_smiles,
+        get_atoms_from_xyz,
+        run_ir,
+        run_ir_thermo,
+        run_optimization,
+        run_single_point,
+        run_thermo,
+        run_vibrations,
+    )
+    from iqc.nmr import run_nmr_workflow
+
+    # --- Resolve input descriptor -------------------------------------------
+    smiles_input = None
+    xyz_record = None
+    smiles_record = None
+    if input_mode == "smiles":
+        smiles_input = xyz_files[0]
+        xyz_file = f"smiles:{smiles_input}"
+        base_name = _smiles_to_basename(smiles_input)
+    elif input_mode == "data_xyz":
+        xyz_record = xyz_files[xyz_index]
+        xyz_file = f"{args.input}:{args.xyz}[{xyz_record.row_index}]"
+        base_name = f"{Path(args.input).stem}_row{xyz_record.row_index}"
+    elif input_mode == "data_smiles":
+        smiles_record = xyz_files[xyz_index]
+        smiles_input = smiles_record.smiles
+        xyz_file = f"{args.input}:{args.smiles}[{smiles_record.row_index}]"
+        base_name = f"{Path(args.input).stem}_row{smiles_record.row_index}"
+    elif number_of_files > 1:
+        xyz_file = xyz_files[xyz_index]
+        base_name = os.path.splitext(os.path.basename(xyz_file))[0]
+    else:
+        xyz_file = xyz_files[0]
+        base_name = os.path.splitext(os.path.basename(xyz_file))[0]
+    record_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique_name = f"{base_name}_{xyz_index}_{worker_id}_{record_stamp}"
+    logging.info(f"Processing input: {xyz_file} with unique ID: {unique_name}")
+
+    # --- Read atoms ----------------------------------------------------------
+    try:
+        if input_mode == "smiles":
+            atoms = get_atoms_from_smiles(smiles_input)
+        elif input_mode == "data_xyz":
+            atoms = get_atoms_from_xyz(xyz_record.xyz)
+        elif input_mode == "data_smiles":
+            atoms = get_atoms_from_smiles(smiles_input)
+        elif number_of_files > 1:
+            atoms = get_atoms_from_xyz(xyz_file)
+        else:
+            atoms = get_atoms_from_xyz(xyz_file, index=xyz_index)
+    except ValueError as e:
+        logging.error(f"Error reading file {xyz_file}: {e}. Skipping.")
+        return None
+    except Exception as e:
+        logging.error(
+            f"Unexpected error processing file {xyz_file}: {e}. Skipping."
+        )
+        return None
+
+    # --- Initial result metadata --------------------------------------------
+    model_name = getattr(calculator, "model_name", "") if calculator else ""
+    results = {
+        "xyz_file": xyz_file,
+        "smiles_input": smiles_input or "",
+        "input_mode": input_mode,
+        "data_input_file": args.input or "",
+        "data_xyz_column": args.xyz if input_mode == "data_xyz" else "",
+        "data_smiles_column": args.smiles if input_mode == "data_smiles" else "",
+        "data_sort_column": args.sort or "",
+        "data_sort_order": args.sort_order if args.sort else "",
+        "data_row_index": (
+            xyz_record.row_index
+            if input_mode == "data_xyz"
+            else smiles_record.row_index if input_mode == "data_smiles" else ""
+        ),
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "mpi_size": n_workers,
+        "mpi_rank": worker_id,
+        "hostname": os.uname().nodename,
+        "ase_version": get_ase_version(),
+        "task": task,
+        "calculator": calculator_name,
+        "model": model_name,
+        "initial_xyz": atoms2xyz(atoms),
+        "params": params_str,
+    }
+
+    # --- Skip-existing -------------------------------------------------------
+    if args.skip_existing:
+        current_key = calculation_key(
+            results["initial_xyz"],
+            results["params"],
+            results["calculator"],
+            results["model"],
+            results["task"],
+        )
+        skip_source = None
+        if current_key in completed_file_index:
+            skip_source = "result files"
+        elif db_path and calculation_exists(
+            db_path,
+            results["initial_xyz"],
+            results["params"],
+            results["calculator"],
+            results["model"],
+            results["task"],
+        ):
+            skip_source = "database"
+
+        if skip_source:
+            logging.info(
+                "Skipping existing %s calculation for input %s; found in %s.",
+                task,
+                xyz_file,
+                skip_source,
+            )
+            return SKIPPED_EXISTING
+
+    # --- Lazy work-dir helper (mirrors the closure in main()) ---------------
+    work_dir_used = [False]
+
+    def _get_work_dir():
+        work_dir_used[0] = True
+        if args.direct_db:
+            return direct_work_dir
+        return rank_output_dir_factory()
+
+    # --- Resolve charge / multiplicity --------------------------------------
+    ase_multiplicity = (
+        args.multiplicity
+        if getattr(args, "multiplicity", None) is not None
+        else atoms.info.get("multiplicity")
+    )
+    ase_charge = (
+        args.charge
+        if getattr(args, "charge", None) is not None
+        else int(atoms.info.get("charge", 0))
+    )
+
+    # --- Dispatch task -------------------------------------------------------
+    try:
+        if task == "single":
+            atoms, task_results = run_single_point(
+                atoms=atoms,
+                calculator=calculator,
+                unique_name=unique_name,
+                multiplicity=ase_multiplicity,
+                charge=ase_charge,
+            )
+        elif task == "opt":
+            opt_run_params = dict(opt_params)
+            trajectory_file = None
+            save_geometry = False
+            if args.save:
+                output_dir = _get_work_dir()
+                trajectory_file = os.path.join(
+                    output_dir, f"{unique_name}_opt_trajectory.traj"
+                )
+                opt_run_params["output_dir"] = output_dir
+                save_geometry = True
+            explicit_params = {
+                "atoms",
+                "calculator",
+                "unique_name",
+                "trajectory",
+                "save_geometry",
+            }
+            opt_params_filtered = {
+                k: v for k, v in opt_run_params.items() if k not in explicit_params
+            }
+            atoms, task_results = run_optimization(
+                atoms=atoms,
+                calculator=calculator,
+                unique_name=unique_name,
+                trajectory=trajectory_file,
+                save_geometry=save_geometry,
+                multiplicity=ase_multiplicity,
+                charge=ase_charge,
+                **opt_params_filtered,
+            )
+        elif task == "vib":
+            vib_run_params = dict(vib_params)
+            output_dir = _get_work_dir()
+            vib_run_params["vib_dir"] = output_dir
+            trajectory_file = None
+            save_geometry = False
+            if args.save:
+                trajectory_file = os.path.join(
+                    output_dir, f"{unique_name}_vib_trajectory.traj"
+                )
+                vib_run_params["output_dir"] = output_dir
+                save_geometry = True
+            explicit_params = {
+                "atoms",
+                "calculator",
+                "optimize",
+                "unique_name",
+                "trajectory",
+                "save_geometry",
+            }
+            vib_params_filtered = {
+                k: v for k, v in vib_run_params.items() if k not in explicit_params
+            }
+            atoms, task_results = run_vibrations(
+                atoms=atoms,
+                calculator=calculator,
+                optimize=True,
+                unique_name=unique_name,
+                trajectory=trajectory_file,
+                save_geometry=save_geometry,
+                multiplicity=ase_multiplicity,
+                charge=ase_charge,
+                **vib_params_filtered,
+            )
+        elif task == "ir":
+            ir_run_params = dict(ir_params)
+            output_dir = _get_work_dir()
+            ir_run_params["vib_dir"] = output_dir
+            trajectory_file = None
+            save_geometry = False
+            if args.save:
+                trajectory_file = os.path.join(
+                    output_dir, f"{unique_name}_ir_trajectory.traj"
+                )
+                ir_run_params["output_dir"] = output_dir
+                save_geometry = True
+
+            role_calculators = _resolve_role_calculators(
+                ir_run_params,
+                (
+                    "optimization_calculator",
+                    "vibration_calculator",
+                    "dipole_calculator",
+                ),
+                calc_params,
+            )
+
+            explicit_params = {
+                "atoms",
+                "calculator",
+                "optimization_calculator",
+                "vibration_calculator",
+                "dipole_calculator",
+                "optimize",
+                "unique_name",
+                "trajectory",
+                "save_geometry",
+            }
+            ir_params_filtered = {
+                k: v for k, v in ir_run_params.items() if k not in explicit_params
+            }
+            atoms, task_results = run_ir(
+                atoms=atoms,
+                calculator=calculator,
+                optimize=True,
+                unique_name=unique_name,
+                trajectory=trajectory_file,
+                save_geometry=save_geometry,
+                multiplicity=ase_multiplicity,
+                charge=ase_charge,
+                **role_calculators,
+                **ir_params_filtered,
+            )
+        elif task == "ir-thermo":
+            ignore_imag = args.ignore_imag
+            ir_thermo_run_params = {**thermo_params, **ir_params}
+            output_dir = _get_work_dir()
+            ir_thermo_run_params["vib_dir"] = output_dir
+            trajectory_file = None
+            save_geometry = False
+            if args.save:
+                trajectory_file = os.path.join(
+                    output_dir, f"{unique_name}_ir-thermo_trajectory.traj"
+                )
+                ir_thermo_run_params["output_dir"] = output_dir
+                save_geometry = True
+
+            role_calculators = _resolve_role_calculators(
+                ir_thermo_run_params,
+                (
+                    "optimization_calculator",
+                    "vibration_calculator",
+                    "dipole_calculator",
+                ),
+                calc_params,
+            )
+
+            explicit_params = {
+                "atoms",
+                "calculator",
+                "optimization_calculator",
+                "vibration_calculator",
+                "dipole_calculator",
+                "optimize",
+                "ignore_imag_modes",
+                "unique_name",
+                "trajectory",
+                "save_geometry",
+            }
+            ir_thermo_params_filtered = {
+                k: v
+                for k, v in ir_thermo_run_params.items()
+                if k not in explicit_params
+            }
+            atoms, task_results = run_ir_thermo(
+                atoms=atoms,
+                calculator=calculator,
+                optimize=True,
+                ignore_imag_modes=ignore_imag,
+                unique_name=unique_name,
+                trajectory=trajectory_file,
+                save_geometry=save_geometry,
+                multiplicity=ase_multiplicity,
+                charge=ase_charge,
+                **role_calculators,
+                **ir_thermo_params_filtered,
+            )
+        elif task == "thermo":
+            ignore_imag = args.ignore_imag
+            thermo_run_params = dict(thermo_params)
+            output_dir = _get_work_dir()
+            thermo_run_params["vib_dir"] = output_dir
+            trajectory_file = None
+            save_geometry = False
+            if args.save:
+                trajectory_file = os.path.join(
+                    output_dir, f"{unique_name}_thermo_trajectory.traj"
+                )
+                thermo_run_params["output_dir"] = output_dir
+                save_geometry = True
+            explicit_params = {
+                "atoms",
+                "calculator",
+                "unique_name",
+                "ignore_imag_modes",
+                "trajectory",
+                "save_geometry",
+            }
+            thermo_params_filtered = {
+                k: v
+                for k, v in thermo_run_params.items()
+                if k not in explicit_params
+            }
+            atoms, task_results = run_thermo(
+                atoms=atoms,
+                calculator=calculator,
+                unique_name=unique_name,
+                ignore_imag_modes=ignore_imag,
+                trajectory=trajectory_file,
+                save_geometry=save_geometry,
+                multiplicity=ase_multiplicity,
+                charge=ase_charge,
+                **thermo_params_filtered,
+            )
+        elif task == "nmr":
+            nmr_run_params = {**nmr_params, **get_nmr_cli_overrides(args)}
+            if not nmr_run_params.get("output_dir"):
+                nmr_run_params["output_dir"] = os.path.join(
+                    _get_work_dir(), f"{unique_name}_nmr"
+                )
+            atoms, task_results = run_nmr_workflow(
+                atoms=atoms,
+                unique_name=unique_name,
+                **nmr_run_params,
+            )
+        else:
+            raise ValueError(f"Unsupported task '{task}'")
+
+        results.update(task_results)
+        logging.debug(f"Completed {task} calculations for file: {xyz_file}")
+    except Exception as e:
+        results[f"{task}_error"] = str(e)
+        logging.error(f"Task '{task}' failed for {xyz_file}: {e}", exc_info=True)
+
+    results["_unique_name"] = unique_name
+    results["_record_stamp"] = record_stamp
+    results["_work_dir_used"] = work_dir_used[0]
+    return results
+
+
 def main():
     """Main function."""
     start_time = time.time()
@@ -646,431 +1148,47 @@ def main():
             return direct_work_dir
         return get_rank_output_dir()
 
-    supported_calculator_names = {
-        "mace",
-        "mace-polar",
-        "xtb",
-        "emt",
-        "orca",
-        "uma",
-        "uma-s-omol",
-        "uma-s-omat",
-        "uma-s-odac",
-        "uma-m-omol",
-        "uma-m-omat",
-        "uma-m-odac",
-    }
-
-    def resolve_role_calculators(run_params, roles):
-        """Instantiate per-role calculator overrides from YAML task params."""
-
-        role_calculators = {}
-        for role in roles:
-            name = run_params.pop(role, None)
-            if name is None:
-                continue
-            if isinstance(name, str):
-                if name.lower() not in supported_calculator_names:
-                    logging.error(
-                        f"Unknown calculator '{name}' for {role}. "
-                        f"Supported names: {sorted(supported_calculator_names)}. "
-                        "To use a calculator outside this list, pass an "
-                        "instantiated calculator via the Python API."
-                    )
-                    comm.Abort(1)
-                try:
-                    instance = get_calculator(name=name, **calc_params)
-                except RuntimeError as e:
-                    logging.error(f"Failed to initialize {role} '{name}': {e}")
-                    comm.Abort(1)
-                # get_calculator silently falls back to MACE when its target
-                # fails. For per-role overrides the user explicitly asked for
-                # a calculator, so fail instead of quietly changing methods.
-                fallback_from = getattr(instance, "_iqc_fallback_from", None)
-                if fallback_from is not None:
-                    logging.error(
-                        f"Requested {role}='{name}' but get_calculator silently "
-                        f"fell back to MACE (was: '{fallback_from}'). Check earlier "
-                        "warnings — typical causes: missing executable (e.g. ORCA "
-                        "not on PATH and ASE_ORCA_COMMAND unset), missing Python "
-                        "package, or initialization failure."
-                    )
-                    comm.Abort(1)
-                role_calculators[role] = instance
-            else:
-                role_calculators[role] = name
-        return role_calculators
-
     for xyz_index in range(start_index, end_index):
-
-        smiles_input = None
-        if input_mode == "smiles":
-            smiles_input = xyz_files[0]
-            xyz_file = f"smiles:{smiles_input}"
-            base_name = _smiles_to_basename(smiles_input)
-        elif input_mode == "data_xyz":
-            xyz_record = xyz_files[xyz_index]
-            xyz_file = f"{args.input}:{args.xyz}[{xyz_record.row_index}]"
-            base_name = f"{Path(args.input).stem}_row{xyz_record.row_index}"
-        elif input_mode == "data_smiles":
-            smiles_record = xyz_files[xyz_index]
-            smiles_input = smiles_record.smiles
-            xyz_file = f"{args.input}:{args.smiles}[{smiles_record.row_index}]"
-            base_name = f"{Path(args.input).stem}_row{smiles_record.row_index}"
-        elif number_of_files > 1:
-            xyz_file = xyz_files[xyz_index]
-            base_name = os.path.splitext(os.path.basename(xyz_file))[0]
-        else:  # only one file
-            xyz_file = xyz_files[0]
-            base_name = os.path.splitext(os.path.basename(xyz_file))[0]
-        record_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_name = f"{base_name}_{xyz_index}_{rank}_{record_stamp}"
-        logging.info(f"Processing input: {xyz_file} with unique ID: {unique_name}")
-
-        # Read input
-        try:
-            if input_mode == "smiles":
-                atoms = get_atoms_from_smiles(smiles_input)
-            elif input_mode == "data_xyz":
-                atoms = get_atoms_from_xyz(xyz_record.xyz)
-            elif input_mode == "data_smiles":
-                atoms = get_atoms_from_smiles(smiles_input)
-            elif number_of_files > 1:
-                atoms = get_atoms_from_xyz(xyz_file)
-            else:
-                atoms = get_atoms_from_xyz(xyz_file, index=xyz_index)
-        except ValueError as e:
-            logging.error(f"Error reading file {xyz_file}: {e}. Skipping.")
-            continue
-        except Exception as e:
-            logging.error(
-                f"Unexpected error processing file {xyz_file}: {e}. Skipping."
-            )
-            continue
-
-        model_name = getattr(calculator, "model_name", "") if calculator else ""
-        results = {
-            "xyz_file": xyz_file,
-            "smiles_input": smiles_input or "",
-            "input_mode": input_mode,
-            "data_input_file": args.input or "",
-            "data_xyz_column": args.xyz if input_mode == "data_xyz" else "",
-            "data_smiles_column": args.smiles if input_mode == "data_smiles" else "",
-            "data_sort_column": args.sort or "",
-            "data_sort_order": args.sort_order if args.sort else "",
-            "data_row_index": (
-                xyz_record.row_index
-                if input_mode == "data_xyz"
-                else smiles_record.row_index if input_mode == "data_smiles" else ""
-            ),
-            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "mpi_size": size,
-            "mpi_rank": rank,
-            "hostname": os.uname().nodename,
-            "ase_version": get_ase_version(),
-            "task": task,
-            "calculator": calculator_name,
-            "model": model_name,
-            "initial_xyz": atoms2xyz(atoms),
-            "params": params_str,
-        }
-
-        if args.skip_existing:
-            current_key = calculation_key(
-                results["initial_xyz"],
-                results["params"],
-                results["calculator"],
-                results["model"],
-                results["task"],
-            )
-            skip_source = None
-            if current_key in completed_file_index:
-                skip_source = "result files"
-            elif db_path and calculation_exists(
-                db_path,
-                results["initial_xyz"],
-                results["params"],
-                results["calculator"],
-                results["model"],
-                results["task"],
-            ):
-                skip_source = "database"
-
-            if skip_source:
-                skipped_existing += 1
-                logging.info(
-                    "Skipping existing %s calculation for input %s; found in %s.",
-                    task,
-                    xyz_file,
-                    skip_source,
-                )
-                continue
-
-        # Resolve multiplicity (2S+1) and charge: CLI > XYZ comment > default.
-        ase_multiplicity = (
-            args.multiplicity
-            if getattr(args, "multiplicity", None) is not None
-            else atoms.info.get("multiplicity")
+        result = _process_one_row(
+            xyz_index,
+            args=args,
+            params_str=params_str,
+            task=task,
+            calculator_name=calculator_name,
+            calc_params=calc_params,
+            opt_params=opt_params,
+            vib_params=vib_params,
+            ir_params=ir_params,
+            thermo_params=thermo_params,
+            nmr_params=nmr_params,
+            xyz_files=xyz_files,
+            input_mode=input_mode,
+            number_of_files=number_of_files,
+            calculator=calculator,
+            worker_id=rank,
+            n_workers=size,
+            rank_output_dir_factory=get_rank_output_dir,
+            direct_work_dir=direct_work_dir,
+            completed_file_index=completed_file_index,
+            db_path=db_path,
         )
-        ase_charge = (
-            args.charge
-            if getattr(args, "charge", None) is not None
-            else int(atoms.info.get("charge", 0))
-        )
+        if result is SKIPPED_EXISTING:
+            skipped_existing += 1
+            continue
+        if result is None:
+            # Bad input row — already logged inside _process_one_row.
+            continue
+        if result.pop("_work_dir_used", False):
+            work_dir_used = True
+        unique_name = result.pop("_unique_name")
+        record_stamp = result.pop("_record_stamp")
 
-        try:
-            # Run calculation based on task using the selected calculator and parameters
-            if task == "single":
-                atoms, task_results = run_single_point(
-                    atoms=atoms,
-                    calculator=calculator,
-                    unique_name=unique_name,
-                    multiplicity=ase_multiplicity,
-                    charge=ase_charge,
-                )
-            elif task == "opt":
-                # Pass optimization parameters from file
-                opt_run_params = dict(opt_params)
-                trajectory_file = None
-                save_geometry = False
-                if args.save:
-                    output_dir = get_work_dir()
-                    trajectory_file = os.path.join(
-                        output_dir, f"{unique_name}_opt_trajectory.traj"
-                    )
-                    opt_run_params["output_dir"] = output_dir
-                    save_geometry = True
-                # Filter out explicit parameters to avoid conflicts
-                explicit_params = {
-                    "atoms",
-                    "calculator",
-                    "unique_name",
-                    "trajectory",
-                    "save_geometry",
-                }
-                opt_params_filtered = {
-                    k: v for k, v in opt_run_params.items() if k not in explicit_params
-                }
-                atoms, task_results = run_optimization(
-                    atoms=atoms,
-                    calculator=calculator,
-                    unique_name=unique_name,
-                    trajectory=trajectory_file,
-                    save_geometry=save_geometry,
-                    multiplicity=ase_multiplicity,
-                    charge=ase_charge,
-                    **opt_params_filtered,
-                )
-            elif task == "vib":
-                # Pass vibration parameters if added to config later
-                # vib_params = params.get('vibration_params', {})
-                vib_run_params = dict(vib_params)
-                output_dir = get_work_dir()
-                vib_run_params["vib_dir"] = output_dir
-                trajectory_file = None
-                save_geometry = False
-                if args.save:
-                    trajectory_file = os.path.join(
-                        output_dir, f"{unique_name}_vib_trajectory.traj"
-                    )
-                    vib_run_params["output_dir"] = output_dir
-                    save_geometry = True
-                # Filter out explicit parameters to avoid conflicts
-                explicit_params = {
-                    "atoms",
-                    "calculator",
-                    "optimize",
-                    "unique_name",
-                    "trajectory",
-                    "save_geometry",
-                }
-                vib_params_filtered = {
-                    k: v for k, v in vib_run_params.items() if k not in explicit_params
-                }
-                atoms, task_results = run_vibrations(
-                    atoms=atoms,
-                    calculator=calculator,
-                    optimize=True,
-                    unique_name=unique_name,
-                    trajectory=trajectory_file,
-                    save_geometry=save_geometry,
-                    multiplicity=ase_multiplicity,
-                    charge=ase_charge,
-                    **vib_params_filtered,
-                )
-            elif task == "ir":
-                ir_run_params = dict(ir_params)
-                output_dir = get_work_dir()
-                ir_run_params["vib_dir"] = output_dir
-                trajectory_file = None
-                save_geometry = False
-                if args.save:
-                    trajectory_file = os.path.join(
-                        output_dir, f"{unique_name}_ir_trajectory.traj"
-                    )
-                    ir_run_params["output_dir"] = output_dir
-                    save_geometry = True
-
-                role_calculators = resolve_role_calculators(
-                    ir_run_params,
-                    (
-                        "optimization_calculator",
-                        "vibration_calculator",
-                        "dipole_calculator",
-                    ),
-                )
-
-                explicit_params = {
-                    "atoms",
-                    "calculator",
-                    "optimization_calculator",
-                    "vibration_calculator",
-                    "dipole_calculator",
-                    "optimize",
-                    "unique_name",
-                    "trajectory",
-                    "save_geometry",
-                }
-                ir_params_filtered = {
-                    k: v for k, v in ir_run_params.items() if k not in explicit_params
-                }
-                atoms, task_results = run_ir(
-                    atoms=atoms,
-                    calculator=calculator,
-                    optimize=True,
-                    unique_name=unique_name,
-                    trajectory=trajectory_file,
-                    save_geometry=save_geometry,
-                    multiplicity=ase_multiplicity,
-                    charge=ase_charge,
-                    **role_calculators,
-                    **ir_params_filtered,
-                )
-            elif task == "ir-thermo":
-                ignore_imag = args.ignore_imag
-                ir_thermo_run_params = {**thermo_params, **ir_params}
-                output_dir = get_work_dir()
-                ir_thermo_run_params["vib_dir"] = output_dir
-                trajectory_file = None
-                save_geometry = False
-                if args.save:
-                    trajectory_file = os.path.join(
-                        output_dir, f"{unique_name}_ir-thermo_trajectory.traj"
-                    )
-                    ir_thermo_run_params["output_dir"] = output_dir
-                    save_geometry = True
-
-                role_calculators = resolve_role_calculators(
-                    ir_thermo_run_params,
-                    (
-                        "optimization_calculator",
-                        "vibration_calculator",
-                        "dipole_calculator",
-                    ),
-                )
-
-                explicit_params = {
-                    "atoms",
-                    "calculator",
-                    "optimization_calculator",
-                    "vibration_calculator",
-                    "dipole_calculator",
-                    "optimize",
-                    "ignore_imag_modes",
-                    "unique_name",
-                    "trajectory",
-                    "save_geometry",
-                }
-                ir_thermo_params_filtered = {
-                    k: v
-                    for k, v in ir_thermo_run_params.items()
-                    if k not in explicit_params
-                }
-                atoms, task_results = run_ir_thermo(
-                    atoms=atoms,
-                    calculator=calculator,
-                    optimize=True,
-                    ignore_imag_modes=ignore_imag,
-                    unique_name=unique_name,
-                    trajectory=trajectory_file,
-                    save_geometry=save_geometry,
-                    multiplicity=ase_multiplicity,
-                    charge=ase_charge,
-                    **role_calculators,
-                    **ir_thermo_params_filtered,
-                )
-            elif task == "thermo":
-                # Pass optimization and thermo parameters
-                # thermo_params = params.get('thermo_params', {})
-                # Decide priority for ignore_imag: CLI flag or param file?
-                # Here, CLI flag takes precedence if set.
-                ignore_imag = (
-                    args.ignore_imag
-                )  # or thermo_params.get('ignore_imag_modes', args.ignore_imag)
-                thermo_run_params = dict(thermo_params)
-                output_dir = get_work_dir()
-                thermo_run_params["vib_dir"] = output_dir
-                trajectory_file = None
-                save_geometry = False
-                if args.save:
-                    trajectory_file = os.path.join(
-                        output_dir, f"{unique_name}_thermo_trajectory.traj"
-                    )
-                    thermo_run_params["output_dir"] = output_dir
-                    save_geometry = True
-                # Filter out explicit parameters to avoid conflicts
-                explicit_params = {
-                    "atoms",
-                    "calculator",
-                    "unique_name",
-                    "ignore_imag_modes",
-                    "trajectory",
-                    "save_geometry",
-                }
-                thermo_params_filtered = {
-                    k: v
-                    for k, v in thermo_run_params.items()
-                    if k not in explicit_params
-                }
-                atoms, task_results = run_thermo(
-                    atoms=atoms,
-                    calculator=calculator,
-                    unique_name=unique_name,
-                    ignore_imag_modes=ignore_imag,
-                    trajectory=trajectory_file,
-                    save_geometry=save_geometry,
-                    multiplicity=ase_multiplicity,
-                    charge=ase_charge,
-                    **thermo_params_filtered,
-                )
-            elif task == "nmr":
-                nmr_run_params = {**nmr_params, **get_nmr_cli_overrides(args)}
-                if not nmr_run_params.get("output_dir"):
-                    nmr_run_params["output_dir"] = os.path.join(
-                        get_work_dir(), f"{unique_name}_nmr"
-                    )
-                atoms, task_results = run_nmr_workflow(
-                    atoms=atoms,
-                    unique_name=unique_name,
-                    **nmr_run_params,
-                )
-            else:
-                raise ValueError(f"Unsupported task '{task}'")
-
-            # Merge task results into main results dict
-            results.update(task_results)
-            logging.debug(f"Completed {task} calculations for file: {xyz_file}")
-        except Exception as e:
-            results[f"{task}_error"] = str(e)
-            logging.error(f"Task '{task}' failed for {xyz_file}: {e}", exc_info=True)
-
-        # Save results
         if args.direct_db and db_path:
-            insert_entry(json.dumps(results, cls=ComplexEncoder), db_path)
+            insert_entry(json.dumps(result, cls=ComplexEncoder), db_path)
         elif not args.direct_db:
             output_file = f"{unique_name}_{task}_{record_stamp}_{rank}.json"
             output_file = os.path.join(get_rank_output_dir(), output_file)
-            save_results(results, output_file)
+            save_results(result, output_file)
 
     # Wait for all processes to finish before combining files
     barrier_start = time.time()
