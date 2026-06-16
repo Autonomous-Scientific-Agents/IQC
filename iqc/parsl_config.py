@@ -61,6 +61,8 @@ def make_aurora_config(
     extra_worker_init: str = "",
     retries: int = 2,
     run_dir: Optional[str] = None,
+    heartbeat_threshold: int = 300,
+    heartbeat_period: int = 30,
 ) -> Config:
     """Build a Parsl Config tuned for ALCF Aurora.
 
@@ -95,6 +97,13 @@ def make_aurora_config(
         single rank's GPU abort no longer kills the job.
     run_dir
         Optional ``runinfo`` directory override.
+    heartbeat_threshold
+        Seconds without a worker heartbeat before Parsl declares the worker
+        lost and reschedules its tasks. Default 300s (vs. Parsl's 120s) to
+        absorb stragglers at the 100+ node scale where MACE model loads and
+        Lustre fan-in can starve heartbeats during cold-start.
+    heartbeat_period
+        Seconds between heartbeats from each worker manager.
     """
 
     if execute_dir is None:
@@ -111,6 +120,8 @@ def make_aurora_config(
                 max_workers_per_node=len(AURORA_TILE_NAMES),
                 cpu_affinity=AURORA_CPU_AFFINITY,
                 prefetch_capacity=0,
+                heartbeat_period=heartbeat_period,
+                heartbeat_threshold=heartbeat_threshold,
                 provider=PBSProProvider(
                     account=account,
                     queue=queue,
