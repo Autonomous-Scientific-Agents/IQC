@@ -53,6 +53,9 @@ mlip = [
 xtb = [
     "xtb",
 ]
+parsl = [
+    "parsl>=2025.1.13",
+]
 test = [
     "pytest>=7.0",
     "pytest-mock",
@@ -84,6 +87,7 @@ multi_line_output = 3
 
 [project.scripts]
 iqc = "iqc.main:main"
+iqc-parsl = "iqc.parsl_dispatch:run_cli"
 iqc-jsonl2parquet = "scripts.jsonl2parquet:run_cli"
 iqc-optimize-parquet = "scripts.optimize_parquet:run_cli"
 iqc-read-parquet = "scripts.read_parquet:run_cli"
