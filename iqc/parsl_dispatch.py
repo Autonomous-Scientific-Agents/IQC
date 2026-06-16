@@ -93,7 +93,14 @@ def _row_app(
 
     from iqc.main import _process_one_row as _proc
 
-    calc = _get_worker_calculator(calc_name, calc_params)
+    # Re-import the cache helper from this module rather than relying on the
+    # @python_app's pickled __globals__: Parsl reconstructs the function on
+    # the worker with a restricted globals dict that does NOT include sibling
+    # module-level helpers, so a bare `_get_worker_calculator(...)` raises
+    # NameError the moment a row is dispatched.
+    from iqc.parsl_dispatch import _get_worker_calculator as _get_calc
+
+    calc = _get_calc(calc_name, calc_params)
     return _proc(
         xyz_index,
         calculator=calc,
