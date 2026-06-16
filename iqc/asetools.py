@@ -726,7 +726,8 @@ def get_calculator(name="mace", **kwargs):
     Args:
         name (str): The name of the calculator ('mace', 'mace-polar', 'xtb',
                     'emt', 'uma', 'uma-s-omol', 'uma-s-omat', 'uma-s-odac',
-                    'uma-m-omol', 'uma-m-omat', or 'uma-m-odac').
+                    'uma-m-omol', 'uma-m-omat', 'uma-m-odac', 'orca', or
+                    'exachem').
         **kwargs: Additional keyword arguments passed to the calculator constructor.
 
     Returns:
@@ -872,6 +873,20 @@ def get_calculator(name="mace", **kwargs):
             )
         except Exception as e:
             logging.warning(f"ORCA initialization failed: {e}. Falling back to MACE.")
+
+    elif name == "exachem":
+        try:
+            from iqc.exachem import ExaChemCalculator
+
+            calculator = ExaChemCalculator(**kwargs)
+            logging.info(
+                f"Using ExaChem calculator with method={calculator.parameters.get('method')}, "
+                f"basis={calculator.parameters.get('basis')}, nproc={calculator.parameters.get('nproc')}"
+            )
+        except ImportError as e:
+            logging.warning(f"ExaChem calculator not importable: {e}. Falling back to MACE.")
+        except Exception as e:
+            logging.warning(f"ExaChem initialization failed: {e}. Falling back to MACE.")
 
     else:
         logging.warning(f"Unknown calculator '{name}'. Falling back to MACE.")
@@ -1668,6 +1683,9 @@ def apply_spin_charge(atoms, calculator, multiplicity=None, charge=0):
         the total spin S, so we set `atoms.info["spin"] = (multiplicity-1)/2`.
       - MACE (`MACECalculator` from mace_mp) and ASE EMT: no spin/charge
         support; a warning is logged if non-default values are requested.
+      - ExaChem (`iqc.exachem.ExaChemCalculator`): writes charge and
+        multiplicity into the calculator parameters which then surface in
+        the SCF section of the generated JSON input.
 
     Returns:
         int: Resolved multiplicity that was applied (after defaulting).
@@ -1699,6 +1717,17 @@ def apply_spin_charge(atoms, calculator, multiplicity=None, charge=0):
         if parameters is not None:
             parameters["charge"] = charge
             parameters["mult"] = multiplicity
+    elif spin_charge_convention == "exachem":
+        # ExaChem reads charge/multiplicity from the SCF section of the input
+        # JSON it generates per call.
+        parameters = getattr(calculator, "parameters", None)
+        if parameters is not None:
+            parameters["charge"] = charge
+            parameters["multiplicity"] = multiplicity
+            if parameters.get("scf_type") is None:
+                parameters["scf_type"] = (
+                    "restricted" if multiplicity == 1 else "unrestricted"
+                )
     elif calc_class in {"MACECalculator", "EMT"}:
         default_mult = get_multiplicity(atoms, charge=charge)
         if charge != 0 or multiplicity != default_mult:
