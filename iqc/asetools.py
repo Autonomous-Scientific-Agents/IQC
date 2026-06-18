@@ -889,6 +889,9 @@ def get_calculator(name="mace", **kwargs):
             logging.warning(f"ORCA initialization failed: {e}. Falling back to MACE.")
 
     elif name == "exachem":
+        # ExaChem is only ever requested explicitly (there is no implicit
+        # exachem path in the codebase). Silently falling back to MACE would
+        # change the level of theory under the user, so fail fast instead.
         try:
             from iqc.exachem import ExaChemCalculator
 
@@ -898,9 +901,16 @@ def get_calculator(name="mace", **kwargs):
                 f"basis={calculator.parameters.get('basis')}, nproc={calculator.parameters.get('nproc')}"
             )
         except ImportError as e:
-            logging.warning(f"ExaChem calculator not importable: {e}. Falling back to MACE.")
+            message = (
+                f"ExaChem calculator not importable: {e}. "
+                "Install ExaChem and its Python bindings, or pick a different calculator."
+            )
+            logging.error(message)
+            raise RuntimeError(message) from e
         except Exception as e:
-            logging.warning(f"ExaChem initialization failed: {e}. Falling back to MACE.")
+            message = f"ExaChem initialization failed: {e}"
+            logging.error(message)
+            raise RuntimeError(message) from e
 
     else:
         logging.warning(f"Unknown calculator '{name}'. Falling back to MACE.")
