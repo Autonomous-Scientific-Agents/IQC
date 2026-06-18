@@ -14,10 +14,25 @@ from __future__ import annotations
 import os
 from typing import Optional
 
+from parsl.addresses import address_by_interface
 from parsl.config import Config
 from parsl.executors import HighThroughputExecutor
 from parsl.launchers import MpiExecLauncher
 from parsl.providers import LocalProvider, PBSProProvider
+
+
+def _aurora_address() -> str:
+    """Force Parsl interchange to bind to the Aurora HSN0 IP.
+
+    Default `address_by_query()` returns the public IP via api.ipify.org, which
+    fails on login nodes (proxy 503) and yields a non-routable address on
+    compute nodes. The interchange then advertises a long list of IPs to the
+    managers (10 interfaces on a typical compute node) and at 100+ node scale
+    most managers fail to find a viable ZMQ route, hit `expire_bad_managers`,
+    and their tasks get re-queued in a heartbeat-cascade that never converges.
+    Pinning to hsn0 avoids the probe list entirely.
+    """
+    return address_by_interface("hsn0")
 
 
 # 6 GPUs x 2 tiles = 12 tile identifiers, one per worker.
@@ -116,6 +131,7 @@ def make_aurora_config(
         "executors": [
             HighThroughputExecutor(
                 label="aurora_htex",
+                address=_aurora_address(),
                 available_accelerators=AURORA_TILE_NAMES,
                 max_workers_per_node=len(AURORA_TILE_NAMES),
                 cpu_affinity=AURORA_CPU_AFFINITY,
@@ -137,6 +153,78 @@ def make_aurora_config(
                     min_blocks=0,
                     max_blocks=max_blocks,
                     cpus_per_node=208,
+                ),
+            ),
+        ],
+        "retries": retries,
+    }
+    if run_dir is not None:
+        cfg_kwargs["run_dir"] = run_dir
+    return Config(**cfg_kwargs)
+
+
+def make_aurora_single_alloc_config(
+    *,
+    nodes_per_block: int,
+    retries: int = 2,
+    run_dir: Optional[str] = None,
+    heartbeat_threshold: int = 300,
+    heartbeat_period: int = 30,
+) -> Config:
+    """Build a Parsl Config that uses the *current* Aurora PBS allocation.
+
+    Unlike ``make_aurora_config`` (which uses PBSProProvider to submit a NEW
+    PBS job for workers), this config uses ``LocalProvider`` paired with
+    ``MpiExecLauncher --ppn 1`` to spawn one ``process_worker_pool.py`` on
+    every node of the allocation we already own.
+
+    This avoids the driver/worker queue race in the two-job architecture: when
+    the script (driver) runs, the workers run too — same PBS job, same wall
+    clock. When the wall clock ends, both stop together. The only cost is the
+    driver lives on the head node alongside one manager + 12 workers, but the
+    driver is a lightweight Python event loop and ZMQ broker so that's fine.
+
+    Caller is responsible for:
+      1. Being inside a PBS allocation.
+      2. Passing the *actual* number of nodes from ``$PBS_NODEFILE``. Parsl's
+         launcher hardcodes ``mpiexec -n (tasks_per_node * nodes_per_block)``;
+         if this is 1, only ONE manager spawns and you waste N-1 nodes.
+
+    Parameters
+    ----------
+    nodes_per_block
+        How many nodes to spread workers across — must match the PBS
+        allocation. Pass ``$(wc -l < $PBS_NODEFILE)``.
+    retries
+        Per-task retry count.
+    run_dir
+        Optional ``runinfo`` directory override.
+    heartbeat_threshold
+        Seconds without heartbeat before a manager is declared lost.
+    heartbeat_period
+        Seconds between heartbeats from each worker manager.
+    """
+
+    cfg_kwargs = {
+        "executors": [
+            HighThroughputExecutor(
+                label="aurora_htex_single",
+                address=_aurora_address(),
+                available_accelerators=AURORA_TILE_NAMES,
+                max_workers_per_node=len(AURORA_TILE_NAMES),
+                cpu_affinity=AURORA_CPU_AFFINITY,
+                prefetch_capacity=0,
+                heartbeat_period=heartbeat_period,
+                heartbeat_threshold=heartbeat_threshold,
+                provider=LocalProvider(
+                    init_blocks=1,
+                    min_blocks=1,
+                    max_blocks=1,
+                    nodes_per_block=nodes_per_block,
+                    launcher=MpiExecLauncher(
+                        bind_cmd="--cpu-bind",
+                        overrides="--ppn 1",
+                    ),
                 ),
             ),
         ],
