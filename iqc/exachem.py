@@ -245,6 +245,12 @@ class ExaChemCalculator(Calculator):
         self.results["exachem_output"] = payload
         self.results["energy_hartree"] = energy_hartree
 
+        # Top-level structured fields (energies in eV, timings in seconds,
+        # method/basis metadata as strings) so the orchestrator can write them
+        # directly to JSONL/SQLite without poking into ``exachem_output``.
+        components = self._extract_components(payload, method)
+        self.results.update(components)
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -451,6 +457,165 @@ class ExaChemCalculator(Calculator):
             f"ExaChem output did not contain a recognized energy for method "
             f"'{method}'. Available keys: {sorted(output)}"
         )
+
+    @staticmethod
+    def _extract_components(
+        payload: Dict[str, Any], method: str
+    ) -> Dict[str, Any]:
+        """Pull SCF / MP2 / CCSD / (T) energy components and method metadata.
+
+        Returns a flat dict suitable for merging into the per-row result
+        record. Energies are converted to eV; timings to seconds. Missing
+        components return ``None`` (e.g. ``mp2_correlation_eV`` for a pure
+        SCF run).
+
+        Field naming matches what the JSONL/SQLite consumers expect:
+            scf_energy_eV, mp2_correlation_eV, ccsd_correlation_eV,
+            t_correction_eV, total_energy_eV,
+            scf_time_s, ccsd_time_s, t_time_s,
+            basis, scf_type, method, frozen_core.
+        """
+
+        output = payload.get("output") or {}
+        input_section = payload.get("input") or {}
+
+        scf_block = output.get("SCF") or {}
+        ccsd_block = output.get("CCSD") or {}
+        ccsd_t_block = output.get("CCSD(T)") or {}
+        mp2_block = output.get("MP2") or {}
+
+        def _ha_to_ev(value):
+            if value is None:
+                return None
+            try:
+                return float(value) * _HARTREE_TO_EV
+            except (TypeError, ValueError):
+                return None
+
+        def _seconds(perf):
+            if not isinstance(perf, dict):
+                return None
+            value = perf.get("total_time")
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        # ---- SCF ---------------------------------------------------------
+        scf_energy_ha = scf_block.get("final_energy")
+        scf_energy_eV = _ha_to_ev(scf_energy_ha)
+        scf_time_s = _seconds(scf_block.get("performance"))
+
+        # ---- CCSD --------------------------------------------------------
+        ccsd_correlation_eV = None
+        ccsd_total_ha = None
+        ccsd_final = ccsd_block.get("final_energy")
+        if isinstance(ccsd_final, dict):
+            ccsd_correlation_eV = _ha_to_ev(ccsd_final.get("correlation"))
+            ccsd_total_ha = ccsd_final.get("total")
+        ccsd_time_s = _seconds(ccsd_block.get("performance"))
+
+        # ---- (T) ---------------------------------------------------------
+        # ExaChem reports both [T] and (T); the canonical "(T)" correction is
+        # the asymmetric one — it's what CCSD(T) total energies use.
+        t_correction_eV = None
+        t_total_ha = None
+        t_energies = ccsd_t_block.get("(T)Energies") or {}
+        if isinstance(t_energies, dict):
+            t_correction_eV = _ha_to_ev(t_energies.get("correction"))
+            t_total_ha = t_energies.get("total")
+        t_time_s = _seconds(ccsd_t_block.get("performance"))
+
+        # ---- MP2 ---------------------------------------------------------
+        # ExaChem's MP2 task output has not been observed in the reference set,
+        # but the existing _extract_energy code reads MP2.final_energy. Mirror
+        # that path: it may be a scalar (total energy) or a dict containing
+        # correlation/total. We surface both correlation (when given) and the
+        # total for use as total_energy when method == mp2.
+        mp2_correlation_eV = None
+        mp2_total_ha = None
+        mp2_final = mp2_block.get("final_energy")
+        if isinstance(mp2_final, dict):
+            mp2_correlation_eV = _ha_to_ev(mp2_final.get("correlation"))
+            mp2_total_ha = mp2_final.get("total")
+        elif mp2_final is not None:
+            mp2_total_ha = mp2_final
+
+        # ---- Total energy (matches highest level requested) --------------
+        if method in ("ccsd_t", "ccsd(t)", "ccsd-t") and t_total_ha is not None:
+            total_energy_eV = _ha_to_ev(t_total_ha)
+        elif method == "ccsd" and ccsd_total_ha is not None:
+            total_energy_eV = _ha_to_ev(ccsd_total_ha)
+        elif method == "mp2" and mp2_total_ha is not None:
+            total_energy_eV = _ha_to_ev(mp2_total_ha)
+        else:
+            total_energy_eV = scf_energy_eV
+
+        # ---- Method metadata (prefer input echo; fall back to molecule) --
+        molecule_section = payload.get("molecule") or {}
+        basis = (
+            (input_section.get("basis") or {}).get("basisset")
+            or (molecule_section.get("basis") or {}).get("basisset")
+        )
+
+        scf_input = input_section.get("SCF") or {}
+        scf_type = scf_input.get("scf_type")
+
+        # Canonical method label: collapse the various ccsd_t aliases.
+        method_label = method
+        if method in ("ccsd(t)", "ccsd-t"):
+            method_label = "ccsd_t"
+        elif method == "hf":
+            method_label = "scf"
+
+        # Frozen-core: CC.freeze is a dict like {"atomic": true, "core": N,
+        # "virtual": N}. Treat any explicit truthy "atomic" or non-zero
+        # "core"/"virtual" as frozen.
+        cc_input = input_section.get("CC") or {}
+        freeze_block = cc_input.get("freeze")
+        if isinstance(freeze_block, dict):
+            frozen_core = bool(
+                freeze_block.get("atomic")
+                or freeze_block.get("core")
+                or freeze_block.get("virtual")
+            )
+        else:
+            frozen_core = False
+
+        return {
+            "scf_energy_eV": scf_energy_eV,
+            "mp2_correlation_eV": mp2_correlation_eV,
+            "ccsd_correlation_eV": ccsd_correlation_eV,
+            "t_correction_eV": t_correction_eV,
+            "total_energy_eV": total_energy_eV,
+            "scf_time_s": scf_time_s,
+            "ccsd_time_s": ccsd_time_s,
+            "t_time_s": t_time_s,
+            "basis": basis,
+            "scf_type": scf_type,
+            "method": method_label,
+            "frozen_core": frozen_core,
+        }
+
+    # Keys written into ``self.results`` by ``_extract_components`` that the
+    # ASE-results-to-row plumbing in ``iqc.asetools`` should copy onto the
+    # top-level per-row dict so the orchestrator can persist them.
+    EXACHEM_RESULT_FIELDS: Tuple[str, ...] = (
+        "scf_energy_eV",
+        "mp2_correlation_eV",
+        "ccsd_correlation_eV",
+        "t_correction_eV",
+        "total_energy_eV",
+        "scf_time_s",
+        "ccsd_time_s",
+        "t_time_s",
+        "basis",
+        "scf_type",
+        "method",
+        "frozen_core",
+    )
 
     @staticmethod
     def _tail(path: Path, n: int) -> str:
