@@ -523,6 +523,13 @@ def _process_one_row(
         return None
 
     # --- Initial result metadata --------------------------------------------
+    # NOTE: ExaChem-specific energy components and method metadata
+    # (scf_energy_eV, mp2_correlation_eV, ccsd_correlation_eV,
+    # t_correction_eV, total_energy_eV, scf_time_s, ccsd_time_s, t_time_s,
+    # basis, scf_type, method, frozen_core) are merged into this dict at the
+    # ``results.update(task_results)`` call below — they live at the top level
+    # and are queryable directly from JSONL/SQLite, not buried inside
+    # ``exachem_output``. See ``ExaChemCalculator._extract_components``.
     model_name = getattr(calculator, "model_name", "") if calculator else ""
     results = {
         "xyz_file": xyz_file,

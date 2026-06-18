@@ -1829,12 +1829,40 @@ def _as_numpy_array(value):
         return None
 
 
+_EXACHEM_TOPLEVEL_FIELDS = (
+    "scf_energy_eV",
+    "mp2_correlation_eV",
+    "ccsd_correlation_eV",
+    "t_correction_eV",
+    "total_energy_eV",
+    "scf_time_s",
+    "ccsd_time_s",
+    "t_time_s",
+    "basis",
+    "scf_type",
+    "method",
+    "frozen_core",
+)
+
+
 def _store_calculator_observables(results, calc, prefix=""):
     """Persist dipoles and MACE-Polar density outputs when present."""
 
     calc_results = getattr(calc, "results", None)
     if not isinstance(calc_results, dict):
         return results
+
+    # ExaChem-specific energy components and method metadata. These are
+    # written by ``ExaChemCalculator._extract_components`` and surfaced here
+    # as top-level keys so the orchestrator can persist them directly to
+    # JSONL/SQLite (without burying them inside ``exachem_output``).
+    if getattr(calc, "_iqc_calculator_family", None) == "exachem":
+        for key in _EXACHEM_TOPLEVEL_FIELDS:
+            if key in calc_results:
+                # Use the prefix only when the caller is gathering a snapshot
+                # of pre-task ("initial_") or post-opt ("opt_") state. For the
+                # final single-point pass (prefix=""), expose the bare names.
+                results[f"{prefix}{key}"] = calc_results[key]
 
     if "dipole" in calc_results:
         results[f"{prefix}dipole"] = _to_serializable_array(calc_results["dipole"])

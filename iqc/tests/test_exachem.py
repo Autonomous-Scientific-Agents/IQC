@@ -11,7 +11,7 @@ import shutil
 from pathlib import Path
 
 import pytest
-from ase import Atoms
+from ase import Atoms, units
 from ase.build import molecule
 
 from iqc.asetools import apply_spin_charge, get_calculator, run_single_point
@@ -21,6 +21,9 @@ from iqc.exachem import (
     _deep_merge,
     _normalize_method,
 )
+
+
+_HARTREE_TO_EV = units.Hartree
 
 
 @pytest.fixture
@@ -213,6 +216,224 @@ def test_get_calculator_exachem_returns_instance():
     assert isinstance(calc, ExaChemCalculator)
     assert calc.parameters["method"] == "scf"
     assert calc.parameters["nproc"] == 2
+
+
+# --- Energy-component extraction --------------------------------------------
+
+# Representative ExaChem CCSD(T) payload, mirroring the shape of the
+# reference outputs shipped with the ExaChem repository (e.g.
+# uracil.cc-pvdz.ccsd_t.json). Energies are in Hartree, timings in seconds.
+#
+# Real-fixture cross-check (verified locally against
+# /lus/flare/projects/IQC/keceli/exachem/ci/reference_output/uracil.cc-pvdz.ccsd_t.json):
+# the field paths used by ``_extract_components`` match. We embed the JSON
+# inline here so the test suite has no external file dependency.
+_CCSD_T_PAYLOAD = {
+    "output": {
+        "SCF": {
+            "final_energy": -76.0,
+            "performance": {"total_time": 1.5},
+        },
+        "CCSD": {
+            "n_iterations": 10,
+            "final_energy": {"correlation": -0.20, "total": -76.20},
+            "performance": {"total_time": 55.0},
+        },
+        "CCSD(T)": {
+            "[T]Energies": {"correction": -0.05, "correlation": -0.25, "total": -76.25},
+            "(T)Energies": {"correction": -0.046, "correlation": -0.246, "total": -76.246},
+            "performance": {"total_time": 12.5},
+        },
+    },
+    "molecule": {"name": "uracil", "basis": {"basisset": "cc-pvdz"}},
+    "input": {
+        "basis": {"basisset": "cc-pvdz"},
+        "SCF": {"scf_type": "restricted", "charge": 0, "multiplicity": 1},
+        "CC": {"threshold": 1e-8, "freeze": {"atomic": True, "core": 0, "virtual": 0}},
+        "TASK": {"ccsd_t": True},
+    },
+}
+
+
+_SCF_ONLY_PAYLOAD = {
+    "output": {
+        "SCF": {
+            "final_energy": -76.0,
+            "performance": {"total_time": 1.0},
+        }
+    },
+    "molecule": {"basis": {"basisset": "def2-tzvp"}},
+    "input": {
+        "basis": {"basisset": "def2-tzvp"},
+        "SCF": {"scf_type": "unrestricted", "multiplicity": 2},
+        "TASK": {"scf": True},
+    },
+}
+
+
+_CCSD_FROZEN_PAYLOAD = {
+    "output": {
+        "SCF": {
+            "final_energy": -229.29,
+            "performance": {"total_time": 0.8},
+        },
+        "CCSD": {
+            "final_energy": {"correlation": -0.32, "total": -229.61},
+            "performance": {"total_time": 2.4},
+        },
+    },
+    "molecule": {"basis": {"basisset": "sto-3g"}},
+    "input": {
+        "basis": {"basisset": "sto-3g"},
+        "SCF": {"scf_type": "restricted"},
+        "CC": {"freeze": {"atomic": True, "core": 0, "virtual": 0}},
+        "TASK": {"ccsd": True},
+    },
+}
+
+
+def _approx_ev(hartree):
+    return pytest.approx(hartree * _HARTREE_TO_EV)
+
+
+def test_extract_components_ccsd_t_full():
+    """All energy components, timings, and method metadata extract for a (T) run."""
+    comp = ExaChemCalculator._extract_components(_CCSD_T_PAYLOAD, "ccsd_t")
+
+    # Energies (eV)
+    assert comp["scf_energy_eV"] == _approx_ev(-76.0)
+    assert comp["ccsd_correlation_eV"] == _approx_ev(-0.20)
+    # The (T) correction is the asymmetric one, not [T].
+    assert comp["t_correction_eV"] == _approx_ev(-0.046)
+    # Total energy for a CCSD(T) run is the (T) total.
+    assert comp["total_energy_eV"] == _approx_ev(-76.246)
+
+    # MP2 is absent from this payload.
+    assert comp["mp2_correlation_eV"] is None
+
+    # Timings (seconds)
+    assert comp["scf_time_s"] == pytest.approx(1.5)
+    assert comp["ccsd_time_s"] == pytest.approx(55.0)
+    assert comp["t_time_s"] == pytest.approx(12.5)
+
+    # Method metadata
+    assert comp["basis"] == "cc-pvdz"
+    assert comp["scf_type"] == "restricted"
+    assert comp["method"] == "ccsd_t"
+    assert comp["frozen_core"] is True
+
+
+def test_extract_components_ccsd_t_alias_method_normalizes():
+    """A user-passed alias like ``ccsd(t)`` should still label method as ``ccsd_t``."""
+    comp = ExaChemCalculator._extract_components(_CCSD_T_PAYLOAD, "ccsd(t)")
+    assert comp["method"] == "ccsd_t"
+    # Total still resolves via the (T)Energies block.
+    assert comp["total_energy_eV"] == _approx_ev(-76.246)
+
+
+def test_extract_components_scf_only_leaves_higher_methods_none():
+    comp = ExaChemCalculator._extract_components(_SCF_ONLY_PAYLOAD, "scf")
+    assert comp["scf_energy_eV"] == _approx_ev(-76.0)
+    assert comp["total_energy_eV"] == _approx_ev(-76.0)
+    assert comp["mp2_correlation_eV"] is None
+    assert comp["ccsd_correlation_eV"] is None
+    assert comp["t_correction_eV"] is None
+    assert comp["ccsd_time_s"] is None
+    assert comp["t_time_s"] is None
+    assert comp["scf_time_s"] == pytest.approx(1.0)
+    assert comp["basis"] == "def2-tzvp"
+    assert comp["scf_type"] == "unrestricted"
+    assert comp["method"] == "scf"
+    assert comp["frozen_core"] is False
+
+
+def test_extract_components_hf_alias_becomes_scf():
+    comp = ExaChemCalculator._extract_components(_SCF_ONLY_PAYLOAD, "hf")
+    assert comp["method"] == "scf"
+
+
+def test_extract_components_ccsd_total_is_ccsd_total_not_scf():
+    comp = ExaChemCalculator._extract_components(_CCSD_FROZEN_PAYLOAD, "ccsd")
+    assert comp["scf_energy_eV"] == _approx_ev(-229.29)
+    assert comp["ccsd_correlation_eV"] == _approx_ev(-0.32)
+    assert comp["total_energy_eV"] == _approx_ev(-229.61)
+    assert comp["t_correction_eV"] is None
+    assert comp["frozen_core"] is True
+    assert comp["basis"] == "sto-3g"
+    assert comp["method"] == "ccsd"
+
+
+def test_extract_components_mp2_scalar_final_energy():
+    # TODO: replace with a real ExaChem MP2 output fixture once one is
+    # captured locally — the ExaChem reference set on disk did not include
+    # any *.mp2.json files. The shape below mirrors the path
+    # ``_extract_energy`` already reads (``output.MP2.final_energy``).
+    payload = {
+        "output": {
+            "SCF": {"final_energy": -76.0},
+            "MP2": {"final_energy": -76.2},
+        },
+        "molecule": {"basis": {"basisset": "cc-pvdz"}},
+        "input": {
+            "basis": {"basisset": "cc-pvdz"},
+            "SCF": {"scf_type": "restricted"},
+            "TASK": {"mp2": True},
+        },
+    }
+    comp = ExaChemCalculator._extract_components(payload, "mp2")
+    assert comp["scf_energy_eV"] == _approx_ev(-76.0)
+    assert comp["total_energy_eV"] == _approx_ev(-76.2)
+    # Scalar final_energy doesn't carry a separate correlation breakdown.
+    assert comp["mp2_correlation_eV"] is None
+    assert comp["method"] == "mp2"
+
+
+def test_extract_components_mp2_dict_final_energy_with_correlation():
+    payload = {
+        "output": {
+            "SCF": {"final_energy": -76.0},
+            "MP2": {
+                "final_energy": {"correlation": -0.2, "total": -76.2},
+            },
+        },
+        "molecule": {"basis": {"basisset": "cc-pvdz"}},
+        "input": {"basis": {"basisset": "cc-pvdz"}, "TASK": {"mp2": True}},
+    }
+    comp = ExaChemCalculator._extract_components(payload, "mp2")
+    assert comp["mp2_correlation_eV"] == _approx_ev(-0.2)
+    assert comp["total_energy_eV"] == _approx_ev(-76.2)
+
+
+def test_extract_components_missing_freeze_returns_false():
+    payload = {
+        "output": {"SCF": {"final_energy": -1.0}},
+        "input": {
+            "basis": {"basisset": "cc-pvdz"},
+            "SCF": {"scf_type": "restricted"},
+            "TASK": {"scf": True},
+            # No CC block at all.
+        },
+    }
+    comp = ExaChemCalculator._extract_components(payload, "scf")
+    assert comp["frozen_core"] is False
+
+
+def test_extract_components_no_basis_in_input_falls_back_to_molecule():
+    payload = {
+        "output": {"SCF": {"final_energy": -1.0}},
+        "molecule": {"basis": {"basisset": "cc-pvtz"}},
+        "input": {"TASK": {"scf": True}, "SCF": {"scf_type": "restricted"}},
+    }
+    comp = ExaChemCalculator._extract_components(payload, "scf")
+    assert comp["basis"] == "cc-pvtz"
+
+
+def test_extract_components_t_prefers_round_t_over_square_t():
+    """ExaChem reports both [T] and (T); the canonical CCSD(T) total uses (T)."""
+    comp = ExaChemCalculator._extract_components(_CCSD_T_PAYLOAD, "ccsd_t")
+    # The [T] total in the fixture is -76.25; the (T) total is -76.246.
+    assert comp["total_energy_eV"] == _approx_ev(-76.246)
+    assert comp["t_correction_eV"] == _approx_ev(-0.046)
 
 
 # --- Integration smoke test --------------------------------------------------
