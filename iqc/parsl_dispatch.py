@@ -27,6 +27,7 @@ import os
 import sys
 import time
 from concurrent.futures import as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -94,6 +95,112 @@ def _load_side_cache(side_cache_path: str) -> dict:
         data = _pickle.load(f)
     _WORKER_SIDE_CACHE[side_cache_path] = data
     return data
+
+
+# Maximum length (in characters) for the {task}_error message persisted in the
+# failure row. Matches the F7 contract's 4 KB cap; truncating here keeps the
+# JSONL file bounded even if Parsl/HTEX surfaces a multi-megabyte traceback.
+_FAILURE_ERROR_MAX_CHARS = 4096
+
+
+def _synthesize_failure_row(
+    xyz_index: int,
+    exception: BaseException,
+    *,
+    args,
+    params_str: str,
+    task: str,
+    calculator_name: str,
+    xyz_files: list,
+    input_mode: str,
+    number_of_files: int,
+) -> dict:
+    """Build a result-record dict for a row whose @python_app exhausted retries.
+
+    The resulting dict must include the same calculation_key fields a successful
+    row would carry so the F5 skip-existing index can recognize it as a known
+    (failed) key. We reconstruct ``initial_xyz`` by re-reading the structure on
+    the driver — failures are rare, so the cost is negligible compared to the
+    rest of the dispatch loop.
+    """
+
+    from iqc.asetools import (
+        atoms2xyz,
+        get_atoms_from_smiles,
+        get_atoms_from_xyz,
+    )
+
+    # Mirror _process_one_row's input descriptor resolution.
+    smiles_input = None
+    xyz_record = None
+    smiles_record = None
+    data_row_index = ""
+    if input_mode == "smiles":
+        smiles_input = xyz_files[0]
+        xyz_file = f"smiles:{smiles_input}"
+    elif input_mode == "data_xyz":
+        xyz_record = xyz_files[xyz_index]
+        xyz_file = f"{args.input}:{args.xyz}[{xyz_record.row_index}]"
+        data_row_index = xyz_record.row_index
+    elif input_mode == "data_smiles":
+        smiles_record = xyz_files[xyz_index]
+        smiles_input = smiles_record.smiles
+        xyz_file = f"{args.input}:{args.smiles}[{smiles_record.row_index}]"
+        data_row_index = smiles_record.row_index
+    elif number_of_files > 1:
+        xyz_file = xyz_files[xyz_index]
+    else:
+        xyz_file = xyz_files[0]
+
+    # Attempt to load the atoms to populate initial_xyz; if that itself fails,
+    # we still emit a failure row but leave initial_xyz empty (the skip-existing
+    # index will then see the row as unique under its empty-xyz hash, which is
+    # the right outcome — a row we can't even read isn't comparable to anything).
+    initial_xyz = ""
+    try:
+        if input_mode == "smiles":
+            atoms = get_atoms_from_smiles(smiles_input)
+        elif input_mode == "data_xyz":
+            atoms = get_atoms_from_xyz(xyz_record.xyz)
+        elif input_mode == "data_smiles":
+            atoms = get_atoms_from_smiles(smiles_input)
+        elif number_of_files > 1:
+            atoms = get_atoms_from_xyz(xyz_file)
+        else:
+            atoms = get_atoms_from_xyz(xyz_file, index=xyz_index)
+        initial_xyz = atoms2xyz(atoms)
+    except Exception as load_err:  # noqa: BLE001 — best-effort hash material
+        logging.warning(
+            "Could not reconstruct initial_xyz for failed row %s (%s): %s",
+            xyz_index,
+            xyz_file,
+            load_err,
+        )
+
+    err_msg = str(exception)
+    if len(err_msg) > _FAILURE_ERROR_MAX_CHARS:
+        err_msg = err_msg[:_FAILURE_ERROR_MAX_CHARS] + "...[truncated]"
+
+    return {
+        "xyz_file": xyz_file,
+        "smiles_input": smiles_input or "",
+        "input_mode": input_mode,
+        "data_input_file": args.input or "",
+        "data_xyz_column": args.xyz if input_mode == "data_xyz" else "",
+        "data_smiles_column": args.smiles if input_mode == "data_smiles" else "",
+        "data_sort_column": args.sort or "",
+        "data_sort_order": args.sort_order if args.sort else "",
+        "data_row_index": data_row_index,
+        "date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "hostname": os.uname().nodename,
+        "task": task,
+        "calculator": calculator_name,
+        "model": "",
+        "initial_xyz": initial_xyz,
+        "params": params_str,
+        f"{task}_error": err_msg,
+        "parsl_retries_exhausted": True,
+    }
 
 
 @python_app
@@ -550,7 +657,10 @@ def main() -> int:
     }
 
     logging.info(f"Submitting {number_of_xyz} row(s) to Parsl...")
-    futures = []
+    # Keep a fut -> xyz_index map so a terminal failure (where Parsl raises on
+    # fut.result() instead of returning a dict) can be turned into a persisted
+    # failure row carrying the correct calculation_key fields. F7.
+    fut_to_index: dict = {}
     for i in range(number_of_xyz):
         # Stamp worker_id with the row index so the result dict has unique IDs.
         # (In production Parsl mode we don't have a stable rank-like number per
@@ -558,15 +668,14 @@ def main() -> int:
         pk = dict(process_kwargs)
         pk["worker_id"] = i
         pk["n_workers"] = number_of_xyz
-        futures.append(
-            _row_app(
-                i,
-                calc_name=calculator_name,
-                calc_params=calc_params,
-                side_cache_path=side_cache_path,
-                process_kwargs=pk,
-            )
+        fut = _row_app(
+            i,
+            calc_name=calculator_name,
+            calc_params=calc_params,
+            side_cache_path=side_cache_path,
+            process_kwargs=pk,
         )
+        fut_to_index[fut] = i
 
     jsonl_file = f"iqc_{task}_results_{run_id}.jsonl"
     completed = 0
@@ -575,12 +684,31 @@ def main() -> int:
     bad_inputs = 0
     try:
         with open(jsonl_file, "w") as outfile:
-            for fut in as_completed(futures):
+            for fut in as_completed(fut_to_index):
                 try:
                     result = fut.result()
                 except Exception as e:
+                    # Parsl exhausted retries; synthesize a failure row that
+                    # carries the same calculation_key fields a successful row
+                    # would, and write it through the same writer code path so
+                    # the F5 skip-existing index recognizes the key as "seen
+                    # (with error)". F7 contract.
                     failed += 1
                     logging.error("row failed after retries: %s", e)
+                    failure_row = _synthesize_failure_row(
+                        fut_to_index[fut],
+                        e,
+                        args=args,
+                        params_str=params_str,
+                        task=task,
+                        calculator_name=calculator_name,
+                        xyz_files=xyz_files,
+                        input_mode=input_mode,
+                        number_of_files=number_of_files,
+                    )
+                    outfile.write(json.dumps(failure_row, cls=ComplexEncoder))
+                    outfile.write("\n")
+                    outfile.flush()
                     continue
                 if result is SKIPPED_EXISTING:
                     skipped_existing += 1
@@ -620,7 +748,9 @@ def main() -> int:
             jsonl_file,
         )
 
-    if completed > 0:
+    # Convert JSONL to parquet if anything was written — both successful and
+    # persisted-failure rows belong in the parquet output (F7).
+    if completed > 0 or failed > 0:
         try:
             convert_jsonl_results_to_parquet(jsonl_file)
         except ValueError as e:
