@@ -363,6 +363,7 @@ SUPPORTED_CALCULATOR_NAMES = {
     "xtb",
     "emt",
     "orca",
+    "exachem",
     "uma",
     "uma-s-omol",
     "uma-s-omat",
