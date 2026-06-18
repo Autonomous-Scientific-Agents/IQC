@@ -1051,6 +1051,21 @@ def main():
         ):
             calc_params.setdefault("keep_artifacts", True)
 
+        # F9: route --artifact-retention / --artifact-root (CLI) into the
+        # ExaChem calculator's artifact_retention dict so the F9 archive
+        # hook fires without needing a YAML override.
+        if (
+            str(calculator_name).lower() == "exachem"
+            and getattr(args, "artifact_retention", "off") == "on"
+        ):
+            existing = calc_params.get("artifact_retention") or {}
+            existing.setdefault("enabled", True)
+            existing.setdefault("compress", True)
+            ar = getattr(args, "artifact_root", None)
+            if ar:
+                existing.setdefault("destination_root", ar)
+            calc_params["artifact_retention"] = existing
+
         # Initialize the calculator
         try:
             calculator = get_calculator(name=calculator_name, **calc_params)
