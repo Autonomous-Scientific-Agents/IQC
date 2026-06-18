@@ -78,6 +78,45 @@ def test_calculation_exists_uses_database_identity(tmp_path):
     )
 
 
+def test_calculation_exists_include_errors_false_skips_failed_rows(tmp_path):
+    db_path = tmp_path / "calculations.db"
+    failed_record = calculation_record(7, single_error="SCF diverged")
+    insert_entry(json.dumps(failed_record), db_path)
+
+    # Default include_errors=True: row is present.
+    assert calculation_exists(
+        db_path,
+        failed_record["initial_xyz"],
+        failed_record["params"],
+        failed_record["calculator"],
+        failed_record["model"],
+        failed_record["task"],
+    )
+    # F5 contract: include_errors=False ignores failed rows so they re-run.
+    assert not calculation_exists(
+        db_path,
+        failed_record["initial_xyz"],
+        failed_record["params"],
+        failed_record["calculator"],
+        failed_record["model"],
+        failed_record["task"],
+        include_errors=False,
+    )
+
+    # A successful row with a distinct key still counts under include_errors=False.
+    ok_record = calculation_record(8)
+    insert_entry(json.dumps(ok_record), db_path)
+    assert calculation_exists(
+        db_path,
+        ok_record["initial_xyz"],
+        ok_record["params"],
+        ok_record["calculator"],
+        ok_record["model"],
+        ok_record["task"],
+        include_errors=False,
+    )
+
+
 def test_calculation_key_from_record_matches_explicit_key():
     record = calculation_record(1)
 

@@ -108,7 +108,17 @@ def test_build_completed_calculation_index_reads_json_and_jsonl(tmp_path):
 
     assert calculation_key_from_record(record_from_json) in index
     assert calculation_key_from_record(record_from_jsonl) in index
-    assert summary == {"sources": 2, "files": 2, "records": 2, "invalid": 2}
+    assert summary == {
+        "sources": 2,
+        "files": 2,
+        "records": 2,
+        "invalid": 2,
+        "ok": 2,
+        "error": 0,
+    }
+    # Both records succeeded; the index now exposes status per F5.
+    assert index[calculation_key_from_record(record_from_json)] == "ok"
+    assert index[calculation_key_from_record(record_from_jsonl)] == "ok"
 
 
 def test_convert_jsonl_results_to_parquet_writes_neighbor_file(tmp_path):

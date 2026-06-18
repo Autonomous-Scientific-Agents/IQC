@@ -123,11 +123,39 @@ def _iter_result_records(result_file):
         yield None
 
 
-def build_completed_calculation_index(sources):
-    """Build a set of calculation keys from existing IQC result files."""
+def _record_status(record):
+    """Classify an IQC result record as 'ok' or 'error' based on {task}_error keys."""
 
-    index = set()
-    summary = {"sources": len(sources), "files": 0, "records": 0, "invalid": 0}
+    # A record is considered an error if it has a non-empty <task>_error key.
+    # F7 also marks Parsl terminal failures with parsl_retries_exhausted=True.
+    task = record.get("task")
+    if task:
+        err_key = f"{task}_error"
+        err_val = record.get(err_key)
+        if err_val:
+            return "error"
+    # Fallback: scan for any *_error key with truthy value (defensive against
+    # records written before a task field was finalized).
+    for key, value in record.items():
+        if isinstance(key, str) and key.endswith("_error") and value:
+            return "error"
+    if record.get("parsl_retries_exhausted"):
+        return "error"
+    return "ok"
+
+
+def build_completed_calculation_index(sources, include_errors=True):
+    """Map calculation keys to 'ok'/'error' so callers can skip selectively."""
+
+    index = {}
+    summary = {
+        "sources": len(sources),
+        "files": 0,
+        "records": 0,
+        "invalid": 0,
+        "ok": 0,
+        "error": 0,
+    }
     seen_files = set()
 
     for source in sources:
@@ -141,11 +169,21 @@ def build_completed_calculation_index(sources):
                     summary["invalid"] += 1
                     continue
                 try:
-                    index.add(calculation_key_from_record(record))
+                    key = calculation_key_from_record(record)
                 except (TypeError, ValueError):
                     summary["invalid"] += 1
                     continue
+                status = _record_status(record)
                 summary["records"] += 1
+                summary[status] += 1
+                if status == "error" and not include_errors:
+                    continue
+                # Prefer 'ok' over 'error' when both records exist for the same
+                # key (a later successful retry should win over an earlier failure).
+                existing = index.get(key)
+                if existing == "ok":
+                    continue
+                index[key] = status
 
     return index, summary
 
@@ -567,8 +605,14 @@ def _process_one_row(
             results["model"],
             results["task"],
         )
+        # With --retry-failed-only, the index already excludes error rows so a
+        # plain `in` check below preserves the F5 contract: skip only successes.
+        require_ok = getattr(args, "retry_failed_only", False)
         skip_source = None
-        if current_key in completed_file_index:
+        index_status = completed_file_index.get(current_key) if isinstance(
+            completed_file_index, dict
+        ) else ("ok" if current_key in completed_file_index else None)
+        if index_status is not None and (not require_ok or index_status == "ok"):
             skip_source = "result files"
         elif db_path and calculation_exists(
             db_path,
@@ -577,6 +621,7 @@ def _process_one_row(
             results["calculator"],
             results["model"],
             results["task"],
+            include_errors=not require_ok,
         ):
             skip_source = "database"
 
@@ -1104,7 +1149,7 @@ def main():
     if db_path:
         comm.Barrier()
 
-    completed_file_index = set()
+    completed_file_index = {}
     if args.skip_existing:
         if rank == 0:
             skip_sources = (
@@ -1112,8 +1157,11 @@ def main():
                 if args.skip_existing_from
                 else _default_skip_existing_sources()
             )
+            include_errors = not getattr(args, "retry_failed_only", False)
             completed_file_index, skip_index_summary = (
-                build_completed_calculation_index(skip_sources)
+                build_completed_calculation_index(
+                    skip_sources, include_errors=include_errors
+                )
             )
             if db_path or completed_file_index:
                 logging.info(

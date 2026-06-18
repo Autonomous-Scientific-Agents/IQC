@@ -236,8 +236,16 @@ def _prepare_calculation_row(json_line, debug=False):
     return (geometry_hash, params_hash, calculator, model, task, blob_data)
 
 
-def calculation_exists(db_path, initial_xyz, params, calculator="", model="", task=""):
-    """Return True if the calculation key already exists in the database."""
+def calculation_exists(
+    db_path,
+    initial_xyz,
+    params,
+    calculator="",
+    model="",
+    task="",
+    include_errors=True,
+):
+    """Return True if a matching calculation row exists (success or, per F5, error)."""
 
     path = Path(db_path).expanduser()
     if str(path) != ":memory:" and not path.exists():
@@ -247,20 +255,55 @@ def calculation_exists(db_path, initial_xyz, params, calculator="", model="", ta
 
     with _connect(db_path) as conn:
         _ensure_schema(conn)
-        row = conn.execute(
+        if include_errors:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM calculations
+                WHERE geometry_hash = ?
+                  AND params_hash = ?
+                  AND calculator = ?
+                  AND model = ?
+                  AND task = ?
+                LIMIT 1
+                """,
+                key,
+            ).fetchone()
+            return row is not None
+        # F5: include_errors=False means a row only "exists" if it succeeded.
+        rows = conn.execute(
             """
-            SELECT 1
+            SELECT blob_data
             FROM calculations
             WHERE geometry_hash = ?
               AND params_hash = ?
               AND calculator = ?
               AND model = ?
               AND task = ?
-            LIMIT 1
             """,
             key,
-        ).fetchone()
-    return row is not None
+        ).fetchall()
+    return any(_blob_is_success(blob, task) for (blob,) in rows)
+
+
+def _blob_is_success(blob, task):
+    """Return True if a stored row's blob_data has no recorded error."""
+
+    try:
+        data = json.loads(blob)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    err_key = f"{task}_error" if task else None
+    if err_key and data.get(err_key):
+        return False
+    if data.get("parsl_retries_exhausted"):
+        return False
+    for k, v in data.items():
+        if isinstance(k, str) and k.endswith("_error") and v:
+            return False
+    return True
 
 
 def _insert_rows(conn, rows):

@@ -209,6 +209,14 @@ def get_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--retry-failed-only",
+        help=(
+            "With --skip-existing: skip only successful entries from the index, "
+            "so previously-failed calculations are re-attempted in this run."
+        ),
+        action="store_true",
+    )
+    parser.add_argument(
         "--skip-existing-from",
         nargs="+",
         default=None,

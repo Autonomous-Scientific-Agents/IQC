@@ -465,14 +465,17 @@ def main() -> int:
         logging.info(f"Checking/Creating database at: {db_path}")
         create_database(db_path)
 
-    completed_file_index: set = set()
+    completed_file_index: dict = {}
     if args.skip_existing:
         skip_sources = (
             [Path(s).expanduser() for s in args.skip_existing_from]
             if args.skip_existing_from
             else _default_skip_existing_sources()
         )
-        completed_file_index, summary = build_completed_calculation_index(skip_sources)
+        include_errors = not getattr(args, "retry_failed_only", False)
+        completed_file_index, summary = build_completed_calculation_index(
+            skip_sources, include_errors=include_errors
+        )
         if db_path or completed_file_index:
             logging.info(
                 "Skip-existing enabled: indexed %s completed calculation(s) from "
