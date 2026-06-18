@@ -466,9 +466,28 @@ def _mace_polar_cache_name(checkpoint_url):
 
 
 def _mace_polar_cached_model_path(model):
-    """Return the cached checkpoint path for a MACE-Polar model key or URL."""
+    """Return the cached checkpoint path for a MACE-Polar model key or URL.
+
+    Picks the path that *mace itself* uses (sanitized URL basename) when it
+    exists on disk; only falls back to ``polar_model_paths`` (which reports
+    the un-sanitized name like ``MACE-POLAR-1-S.model``) if the sanitized
+    cache is missing. This avoids the spurious-download trap: the previous
+    order checked the un-sanitized path first, found nothing (mace caches
+    under the sanitized name), and acquired the download lock every time —
+    which on Aurora compute nodes (no github) just hangs.
+    """
 
     model = str(model)
+
+    sanitized_path = None
+    checkpoint_url = MACE_POLAR_MODEL_URLS.get(model)
+    if checkpoint_url is None and model.startswith("https:"):
+        checkpoint_url = model
+    if checkpoint_url is not None:
+        sanitized_path = _default_mace_cache_dir() / _mace_polar_cache_name(checkpoint_url)
+    if sanitized_path is not None and sanitized_path.exists():
+        return sanitized_path
+
     try:
         from mace.calculators import foundations_models
 
@@ -479,12 +498,7 @@ def _mace_polar_cached_model_path(model):
     except Exception:
         pass
 
-    checkpoint_url = MACE_POLAR_MODEL_URLS.get(model)
-    if checkpoint_url is None and model.startswith("https:"):
-        checkpoint_url = model
-    if checkpoint_url is None:
-        return None
-    return _default_mace_cache_dir() / _mace_polar_cache_name(checkpoint_url)
+    return sanitized_path
 
 
 def _download_mace_polar_checkpoint(model):
