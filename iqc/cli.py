@@ -148,6 +148,7 @@ def get_args(argv=None):
             "xtb",
             "emt",
             "orca",
+            "exachem",
             "uma",
             "uma-s-omol",
             "uma-s-omat",
