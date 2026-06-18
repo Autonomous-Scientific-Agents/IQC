@@ -24,8 +24,10 @@ import logging
 import os
 import shutil
 import subprocess
+import tarfile
+import tempfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from ase import units
 from ase.calculators.calculator import (
@@ -92,6 +94,222 @@ def _atoms_to_coordinate_lines(atoms) -> List[str]:
     for symbol, (x, y, z) in zip(atoms.get_chemical_symbols(), atoms.get_positions()):
         lines.append(f"{symbol:<3s} {x: .12f} {y: .12f} {z: .12f}")
     return lines
+
+
+# ---------------------------------------------------------------------------
+# Restart-from-prior-amplitudes helpers (F10)
+# ---------------------------------------------------------------------------
+#
+# Kinds we restage when starting from a prior calculation. Anything else
+# (output JSON, logs, scratch files) is deliberately ignored — the next run
+# regenerates them.
+_RESTART_KINDS = ("mo", "amplitudes", "cholesky", "restart")
+
+# Glob patterns used to classify on-disk artifacts when a F4-style manifest
+# is unavailable. Same heuristics as the F4 contract so manifest-based and
+# manifest-less staging produce equivalent files.
+_KIND_PATTERNS: Dict[str, Tuple[str, ...]] = {
+    "mo": ("*.mo*", "*.molden"),
+    "amplitudes": ("*t1*", "*t2*", "*ccsd_t*"),
+    "cholesky": ("*chol*", "*cd_vec*"),
+    "restart": ("*restart*", "*chkpt*"),
+}
+
+
+def _classify_file_kind(name: str) -> Optional[str]:
+    """Return the artifact kind for a file basename, or None if not restartable."""
+
+    for kind, patterns in _KIND_PATTERNS.items():
+        for pat in patterns:
+            if fnmatch.fnmatch(name, pat):
+                return kind
+    return None
+
+
+def _looks_like_calculation_key(value: Any) -> bool:
+    """True for inputs that should be resolved via the SQLite manifest index."""
+
+    if isinstance(value, dict):
+        return "geometry_hash" in value
+    if isinstance(value, (list, tuple)):
+        return len(value) == 5
+    if isinstance(value, str):
+        # 64-hex sha256 string treated as a geometry_hash digest.
+        return len(value) == 64 and all(c in "0123456789abcdef" for c in value.lower())
+    return False
+
+
+def _lookup_artifact_in_sqlite(
+    restart_id: Union[str, dict, list, tuple],
+    db_path: Optional[Path],
+) -> Optional[Path]:
+    """Look up an archived run directory in the F4 artifact_manifest blob_data.
+
+    F4 stores run_dir / artifact_archive inside the per-row blob_data JSON
+    (per the shared contract); F9 stores artifact_archive there too. We
+    return the absolute path to the archive (preferred) or run_dir, or None
+    when the table isn't present (F4 not merged yet) or no row matches.
+    Failures are logged and swallowed so a missing table never breaks a run.
+    """
+
+    if db_path is None or not Path(db_path).exists():
+        logging.warning(
+            "restart_from points at a calculation key but no SQLite DB is "
+            "available; cannot resolve."
+        )
+        return None
+
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='calculations'"
+            )
+            if cursor.fetchone() is None:
+                logging.warning(
+                    "calculations table absent in %s; cannot resolve restart_from",
+                    db_path,
+                )
+                return None
+            rows = conn.execute("SELECT blob_data FROM calculations").fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:  # pragma: no cover - defensive against schema drift
+        logging.warning("Failed to query artifact manifests from %s: %s", db_path, exc)
+        return None
+
+    target_geometry_hash: Optional[str] = None
+    if isinstance(restart_id, str):
+        target_geometry_hash = restart_id
+    elif isinstance(restart_id, dict):
+        target_geometry_hash = restart_id.get("geometry_hash")
+    elif isinstance(restart_id, (list, tuple)) and len(restart_id) == 5:
+        target_geometry_hash = restart_id[0]
+
+    for (blob,) in rows:
+        try:
+            record = json.loads(blob)
+        except (TypeError, ValueError):
+            continue
+        if target_geometry_hash and record.get("geometry_hash") != target_geometry_hash:
+            continue
+        archive = record.get("artifact_archive")
+        if archive and Path(archive).exists():
+            return Path(archive)
+        run_dir = record.get("run_dir")
+        if run_dir and Path(run_dir).exists():
+            return Path(run_dir)
+
+    logging.warning(
+        "No matching artifact found for restart_id %r in %s", restart_id, db_path
+    )
+    return None
+
+
+def resolve_restart_artifact(
+    restart_id: Union[str, Path, dict, list, tuple],
+    *,
+    db_path: Optional[Path] = None,
+) -> Optional[Path]:
+    """Map a restart_from value to an on-disk source (directory or .tar.gz).
+
+    Filesystem inputs (existing paths) are returned as-is so callers without
+    a SQLite manifest still work. Calculation-key dicts / hashes / tuples
+    trigger an artifact_manifest lookup; missing table or no-hit returns
+    None with a logged warning rather than raising.
+    """
+
+    if isinstance(restart_id, Path):
+        return restart_id if restart_id.exists() else None
+
+    if isinstance(restart_id, str):
+        candidate = Path(restart_id)
+        if candidate.exists():
+            return candidate
+        # Not an on-disk path -- fall through to manifest lookup below.
+
+    if _looks_like_calculation_key(restart_id):
+        return _lookup_artifact_in_sqlite(restart_id, db_path)
+
+    return None
+
+
+def _stage_restart_artifacts(
+    source: Path,
+    run_dir: Path,
+    *,
+    manifest: Optional[List[Dict[str, Any]]] = None,
+) -> List[Path]:
+    """Copy restart-relevant files from ``source`` into ``run_dir``.
+
+    ``source`` is either a directory (typically a prior ExaChem run_dir) or
+    a ``.tar.gz`` archive produced by F9. When ``manifest`` is supplied
+    (F4-shaped list of dicts with ``path`` + ``kind``), it drives selection;
+    otherwise files matching the kind patterns are picked up by basename.
+    Returns the list of staged destination paths.
+    """
+
+    if not source.exists():
+        raise CalculationFailed(f"restart_from source does not exist: {source}")
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    extracted: Optional[tempfile.TemporaryDirectory] = None
+    try:
+        suffixes = "".join(source.suffixes[-2:]) if source.is_file() else ""
+        if source.is_file() and (suffixes in (".tar.gz",) or source.suffix == ".tgz"):
+            extracted = tempfile.TemporaryDirectory(prefix="exachem_restart_")
+            with tarfile.open(source, "r:gz") as tf:
+                tf.extractall(extracted.name)
+            walk_root = Path(extracted.name)
+        elif source.is_dir():
+            walk_root = source
+        else:
+            raise CalculationFailed(
+                f"restart_from source must be a directory or .tar.gz: {source}"
+            )
+
+        staged: List[Path] = []
+
+        if manifest:
+            # Manifest-driven: trust the kinds F4 already classified.
+            for entry in manifest:
+                kind = entry.get("kind")
+                src_path_str = entry.get("path")
+                if kind not in _RESTART_KINDS or not src_path_str:
+                    continue
+                src_path = Path(src_path_str)
+                if extracted is not None and src_path.is_absolute():
+                    matches = list(walk_root.rglob(src_path.name))
+                    if not matches:
+                        continue
+                    src_path = matches[0]
+                if not src_path.exists():
+                    continue
+                dest = run_dir / src_path.name
+                shutil.copy2(src_path, dest)
+                staged.append(dest)
+        else:
+            # Glob-pattern fallback (no manifest available).
+            seen: set = set()
+            for path in walk_root.rglob("*"):
+                if not path.is_file():
+                    continue
+                if _classify_file_kind(path.name) is None:
+                    continue
+                if path.name in seen:
+                    continue
+                seen.add(path.name)
+                dest = run_dir / path.name
+                shutil.copy2(path, dest)
+                staged.append(dest)
+
+        return staged
+    finally:
+        if extracted is not None:
+            extracted.cleanup()
 
 
 class ExaChemCalculator(Calculator):
@@ -214,6 +432,17 @@ class ExaChemCalculator(Calculator):
         input_path = run_dir / "input.json"
         stdout_path = run_dir / "exachem.log"
 
+        # Stage prior-run artifacts (MO files, T1/T2 amplitudes, Cholesky
+        # vectors, restart blobs) into the new run_dir before launching
+        # ExaChem. The restart_from value is consumed here and stripped
+        # from the JSON input by _build_input_json.
+        restart_from = None
+        exachem_input = params.get("exachem_input")
+        if isinstance(exachem_input, dict) and "restart_from" in exachem_input:
+            restart_from = exachem_input["restart_from"]
+        if restart_from is not None:
+            self._stage_restart_inputs(restart_from, run_dir)
+
         input_json = self._build_input_json(self.atoms, params, method)
         with open(input_path, "w") as fh:
             json.dump(input_json, fh, indent=2)
@@ -334,6 +563,51 @@ class ExaChemCalculator(Calculator):
             shutil.rmtree(run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
         return run_dir
+
+    def _stage_restart_inputs(
+        self, restart_from: Any, run_dir: Path
+    ) -> List[Path]:
+        """Resolve and copy restart artifacts into ``run_dir``.
+
+        Accepts a filesystem path / Path / .tar.gz, a calculation_key dict,
+        a 5-tuple key, or a 64-hex geometry hash. Returns the staged
+        destinations (empty if nothing was resolved); logs a warning rather
+        than failing when a hash-based lookup misses (F4 may not yet be
+        merged in production).
+        """
+
+        # Allow callers to pass a dict like
+        # {"source": <path>, "manifest": [...], "db_path": <path>}
+        # to provide an explicit manifest alongside the source.
+        manifest: Optional[List[Dict[str, Any]]] = None
+        db_path: Optional[Path] = None
+        if isinstance(restart_from, dict) and "source" in restart_from:
+            source_value = restart_from["source"]
+            manifest = restart_from.get("manifest")
+            if restart_from.get("db_path") is not None:
+                db_path = Path(restart_from["db_path"])
+        else:
+            source_value = restart_from
+            env_db = os.environ.get("IQC_SQLITE_DB")
+            db_path = Path(env_db) if env_db else None
+
+        source = resolve_restart_artifact(source_value, db_path=db_path)
+        if source is None:
+            logging.warning(
+                "Could not resolve restart_from=%r; proceeding without "
+                "restart artifacts.",
+                restart_from,
+            )
+            return []
+
+        staged = _stage_restart_artifacts(source, run_dir, manifest=manifest)
+        logging.info(
+            "Staged %d restart artifact(s) from %s into %s",
+            len(staged),
+            source,
+            run_dir,
+        )
+        return staged
 
     @staticmethod
     def _resolve_binary(params: Dict[str, Any]) -> str:
@@ -461,7 +735,12 @@ class ExaChemCalculator(Calculator):
             _deep_merge(input_json["basis"], dict(params["basis_block"]))
 
         if params.get("exachem_input"):
-            _deep_merge(input_json, dict(params["exachem_input"]))
+            # ``restart_from`` is an F10 hint consumed by ``calculate()``; it
+            # is not an ExaChem JSON key and must be stripped before merging.
+            exachem_input = dict(params["exachem_input"])
+            exachem_input.pop("restart_from", None)
+            if exachem_input:
+                _deep_merge(input_json, exachem_input)
 
         return input_json
 

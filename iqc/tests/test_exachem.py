@@ -9,6 +9,8 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
+import tarfile
 from pathlib import Path
 from unittest import mock
 
@@ -20,8 +22,11 @@ from iqc.asetools import _store_calculator_observables, apply_spin_charge, get_c
 from iqc.exachem import (
     ExaChemCalculator,
     _atoms_to_coordinate_lines,
+    _classify_file_kind,
     _deep_merge,
     _normalize_method,
+    _stage_restart_artifacts,
+    resolve_restart_artifact,
 )
 
 
@@ -436,6 +441,238 @@ def test_extract_components_t_prefers_round_t_over_square_t():
     # The [T] total in the fixture is -76.25; the (T) total is -76.246.
     assert comp["total_energy_eV"] == _approx_ev(-76.246)
     assert comp["t_correction_eV"] == _approx_ev(-0.046)
+
+
+# --- F10: restart from prior amplitudes -------------------------------------
+
+
+def _write_fake_artifact_files(root: Path):
+    """Create a representative set of files an ExaChem run would emit."""
+
+    (root / "h2o.cc-pvdz_files" / "restricted").mkdir(parents=True)
+    base = root / "h2o.cc-pvdz_files" / "restricted"
+    # Amplitudes
+    (base / "h2o.cc-pvdz.ccsd.t1_amp").write_bytes(b"FAKE_T1")
+    (base / "h2o.cc-pvdz.ccsd.t2_amp").write_bytes(b"FAKE_T2")
+    # MO file
+    (base / "h2o.cc-pvdz.movecs").write_bytes(b"FAKE_MO")
+    # Cholesky vector
+    (base / "h2o.cc-pvdz.cholvecs").write_bytes(b"FAKE_CHOL")
+    # Output JSON that should NOT be staged
+    (base / "h2o.cc-pvdz.scf.json").write_text("{}")
+    # Log file that should NOT be staged
+    (root / "exachem.log").write_text("done\n")
+
+
+def test_classify_file_kind_recognizes_canonical_artifacts():
+    assert _classify_file_kind("h2o.cc-pvdz.ccsd.t1_amp") == "amplitudes"
+    assert _classify_file_kind("h2o.cc-pvdz.ccsd.t2_amp") == "amplitudes"
+    assert _classify_file_kind("h2o.cc-pvdz.movecs") == "mo"
+    assert _classify_file_kind("h2o.cc-pvdz.cholvecs") == "cholesky"
+    assert _classify_file_kind("anything.restart") == "restart"
+    assert _classify_file_kind("exachem.log") is None
+    assert _classify_file_kind("input.json") is None
+
+
+def test_resolve_restart_artifact_passes_through_existing_path(tmp_path):
+    d = tmp_path / "prev_run"
+    d.mkdir()
+    assert resolve_restart_artifact(str(d)) == d
+    assert resolve_restart_artifact(d) == d
+
+
+def test_resolve_restart_artifact_missing_path_with_no_db_returns_none(caplog):
+    # Looks like a hash but no DB available; should warn + return None.
+    fake_hash = "a" * 64
+    out = resolve_restart_artifact(fake_hash, db_path=None)
+    assert out is None
+
+
+def test_resolve_restart_artifact_returns_none_when_table_missing(tmp_path):
+    """Hash-based lookup must not raise when F4 hasn't been merged."""
+    db = tmp_path / "empty.db"
+    conn = sqlite3.connect(str(db))
+    # Intentionally do NOT create the calculations table.
+    conn.close()
+    out = resolve_restart_artifact("a" * 64, db_path=db)
+    assert out is None
+
+
+def test_resolve_restart_artifact_finds_archive_via_blob_data(tmp_path):
+    """Hash lookup should locate an archive recorded in blob_data."""
+    archive = tmp_path / "fake.tar.gz"
+    # Create a real tar.gz so Path.exists() succeeds.
+    with tarfile.open(archive, "w:gz") as tf:
+        f = tmp_path / "placeholder"
+        f.write_text("x")
+        tf.add(f, arcname="placeholder")
+    db = tmp_path / "manifest.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE calculations ("
+        "id INTEGER PRIMARY KEY, geometry_hash TEXT, params_hash TEXT, "
+        "calculator TEXT, model TEXT, task TEXT, blob_data TEXT)"
+    )
+    blob = {
+        "geometry_hash": "a" * 64,
+        "artifact_archive": str(archive),
+        "run_dir": None,
+    }
+    conn.execute(
+        "INSERT INTO calculations VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (1, "a" * 64, "p" * 64, "exachem", "ccsd_t/cc-pvdz", "energy", json.dumps(blob)),
+    )
+    conn.commit()
+    conn.close()
+
+    found = resolve_restart_artifact("a" * 64, db_path=db)
+    assert found == archive
+
+
+def test_stage_restart_artifacts_from_directory_copies_only_restartable(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    _write_fake_artifact_files(src)
+    dest = tmp_path / "new_run"
+
+    staged = _stage_restart_artifacts(src, dest)
+
+    names = sorted(p.name for p in staged)
+    assert "h2o.cc-pvdz.ccsd.t1_amp" in names
+    assert "h2o.cc-pvdz.ccsd.t2_amp" in names
+    assert "h2o.cc-pvdz.movecs" in names
+    assert "h2o.cc-pvdz.cholvecs" in names
+    # Output JSON and logs must NOT be staged.
+    assert not any("scf.json" in n for n in names)
+    assert "exachem.log" not in names
+    # Files are real copies (not zero-byte stubs).
+    assert (dest / "h2o.cc-pvdz.ccsd.t1_amp").read_bytes() == b"FAKE_T1"
+
+
+def test_stage_restart_artifacts_from_targz_extracts_and_copies(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    _write_fake_artifact_files(src)
+    archive = tmp_path / "prev.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        tf.add(src, arcname="src")
+
+    dest = tmp_path / "new_run"
+    staged = _stage_restart_artifacts(archive, dest)
+    names = sorted(p.name for p in staged)
+    assert "h2o.cc-pvdz.ccsd.t1_amp" in names
+    assert "h2o.cc-pvdz.movecs" in names
+    assert not any("scf.json" in n for n in names)
+
+
+def test_stage_restart_artifacts_with_manifest_uses_kind_filter(tmp_path):
+    """A F4-shaped manifest drives selection and ignores unlisted kinds."""
+    src = tmp_path / "src"
+    src.mkdir()
+    _write_fake_artifact_files(src)
+
+    base = src / "h2o.cc-pvdz_files" / "restricted"
+    manifest = [
+        {"path": str(base / "h2o.cc-pvdz.ccsd.t1_amp"), "kind": "amplitudes",
+         "size_bytes": 7, "sha256": "x"},
+        {"path": str(base / "h2o.cc-pvdz.movecs"), "kind": "mo",
+         "size_bytes": 7, "sha256": "x"},
+        # 'output' kind must be skipped.
+        {"path": str(base / "h2o.cc-pvdz.scf.json"), "kind": "output",
+         "size_bytes": 2, "sha256": "x"},
+    ]
+    dest = tmp_path / "new_run"
+    staged = _stage_restart_artifacts(src, dest, manifest=manifest)
+    names = sorted(p.name for p in staged)
+    assert names == sorted(["h2o.cc-pvdz.ccsd.t1_amp", "h2o.cc-pvdz.movecs"])
+
+
+def test_stage_restart_artifacts_missing_source_raises(tmp_path):
+    from ase.calculators.calculator import CalculationFailed
+
+    with pytest.raises(CalculationFailed):
+        _stage_restart_artifacts(tmp_path / "nope", tmp_path / "run")
+
+
+def test_build_input_json_strips_restart_from(water):
+    """restart_from is an F10 hint and must not appear in the ExaChem JSON."""
+    calc = ExaChemCalculator(
+        method="ccsd",
+        exachem_input={"restart_from": "/some/archive.tar.gz",
+                       "SCF": {"writem": 5}},
+    )
+    payload = calc._build_input_json(water, calc.parameters, "ccsd")
+    assert "restart_from" not in payload
+    assert payload["SCF"]["writem"] == 5
+
+
+def test_calculate_stages_amplitudes_before_mpiexec(tmp_path, water):
+    """End-to-end: a CCSD restart_from archive stages T1/T2 + MO files
+    into the new run_dir before subprocess.run is invoked, then short-
+    circuits the actual ExaChem binary call.
+    """
+    # Build a fake archive of a prior run.
+    prev = tmp_path / "prev"
+    prev.mkdir()
+    _write_fake_artifact_files(prev)
+    archive = tmp_path / "prev.tar.gz"
+    with tarfile.open(archive, "w:gz") as tf:
+        tf.add(prev, arcname="prev")
+
+    work = tmp_path / "work"
+    work.mkdir()
+    calc = ExaChemCalculator(
+        method="ccsd",
+        basis="cc-pvdz",
+        directory=str(work),
+        binary="/usr/bin/true",
+        exachem_input={"restart_from": str(archive)},
+    )
+    water.calc = calc
+
+    # Capture what subprocess.run sees AT call time and assert that the
+    # amplitudes are already staged before mpiexec/ExaChem launches.
+    staged_at_launch = {}
+
+    def fake_run(cmd, cwd, stdout, stderr, env, check):
+        run_dir = Path(cwd)
+        staged_at_launch["names"] = sorted(p.name for p in run_dir.iterdir())
+        # Drop a minimal SCF JSON so _locate_output succeeds and the
+        # calculator doesn't raise CalculationFailed.
+        out_dir = run_dir / "input.cc-pvdz_files" / "restricted" / "json"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "input.cc-pvdz.ccsd.json").write_text(
+            json.dumps(
+                {
+                    "output": {
+                        "SCF": {"final_energy": -76.0},
+                        "CCSD": {
+                            "final_energy": {"correlation": -0.2, "total": -76.2}
+                        },
+                    },
+                    "input": {
+                        "basis": {"basisset": "cc-pvdz"},
+                        "SCF": {"scf_type": "restricted"},
+                        "TASK": {"ccsd": True},
+                    },
+                }
+            )
+        )
+
+        class _R:
+            returncode = 0
+
+        return _R()
+
+    with mock.patch("iqc.exachem.subprocess.run", side_effect=fake_run):
+        energy_eV = water.get_potential_energy()
+
+    assert "h2o.cc-pvdz.ccsd.t1_amp" in staged_at_launch["names"]
+    assert "h2o.cc-pvdz.ccsd.t2_amp" in staged_at_launch["names"]
+    assert "h2o.cc-pvdz.movecs" in staged_at_launch["names"]
+    # input.json must still be present alongside the staged artifacts.
+    assert "input.json" in staged_at_launch["names"]
+    assert energy_eV < 0
 
 
 # --- Integration smoke test --------------------------------------------------
