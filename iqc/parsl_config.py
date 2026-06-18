@@ -49,18 +49,35 @@ AURORA_CPU_AFFINITY = (
 )
 
 
-def _default_worker_init(venv_activate: str, execute_dir: str) -> str:
+def _default_worker_init(
+    venv_activate: Optional[str] = None,
+    execute_dir: Optional[str] = None,
+) -> str:
     """Worker-init shell snippet used inside every PBSPro job on Aurora.
 
     ``export TMPDIR=/tmp`` is the documented Aurora workaround for the AF_UNIX
     "path too long" Parsl bug that started appearing in Oct 2025.
+
+    The four trailing exports (``ZE_FLAT_DEVICE_HIERARCHY``,
+    ``ZES_ENABLE_SYSMAN``, ``SYCL_CACHE_PERSISTENT``, ``OMP_NUM_THREADS``) are
+    the per-process env required by ExaChem (and harmless to other Aurora
+    SYCL/oneAPI workloads). Setting them in ``worker_init`` makes them
+    inherited by every task subprocess (e.g. ``mpiexec exachem``).
     """
-    return (
-        "export TMPDIR=/tmp; "
-        "module load frameworks; "
-        f"source {venv_activate}; "
-        f"cd {execute_dir}"
+    parts = ["export TMPDIR=/tmp", "module load frameworks"]
+    if venv_activate:
+        parts.append(f"source {venv_activate}")
+    if execute_dir:
+        parts.append(f"cd {execute_dir}")
+    parts.extend(
+        [
+            "export ZE_FLAT_DEVICE_HIERARCHY=FLAT",
+            "export ZES_ENABLE_SYSMAN=1",
+            "export SYCL_CACHE_PERSISTENT=1",
+            "export OMP_NUM_THREADS=1",
+        ]
     )
+    return "; ".join(parts)
 
 
 def make_aurora_config(
@@ -78,6 +95,7 @@ def make_aurora_config(
     run_dir: Optional[str] = None,
     heartbeat_threshold: int = 300,
     heartbeat_period: int = 30,
+    one_worker_per_node: bool = False,
 ) -> Config:
     """Build a Parsl Config tuned for ALCF Aurora.
 
@@ -119,6 +137,13 @@ def make_aurora_config(
         Lustre fan-in can starve heartbeats during cold-start.
     heartbeat_period
         Seconds between heartbeats from each worker manager.
+    one_worker_per_node
+        When True, run a single Parsl worker per node and let that worker's
+        task own the whole node (all 12 tiles, all cores). Used for codes
+        like ExaChem that fan out internally with their own ``mpiexec``
+        (e.g. 13 ranks/node for CC) — Parsl must NOT also place 12 tasks per
+        node or oversubscription kills everything. Default False preserves
+        the per-tile worker placement for tile-parallel codes.
     """
 
     if execute_dir is None:
@@ -127,35 +152,48 @@ def make_aurora_config(
     if extra_worker_init:
         worker_init = f"{worker_init}; {extra_worker_init}"
 
+    # For node-exclusive tasks (e.g. ExaChem's internal mpiexec), expose 1
+    # worker/node with no per-tile pinning so the task can spawn its own ranks.
+    if one_worker_per_node:
+        accelerators_arg = None
+        max_workers_arg = 1
+        cpu_affinity_arg = "none"
+    else:
+        accelerators_arg = AURORA_TILE_NAMES
+        max_workers_arg = len(AURORA_TILE_NAMES)
+        cpu_affinity_arg = AURORA_CPU_AFFINITY
+
+    htex_kwargs = dict(
+        label="aurora_htex",
+        address=_aurora_address(),
+        max_workers_per_node=max_workers_arg,
+        cpu_affinity=cpu_affinity_arg,
+        prefetch_capacity=0,
+        heartbeat_period=heartbeat_period,
+        heartbeat_threshold=heartbeat_threshold,
+    )
+    if accelerators_arg is not None:
+        htex_kwargs["available_accelerators"] = accelerators_arg
+
+    htex_kwargs["provider"] = PBSProProvider(
+        account=account,
+        queue=queue,
+        worker_init=worker_init,
+        walltime=walltime,
+        scheduler_options=f"#PBS -l filesystems={filesystems}",
+        launcher=MpiExecLauncher(
+            bind_cmd="--cpu-bind",
+            overrides="--ppn 1",
+        ),
+        select_options="",
+        nodes_per_block=nodes_per_block,
+        min_blocks=0,
+        max_blocks=max_blocks,
+        cpus_per_node=208,
+    )
+
     cfg_kwargs = {
-        "executors": [
-            HighThroughputExecutor(
-                label="aurora_htex",
-                address=_aurora_address(),
-                available_accelerators=AURORA_TILE_NAMES,
-                max_workers_per_node=len(AURORA_TILE_NAMES),
-                cpu_affinity=AURORA_CPU_AFFINITY,
-                prefetch_capacity=0,
-                heartbeat_period=heartbeat_period,
-                heartbeat_threshold=heartbeat_threshold,
-                provider=PBSProProvider(
-                    account=account,
-                    queue=queue,
-                    worker_init=worker_init,
-                    walltime=walltime,
-                    scheduler_options=f"#PBS -l filesystems={filesystems}",
-                    launcher=MpiExecLauncher(
-                        bind_cmd="--cpu-bind",
-                        overrides="--ppn 1",
-                    ),
-                    select_options="",
-                    nodes_per_block=nodes_per_block,
-                    min_blocks=0,
-                    max_blocks=max_blocks,
-                    cpus_per_node=208,
-                ),
-            ),
-        ],
+        "executors": [HighThroughputExecutor(**htex_kwargs)],
         "retries": retries,
     }
     if run_dir is not None:
@@ -166,10 +204,14 @@ def make_aurora_config(
 def make_aurora_single_alloc_config(
     *,
     nodes_per_block: int,
+    venv_activate: Optional[str] = None,
+    execute_dir: Optional[str] = None,
+    extra_worker_init: str = "",
     retries: int = 2,
     run_dir: Optional[str] = None,
     heartbeat_threshold: int = 300,
     heartbeat_period: int = 30,
+    one_worker_per_node: bool = False,
 ) -> Config:
     """Build a Parsl Config that uses the *current* Aurora PBS allocation.
 
@@ -195,6 +237,12 @@ def make_aurora_single_alloc_config(
     nodes_per_block
         How many nodes to spread workers across — must match the PBS
         allocation. Pass ``$(wc -l < $PBS_NODEFILE)``.
+    venv_activate
+        Optional path to a venv's ``bin/activate`` sourced before tasks run.
+    execute_dir
+        Optional worker working directory.
+    extra_worker_init
+        Extra shell appended to the default ``worker_init`` (semicolon-prefixed).
     retries
         Per-task retry count.
     run_dir
@@ -203,31 +251,50 @@ def make_aurora_single_alloc_config(
         Seconds without heartbeat before a manager is declared lost.
     heartbeat_period
         Seconds between heartbeats from each worker manager.
+    one_worker_per_node
+        Same semantics as in ``make_aurora_config``: True means one worker per
+        node owning all 12 tiles, for codes (e.g. ExaChem) that drive their
+        own intra-node mpiexec.
     """
 
-    cfg_kwargs = {
-        "executors": [
-            HighThroughputExecutor(
-                label="aurora_htex_single",
-                address=_aurora_address(),
-                available_accelerators=AURORA_TILE_NAMES,
-                max_workers_per_node=len(AURORA_TILE_NAMES),
-                cpu_affinity=AURORA_CPU_AFFINITY,
-                prefetch_capacity=0,
-                heartbeat_period=heartbeat_period,
-                heartbeat_threshold=heartbeat_threshold,
-                provider=LocalProvider(
-                    init_blocks=1,
-                    min_blocks=1,
-                    max_blocks=1,
-                    nodes_per_block=nodes_per_block,
-                    launcher=MpiExecLauncher(
-                        bind_cmd="--cpu-bind",
-                        overrides="--ppn 1",
-                    ),
-                ),
+    worker_init = _default_worker_init(venv_activate, execute_dir)
+    if extra_worker_init:
+        worker_init = f"{worker_init}; {extra_worker_init}"
+
+    if one_worker_per_node:
+        accelerators_arg = None
+        max_workers_arg = 1
+        cpu_affinity_arg = "none"
+    else:
+        accelerators_arg = AURORA_TILE_NAMES
+        max_workers_arg = len(AURORA_TILE_NAMES)
+        cpu_affinity_arg = AURORA_CPU_AFFINITY
+
+    htex_kwargs = dict(
+        label="aurora_htex_single",
+        address=_aurora_address(),
+        max_workers_per_node=max_workers_arg,
+        cpu_affinity=cpu_affinity_arg,
+        prefetch_capacity=0,
+        heartbeat_period=heartbeat_period,
+        heartbeat_threshold=heartbeat_threshold,
+        provider=LocalProvider(
+            init_blocks=1,
+            min_blocks=1,
+            max_blocks=1,
+            nodes_per_block=nodes_per_block,
+            worker_init=worker_init,
+            launcher=MpiExecLauncher(
+                bind_cmd="--cpu-bind",
+                overrides="--ppn 1",
             ),
-        ],
+        ),
+    )
+    if accelerators_arg is not None:
+        htex_kwargs["available_accelerators"] = accelerators_arg
+
+    cfg_kwargs = {
+        "executors": [HighThroughputExecutor(**htex_kwargs)],
         "retries": retries,
     }
     if run_dir is not None:
