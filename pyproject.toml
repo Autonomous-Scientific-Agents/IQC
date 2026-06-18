@@ -89,6 +89,7 @@ multi_line_output = 3
 iqc = "iqc.main:main"
 iqc-parsl = "iqc.parsl_dispatch:run_cli"
 iqc-sweep = "iqc.cli_sweep:main"
+iqc-status = "iqc.status_query:main"
 iqc-jsonl2parquet = "scripts.jsonl2parquet:run_cli"
 iqc-chunk-parquet = "scripts.chunk_parquet:run_cli"
 iqc-optimize-parquet = "scripts.optimize_parquet:run_cli"
