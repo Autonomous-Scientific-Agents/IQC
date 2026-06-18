@@ -626,7 +626,7 @@ UMA_PREDICTOR_KWARGS = {
 }
 UMA_HOSTED_PREDICTOR_KWARGS = UMA_PREDICTOR_KWARGS - {"atom_refs", "form_elem_refs"}
 UMA_LOCAL_PREDICTOR_KWARGS = UMA_PREDICTOR_KWARGS - {"cache_dir", "seed"}
-UMA_SUPPORTED_DEVICES = {"cpu", "cuda"}
+UMA_SUPPORTED_DEVICES = {"cpu", "cuda", "xpu"}
 
 
 class CalculatorConfigurationError(RuntimeError):
