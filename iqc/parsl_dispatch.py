@@ -75,12 +75,34 @@ def _get_worker_calculator(calc_name: str, calc_params: dict):
     return _WORKER_CALCULATOR_CACHE[key]
 
 
+# Module-level singletons for things workers should load ONCE from disk, not
+# receive in every task pickle. The original design shipped the full xyz_files
+# list (~58k entries) and completed_file_index (~19k entries) inside every task
+# dict — at 1MB+ per task, this saturated the interchange and slowed task
+# submission to ~2 tasks/sec.
+_WORKER_SIDE_CACHE: dict = {}
+
+
+def _load_side_cache(side_cache_path: str) -> dict:
+    """Load (and cache) the driver-written sidecar pickle on this worker."""
+
+    import pickle as _pickle
+
+    if side_cache_path in _WORKER_SIDE_CACHE:
+        return _WORKER_SIDE_CACHE[side_cache_path]
+    with open(side_cache_path, "rb") as f:
+        data = _pickle.load(f)
+    _WORKER_SIDE_CACHE[side_cache_path] = data
+    return data
+
+
 @python_app
 def _row_app(
     xyz_index: int,
     *,
     calc_name: str,
     calc_params: dict,
+    side_cache_path: str,
     process_kwargs: dict,
 ) -> Optional[dict]:
     """Parsl app: process one input row. Returns the result dict, or None if skipped."""
@@ -93,12 +115,24 @@ def _row_app(
 
     from iqc.main import _process_one_row as _proc
 
-    # Re-import the cache helper from this module rather than relying on the
+    # Re-import the cache helpers from this module rather than relying on the
     # @python_app's pickled __globals__: Parsl reconstructs the function on
     # the worker with a restricted globals dict that does NOT include sibling
     # module-level helpers, so a bare `_get_worker_calculator(...)` raises
     # NameError the moment a row is dispatched.
-    from iqc.parsl_dispatch import _get_worker_calculator as _get_calc
+    from iqc.parsl_dispatch import (
+        _get_worker_calculator as _get_calc,
+        _load_side_cache as _load_cache,
+    )
+
+    side = _load_cache(side_cache_path)
+    # The driver wrote {xyz_files, completed_file_index} once to disk; merge
+    # them into the per-task kwargs here so _process_one_row sees them.
+    process_kwargs = {
+        **process_kwargs,
+        "xyz_files": side["xyz_files"],
+        "completed_file_index": side["completed_file_index"],
+    }
 
     calc = _get_calc(calc_name, calc_params)
     return _proc(
@@ -174,6 +208,17 @@ def _add_parsl_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Local mode only: pin workers to Aurora GPU tiles via "
             "available_accelerators (12 tiles)."
+        ),
+    )
+    group.add_argument(
+        "--parsl-single-alloc",
+        action="store_true",
+        help=(
+            "Run inside the current PBS allocation (LocalProvider + "
+            "MpiExecLauncher --ppn 1). One qsub for driver+workers — no "
+            "separate worker PBS job, no driver/worker queue race. Use this "
+            "when launching iqc-parsl from a PBS submit script that already "
+            "owns the worker nodes."
         ),
     )
 
@@ -288,8 +333,32 @@ def _build_parsl_config(args):
     from iqc.parsl_config import (
         AURORA_TILE_NAMES,
         make_aurora_config,
+        make_aurora_single_alloc_config,
         make_local_config,
     )
+
+    if args.parsl_single_alloc:
+        # Driver runs inside the PBS allocation; LocalProvider + MpiExecLauncher
+        # spreads workers across all $PBS_NODEFILE nodes. No separate qsub for
+        # workers, so no driver/worker queue race. The node count MUST equal
+        # the PBS allocation — without it the launcher's `mpiexec -n` defaults
+        # to 1 and only one manager spawns regardless of how many nodes are
+        # allocated. Always derive from $PBS_NODEFILE for correctness.
+        nodes_file = os.environ.get("PBS_NODEFILE")
+        if nodes_file and os.path.isfile(nodes_file):
+            with open(nodes_file) as f:
+                nodes = sum(1 for line in f if line.strip())
+        else:
+            nodes = 1
+            logging.warning(
+                "--parsl-single-alloc but no PBS_NODEFILE — falling back to "
+                "1 node (driver-host only)."
+            )
+        logging.info(f"single-alloc parsl: using {nodes} nodes from PBS_NODEFILE")
+        return make_aurora_single_alloc_config(
+            nodes_per_block=nodes,
+            retries=args.parsl_retries,
+        )
 
     if args.parsl_local:
         accel = AURORA_TILE_NAMES if args.parsl_tile_pin else None
@@ -425,9 +494,29 @@ def main() -> int:
         cfg.retries,
     )
 
+    # Write xyz_files + completed_file_index ONCE to a sidecar pickle on disk.
+    # Workers load this on their first task and cache it (see _load_side_cache
+    # in this module). The per-task pickle then stays ~10 KB instead of ~60 MB
+    # when 58k-row parquet input + 19k-entry skip index would otherwise ship in
+    # every TasksOutgoing message.
+    import pickle as _pickle
+
+    side_cache_path = os.path.join(head_output_dir, f"side_cache_{run_id}.pkl")
+    with open(side_cache_path, "wb") as _f:
+        _pickle.dump(
+            {
+                "xyz_files": xyz_files,
+                "completed_file_index": completed_file_index,
+            },
+            _f,
+            protocol=_pickle.HIGHEST_PROTOCOL,
+        )
+    logging.info(f"Wrote sidecar cache: {side_cache_path}")
+
     # Build the per-row kwargs that go into every @python_app call. The
     # calculator itself is NOT shipped — each worker builds its own via
-    # _get_worker_calculator (cached).
+    # _get_worker_calculator (cached). Likewise xyz_files and the skip index
+    # are loaded from side_cache_path on the worker, not shipped per task.
     process_kwargs = {
         "args": args,
         "params_str": params_str,
@@ -439,14 +528,12 @@ def main() -> int:
         "ir_params": ir_params,
         "thermo_params": thermo_params,
         "nmr_params": nmr_params,
-        "xyz_files": xyz_files,
         "input_mode": input_mode,
         "number_of_files": number_of_files,
         "worker_id": 0,
         "n_workers": 0,
         "rank_output_dir_factory": rank_output_dir_factory,
         "direct_work_dir": direct_work_dir,
-        "completed_file_index": completed_file_index,
         "db_path": db_path,
     }
 
@@ -464,6 +551,7 @@ def main() -> int:
                 i,
                 calc_name=calculator_name,
                 calc_params=calc_params,
+                side_cache_path=side_cache_path,
                 process_kwargs=pk,
             )
         )
