@@ -361,6 +361,29 @@ def get_args(argv=None):
         default=None,
         help="Reference shielding override in the form nucleus=value, e.g. 1H=31.77",
     )
+    parser.add_argument(
+        "--artifact-retention",
+        choices=["on", "off"],
+        default="on",
+        help=(
+            "F9: archive ExaChem run directories (MOs, amplitudes, Cholesky "
+            "vectors) into IQC_ARTIFACT_ROOT so they survive scratch cleanup "
+            "and can seed restarts. Default 'on' for production sweeps."
+        ),
+    )
+    parser.add_argument(
+        "--artifact-root",
+        type=str,
+        default=os.environ.get(
+            "IQC_ARTIFACT_ROOT",
+            "/lus/flare/projects/HiFiThermKin/keceli/exachem/artifacts/",
+        ),
+        help=(
+            "Destination root for F9 artifact archives. Defaults to the "
+            "IQC_ARTIFACT_ROOT env var when set, otherwise the project-space "
+            "artifacts directory on /lus/flare."
+        ),
+    )
 
     argcomplete.autocomplete(parser)
     args = parser.parse_args(argv)

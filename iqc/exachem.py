@@ -157,6 +157,10 @@ class ExaChemCalculator(Calculator):
         "exachem_input": None,
         "keep_files": False,
         "keep_artifacts": False,
+        # F9: artifact retention config. Disabled by default at the calculator
+        # level — the orchestrator / CLI enables it for production sweeps so
+        # interactive single-shot calls don't accumulate archives.
+        "artifact_retention": None,
     }
 
     def __init__(
@@ -281,9 +285,47 @@ class ExaChemCalculator(Calculator):
         # the field being present even when the archive stage is disabled.
         self.results["artifact_archive"] = None
 
+        # F9: archive run_dir before any cleanup so MOs/amplitudes survive
+        # scratch wipes. Consumes the manifest + run_dir populated above; if
+        # keep_artifacts is False those are empty/None and the archive helper
+        # quietly skips.
+        self._maybe_archive_artifacts(params)
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _maybe_archive_artifacts(self, params: Dict[str, Any]) -> None:
+        """Archive ExaChem run_dir into the configured artifact root, if enabled."""
+
+        retention = params.get("artifact_retention") or {}
+        if not retention.get("enabled", False):
+            return
+
+        # Until F4 lands, the manifest is not built — quietly skip rather than
+        # creating useless 1-file archives that don't preserve MO/amplitude
+        # provenance.
+        manifest = self.results.get("artifact_manifest")
+        run_dir = self.results.get("run_dir") or self.results.get("run_dir_path")
+        if not manifest or not run_dir:
+            return
+
+        # Import lazily so users without artifact retention configured don't
+        # pay the import cost on every calculate().
+        from iqc.artifact_manager import archive_run_dir  # noqa: WPS433
+
+        destination_root = retention.get("destination_root")
+        compress = bool(retention.get("compress", True))
+        record = archive_run_dir(
+            Path(run_dir),
+            manifest,
+            destination_root=Path(destination_root) if destination_root else None,
+            compress=compress,
+        )
+        self.results["artifact_archive"] = record["archive_path"]
+        self.results["artifact_archive_sha256"] = record["archive_sha256"]
+        self.results["artifact_archive_size_bytes"] = record["archive_size_bytes"]
+
+
     def _prepare_run_dir(self, keep_files: bool) -> Path:
         base = Path(self.directory).resolve()
         base.mkdir(parents=True, exist_ok=True)

@@ -40,3 +40,31 @@ def test_ir_thermo_task_is_supported():
     args = get_args(["--task", "ir-thermo"])
 
     assert args.task == "ir-thermo"
+
+
+def test_artifact_retention_defaults_on():
+    args = get_args([])
+
+    assert args.artifact_retention == "on"
+
+
+def test_artifact_retention_can_be_disabled():
+    args = get_args(["--artifact-retention", "off"])
+
+    assert args.artifact_retention == "off"
+
+
+def test_artifact_root_honors_env_var(monkeypatch):
+    monkeypatch.setenv("IQC_ARTIFACT_ROOT", "/scratch/custom")
+    # Reload the module so argparse picks up the patched env default.
+    import importlib
+
+    import iqc.cli as cli_module
+
+    importlib.reload(cli_module)
+    try:
+        args = cli_module.get_args([])
+        assert args.artifact_root == "/scratch/custom"
+    finally:
+        monkeypatch.delenv("IQC_ARTIFACT_ROOT", raising=False)
+        importlib.reload(cli_module)
