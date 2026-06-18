@@ -5,16 +5,18 @@ no ExaChem binary is required. A single smoke test runs an actual SCF and is
 skipped unless the binary is available on this machine.
 """
 
+import hashlib
 import json
 import os
 import shutil
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from ase import Atoms, units
 from ase.build import molecule
 
-from iqc.asetools import apply_spin_charge, get_calculator, run_single_point
+from iqc.asetools import _store_calculator_observables, apply_spin_charge, get_calculator, run_single_point
 from iqc.exachem import (
     ExaChemCalculator,
     _atoms_to_coordinate_lines,
@@ -491,3 +493,277 @@ def test_exachem_run_single_point_integration(tmp_path, water):
     assert results["energy_eV"] < 0
     # Forces are not implemented; a single warning is expected.
     assert any("Forces" in w for w in results["warnings"])
+
+
+# --- F4: artifact manifest tests --------------------------------------------
+
+
+def _write(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+
+def _make_fake_run_dir(root: Path) -> dict:
+    """Populate ``root`` with the artifact types ExaChem writes; return paths."""
+
+    stem = "h2o"
+    basis = "cc-pvdz"
+    nested = root / f"{stem}.{basis}_files" / "restricted"
+    files = {
+        "mo": nested / f"{stem}.{basis}.movecs",
+        "molden": nested / f"{stem}.{basis}.molden",
+        "t1": nested / f"{stem}.{basis}.t1amp",
+        "t2": nested / f"{stem}.{basis}.t2amp",
+        "chol": nested / f"{stem}.{basis}.cholesky.dat",
+        "restart": nested / f"{stem}.{basis}.restart",
+        "output": nested / "json" / f"{stem}.{basis}.ccsd_t.json",
+        "log": root / "exachem.log",
+        "stray": nested / "scratch.tmp",
+    }
+    # Deterministic contents so sha256 is reproducible.
+    payloads = {
+        name: f"contents-of-{name}".encode("utf-8") for name in files
+    }
+    for name, path in files.items():
+        _write(path, payloads[name])
+    return {"paths": files, "payloads": payloads}
+
+
+def test_classify_artifact_kinds():
+    classify = ExaChemCalculator._classify_artifact
+    assert classify("h2o.cc-pvdz.movecs") == "mo"
+    assert classify("h2o.molden") == "mo"
+    assert classify("h2o.t1amp") == "amplitudes"
+    assert classify("h2o.t2amp") == "amplitudes"
+    assert classify("h2o.cholesky.dat") == "cholesky"
+    assert classify("h2o.cd_vec.bin") == "cholesky"
+    assert classify("h2o.restart") == "restart"
+    assert classify("h2o.chkpt") == "restart"
+    assert classify("h2o.ccsd.json") == "output"
+    assert classify("exachem.log") == "output"
+    assert classify("scratch.tmp") == "other"
+
+
+def test_build_manifest_collects_expected_kinds(tmp_path):
+    fake = _make_fake_run_dir(tmp_path)
+    output_path = fake["paths"]["output"]
+
+    manifest = ExaChemCalculator._build_artifact_manifest(tmp_path, output_path)
+
+    by_path = {entry["path"]: entry for entry in manifest}
+    # Every fake file (no symlinks) should appear.
+    for path in fake["paths"].values():
+        assert str(path.resolve()) in by_path, f"missing {path}"
+
+    # Spot-check kinds for representative files.
+    assert by_path[str(fake["paths"]["mo"].resolve())]["kind"] == "mo"
+    assert by_path[str(fake["paths"]["t1"].resolve())]["kind"] == "amplitudes"
+    assert by_path[str(fake["paths"]["t2"].resolve())]["kind"] == "amplitudes"
+    assert by_path[str(fake["paths"]["chol"].resolve())]["kind"] == "cholesky"
+    assert by_path[str(fake["paths"]["restart"].resolve())]["kind"] == "restart"
+    # The known output JSON is tagged 'output' even though the JSON glob
+    # rule would also match it.
+    assert by_path[str(fake["paths"]["output"].resolve())]["kind"] == "output"
+    assert by_path[str(fake["paths"]["stray"].resolve())]["kind"] == "other"
+
+
+def test_build_manifest_paths_are_absolute(tmp_path):
+    _make_fake_run_dir(tmp_path)
+    # Pass a relative-looking path; resolve() inside the builder must promote
+    # entries to absolute regardless.
+    manifest = ExaChemCalculator._build_artifact_manifest(tmp_path)
+    assert manifest, "expected non-empty manifest"
+    for entry in manifest:
+        assert os.path.isabs(entry["path"]), entry
+        # And no '..' segments slipping through.
+        assert ".." not in Path(entry["path"]).parts
+
+
+def test_build_manifest_sha256_and_size(tmp_path):
+    fake = _make_fake_run_dir(tmp_path)
+    manifest = ExaChemCalculator._build_artifact_manifest(
+        tmp_path, fake["paths"]["output"]
+    )
+    by_path = {entry["path"]: entry for entry in manifest}
+    for name, path in fake["paths"].items():
+        entry = by_path[str(path.resolve())]
+        payload = fake["payloads"][name]
+        assert entry["size_bytes"] == len(payload), (name, entry)
+        assert entry["sha256"] == hashlib.sha256(payload).hexdigest(), (name, entry)
+        # All values JSON-serializable scalars.
+        assert isinstance(entry["sha256"], str) and len(entry["sha256"]) == 64
+        assert isinstance(entry["size_bytes"], int)
+
+
+def test_build_manifest_skips_symlinks(tmp_path):
+    """Symlinks must not produce duplicate entries pointing at the target."""
+
+    real = tmp_path / "real.movecs"
+    real.write_bytes(b"data")
+    link = tmp_path / "link.movecs"
+    link.symlink_to(real)
+    manifest = ExaChemCalculator._build_artifact_manifest(tmp_path)
+    # Exactly one entry — the real file — should appear; the symlink should
+    # have been skipped during the walk to avoid double-hashing the same
+    # bytes and emitting a stale alias path.
+    assert len(manifest) == 1
+    assert manifest[0]["path"] == str(real.resolve())
+
+
+def test_build_manifest_empty_for_missing_dir(tmp_path):
+    missing = tmp_path / "nope"
+    assert ExaChemCalculator._build_artifact_manifest(missing) == []
+
+
+def _fake_calculate(self, atoms=None, properties=("energy",), system_changes=None):
+    """Stand-in for ExaChemCalculator.calculate that does not need a binary.
+
+    We mimic the side effects the real method has on ``self.results`` and
+    ``self.last_*`` so the manifest-building branch can run end-to-end.
+    """
+
+    from ase.calculators.calculator import Calculator as _Cal
+
+    _Cal.calculate(self, atoms, list(properties), [])
+    params = self.parameters
+    keep_artifacts = bool(params.get("keep_artifacts", False))
+    keep_files = bool(params.get("keep_files", False)) or keep_artifacts
+    run_dir = self._prepare_run_dir(keep_files)
+    # Drop fake artifacts into the prepared run_dir so the manifest sees
+    # them when --keep-artifacts is on.
+    fake = _make_fake_run_dir(run_dir)
+    output_path = fake["paths"]["output"]
+
+    self.last_run_dir = run_dir
+    self.last_output_path = output_path
+    self.last_output_payload = {"output": {"SCF": {"final_energy": -76.0}}}
+    self.results = {
+        "energy": -76.0 * units.Hartree,
+        "energy_hartree": -76.0,
+        "exachem_output": self.last_output_payload,
+    }
+    if keep_artifacts:
+        manifest = self._build_artifact_manifest(run_dir, output_path)
+        self.results["run_dir"] = str(run_dir.resolve())
+        self.results["artifact_manifest"] = manifest
+        self.results["keep_artifacts"] = True
+    else:
+        self.results["run_dir"] = None
+        self.results["artifact_manifest"] = []
+        self.results["keep_artifacts"] = False
+    self.results["artifact_archive"] = None
+
+
+def test_calculate_records_run_dir_and_manifest_when_keep_artifacts(tmp_path, water):
+    calc = ExaChemCalculator(
+        method="scf",
+        directory=str(tmp_path),
+        keep_artifacts=True,
+    )
+    water.calc = calc
+    with mock.patch.object(ExaChemCalculator, "calculate", _fake_calculate):
+        calc.calculate(water)
+
+    assert calc.results["keep_artifacts"] is True
+    assert calc.results["artifact_archive"] is None
+    assert calc.results["run_dir"] is not None
+    assert os.path.isabs(calc.results["run_dir"])
+    assert Path(calc.results["run_dir"]).is_dir()
+    manifest = calc.results["artifact_manifest"]
+    assert isinstance(manifest, list) and len(manifest) > 0
+    kinds = {entry["kind"] for entry in manifest}
+    # MO, amplitudes, cholesky, restart, output were all written by the fake.
+    for required in ("mo", "amplitudes", "cholesky", "restart", "output"):
+        assert required in kinds, kinds
+
+
+def test_calculate_default_leaves_manifest_empty_and_run_dir_null(tmp_path, water):
+    calc = ExaChemCalculator(method="scf", directory=str(tmp_path))
+    water.calc = calc
+    with mock.patch.object(ExaChemCalculator, "calculate", _fake_calculate):
+        calc.calculate(water)
+
+    assert calc.results["keep_artifacts"] is False
+    assert calc.results["run_dir"] is None
+    assert calc.results["artifact_manifest"] == []
+    assert calc.results["artifact_archive"] is None
+
+
+def test_keep_artifacts_false_reverts_to_existing_rmtree(tmp_path, water):
+    """The first call leaves files; the second call wipes them as before.
+
+    This pins the behaviour the contract calls out: when --keep-artifacts is
+    off, ``_prepare_run_dir`` still rm-trees the previous run on the next
+    call (existing semantics preserved).
+    """
+
+    calc = ExaChemCalculator(method="scf", directory=str(tmp_path))
+    water.calc = calc
+    with mock.patch.object(ExaChemCalculator, "calculate", _fake_calculate):
+        calc.calculate(water)
+        first_run_dir = calc.last_run_dir
+        sentinel = first_run_dir / "sentinel.dat"
+        sentinel.write_text("from first run")
+        assert sentinel.exists()
+
+        calc.calculate(water)
+        # Same path is reused, but its previous contents (incl. the sentinel)
+        # were rm-tree'd at the start of the second call.
+        assert calc.last_run_dir == first_run_dir
+        assert not sentinel.exists()
+
+
+def test_keep_artifacts_true_preserves_run_dir_between_calls(tmp_path, water):
+    calc = ExaChemCalculator(method="scf", directory=str(tmp_path), keep_artifacts=True)
+    water.calc = calc
+    with mock.patch.object(ExaChemCalculator, "calculate", _fake_calculate):
+        calc.calculate(water)
+        first_run_dir = calc.last_run_dir
+        sentinel = first_run_dir / "sentinel.dat"
+        sentinel.write_text("from first run")
+
+        calc.calculate(water)
+        assert sentinel.exists(), "keep_artifacts should imply keep_files"
+
+
+def test_store_calculator_observables_copies_artifact_fields(tmp_path, water):
+    calc = ExaChemCalculator(
+        method="scf",
+        directory=str(tmp_path),
+        keep_artifacts=True,
+    )
+    water.calc = calc
+    with mock.patch.object(ExaChemCalculator, "calculate", _fake_calculate):
+        calc.calculate(water)
+
+    out = _store_calculator_observables({}, calc)
+    assert out["run_dir"] == calc.results["run_dir"]
+    assert out["artifact_manifest"] == calc.results["artifact_manifest"]
+    assert out["keep_artifacts"] is True
+    assert out["artifact_archive"] is None
+    # And no path leaks through as relative.
+    for entry in out["artifact_manifest"]:
+        assert os.path.isabs(entry["path"])
+
+
+def test_store_calculator_observables_prefix_applies_to_artifact_fields(tmp_path, water):
+    calc = ExaChemCalculator(
+        method="scf",
+        directory=str(tmp_path),
+        keep_artifacts=True,
+    )
+    water.calc = calc
+    with mock.patch.object(ExaChemCalculator, "calculate", _fake_calculate):
+        calc.calculate(water)
+
+    out = _store_calculator_observables({}, calc, prefix="initial_")
+    assert "initial_run_dir" in out
+    assert "initial_artifact_manifest" in out
+    assert "initial_keep_artifacts" in out
+    assert "initial_artifact_archive" in out
+
+
+def test_keep_artifacts_default_parameter_exists():
+    """Pin the calculator's default so callers can rely on backward-compat."""
+
+    assert ExaChemCalculator.default_parameters["keep_artifacts"] is False

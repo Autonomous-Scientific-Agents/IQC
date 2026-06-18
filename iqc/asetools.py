@@ -1854,6 +1854,16 @@ _EXACHEM_TOPLEVEL_FIELDS = (
     "frozen_core",
 )
 
+# F4: artifact retention metadata. Always copied (when present in
+# ``calc.results``) so the JSONL/SQLite schema stays stable across keep/no-keep
+# runs — see ExaChemCalculator.EXACHEM_ARTIFACT_FIELDS for the contract.
+_EXACHEM_ARTIFACT_FIELDS = (
+    "run_dir",
+    "artifact_manifest",
+    "keep_artifacts",
+    "artifact_archive",
+)
+
 
 def _store_calculator_observables(results, calc, prefix=""):
     """Persist dipoles and MACE-Polar density outputs when present."""
@@ -1872,6 +1882,14 @@ def _store_calculator_observables(results, calc, prefix=""):
                 # Use the prefix only when the caller is gathering a snapshot
                 # of pre-task ("initial_") or post-opt ("opt_") state. For the
                 # final single-point pass (prefix=""), expose the bare names.
+                results[f"{prefix}{key}"] = calc_results[key]
+        # F4: surface run_dir + per-artifact manifest so the orchestrator can
+        # write absolute paths / sha256s into the per-row record. F9 fills in
+        # artifact_archive after a successful tar.gz step; until then it stays
+        # null. Behaviour for plain runs (keep_artifacts=False) is preserved
+        # because the calculator writes empty list / null defaults itself.
+        for key in _EXACHEM_ARTIFACT_FIELDS:
+            if key in calc_results:
                 results[f"{prefix}{key}"] = calc_results[key]
 
     if "dipole" in calc_results:

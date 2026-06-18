@@ -17,6 +17,8 @@ support is method-dependent and not exposed through this thin wrapper.
 from __future__ import annotations
 
 import copy
+import fnmatch
+import hashlib
 import json
 import logging
 import os
@@ -122,6 +124,13 @@ class ExaChemCalculator(Calculator):
             anything not covered by the named sections above.
         keep_files (bool): If False (default), the per-call scratch directory
             is removed on the next call. Set True to retain all run artifacts.
+        keep_artifacts (bool): If True, build an ``artifact_manifest`` listing
+            MO/amplitude/cholesky/restart/output files in the run directory
+            and surface the absolute ``run_dir`` and per-file
+            sha256/size/kind through ``self.results`` so the orchestrator can
+            persist them. Implies ``keep_files=True`` for the duration of
+            this run so the listed files are not wiped on the next call.
+            Default False (backward compatible — empty manifest, null run_dir).
     """
 
     implemented_properties = ["energy"]
@@ -147,6 +156,7 @@ class ExaChemCalculator(Calculator):
         "fci": None,
         "exachem_input": None,
         "keep_files": False,
+        "keep_artifacts": False,
     }
 
     def __init__(
@@ -192,7 +202,11 @@ class ExaChemCalculator(Calculator):
 
         params = self.parameters
         method = _normalize_method(params["method"])
-        run_dir = self._prepare_run_dir(params.get("keep_files", False))
+        keep_artifacts = bool(params.get("keep_artifacts", False))
+        # keep_artifacts implies keep_files for the lifetime of this run so
+        # the artifact files we hash/manifest aren't wiped on the next call.
+        keep_files = bool(params.get("keep_files", False)) or keep_artifacts
+        run_dir = self._prepare_run_dir(keep_files)
         input_path = run_dir / "input.json"
         stdout_path = run_dir / "exachem.log"
 
@@ -250,6 +264,22 @@ class ExaChemCalculator(Calculator):
         # directly to JSONL/SQLite without poking into ``exachem_output``.
         components = self._extract_components(payload, method)
         self.results.update(components)
+
+        # Artifact manifest (run_dir + per-file sha256/size/kind). Only built
+        # when keep_artifacts is True so the default behaviour stays cheap and
+        # backward compatible; F9's archive stage consumes this manifest.
+        if keep_artifacts:
+            manifest = self._build_artifact_manifest(run_dir, output_path)
+            self.results["run_dir"] = str(run_dir.resolve())
+            self.results["artifact_manifest"] = manifest
+            self.results["keep_artifacts"] = True
+        else:
+            self.results["run_dir"] = None
+            self.results["artifact_manifest"] = []
+            self.results["keep_artifacts"] = False
+        # F9 populates this; F4 leaves it null so downstream code can rely on
+        # the field being present even when the archive stage is disabled.
+        self.results["artifact_archive"] = None
 
     # ------------------------------------------------------------------
     # Helpers
@@ -617,6 +647,16 @@ class ExaChemCalculator(Calculator):
         "frozen_core",
     )
 
+    # Artifact retention fields added by F4 / populated by F9. Always present
+    # on a successful run so downstream JSONL/SQLite schemas are stable; null
+    # / empty when --keep-artifacts is False or F9 is inactive.
+    EXACHEM_ARTIFACT_FIELDS: Tuple[str, ...] = (
+        "run_dir",
+        "artifact_manifest",
+        "keep_artifacts",
+        "artifact_archive",
+    )
+
     @staticmethod
     def _tail(path: Path, n: int) -> str:
         try:
@@ -625,3 +665,82 @@ class ExaChemCalculator(Calculator):
         except OSError:
             return ""
         return "".join(lines[-n:])
+
+    # Patterns (case-insensitive fnmatch) that classify per-file artifacts.
+    # Order matters: first match wins so that an MO file named ``*.mo`` does
+    # not get tagged ``other`` because it lacks the basename hints.
+    _ARTIFACT_PATTERN_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+        ("mo", ("*.mo", "*.mo[0-9]*", "*movecs*", "*.molden", "*orbitals*")),
+        ("amplitudes", ("*t1*", "*t2*", "*ccsd_t*amps*", "*amplitudes*")),
+        ("cholesky", ("*chol*", "*cd_vec*", "*cholesky*")),
+        ("restart", ("*restart*", "*chkpt*", "*checkpoint*")),
+        ("output", ("*.json", "*.log", "*.out")),
+    )
+
+    @classmethod
+    def _classify_artifact(cls, name: str) -> str:
+        """Return the manifest 'kind' for a filename based on ExaChem conventions."""
+
+        lowered = name.lower()
+        for kind, patterns in cls._ARTIFACT_PATTERN_RULES:
+            for pat in patterns:
+                if fnmatch.fnmatch(lowered, pat):
+                    return kind
+        return "other"
+
+    @staticmethod
+    def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+        """Stream a sha256 so multi-GB amplitude files don't blow the heap."""
+
+        hasher = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(chunk_size), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    @classmethod
+    def _build_artifact_manifest(
+        cls,
+        run_dir: Path,
+        output_path: Optional[Path] = None,
+    ) -> List[Dict[str, Any]]:
+        """Walk ``run_dir`` and return a list of artifact records.
+
+        Each record is ``{path, kind, size_bytes, sha256}`` with an absolute
+        ``path``. The walk is bounded to the supplied ``run_dir`` to avoid
+        following stray symlinks into the rest of the filesystem.
+        """
+
+        manifest: List[Dict[str, Any]] = []
+        run_dir = run_dir.resolve()
+        if not run_dir.is_dir():
+            return manifest
+
+        output_resolved = output_path.resolve() if output_path else None
+
+        for entry in sorted(run_dir.rglob("*")):
+            if not entry.is_file() or entry.is_symlink():
+                continue
+            try:
+                size_bytes = entry.stat().st_size
+            except OSError:
+                continue
+            resolved = entry.resolve()
+            kind = cls._classify_artifact(entry.name)
+            # The known ExaChem output JSON is unambiguously 'output' even when
+            # the basename also matches an earlier rule.
+            if output_resolved is not None and resolved == output_resolved:
+                kind = "output"
+            try:
+                sha = cls._sha256_file(resolved)
+            except OSError:
+                continue
+            manifest.append(
+                {
+                    "path": str(resolved),
+                    "kind": kind,
+                    "size_bytes": int(size_bytes),
+                    "sha256": sha,
+                }
+            )
+        return manifest

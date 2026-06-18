@@ -198,6 +198,17 @@ def get_args(argv=None):
         action="store_true",
     )
     parser.add_argument(
+        "--keep-artifacts",
+        action="store_true",
+        help=(
+            "For ExaChem runs: retain the per-call run_dir and emit an "
+            "artifact_manifest (kind/path/size_bytes/sha256 for MO, "
+            "amplitude, cholesky, restart, and output files) in each result "
+            "record. Off by default — the run_dir is wiped on the next call "
+            "as usual."
+        ),
+    )
+    parser.add_argument(
         "--skip-existing-from",
         nargs="+",
         default=None,

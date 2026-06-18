@@ -997,6 +997,15 @@ def main():
                 )
                 comm.Abort(1)
 
+        # F4: route --keep-artifacts (CLI) into ExaChem calculator kwargs so
+        # the manifest is emitted without requiring users to also edit their
+        # YAML params file. Non-ExaChem calculators ignore this flag.
+        if (
+            str(calculator_name).lower() == "exachem"
+            and getattr(args, "keep_artifacts", False)
+        ):
+            calc_params.setdefault("keep_artifacts", True)
+
         # Initialize the calculator
         try:
             calculator = get_calculator(name=calculator_name, **calc_params)

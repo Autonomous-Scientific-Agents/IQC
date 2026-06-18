@@ -439,6 +439,15 @@ def main() -> int:
     if task == "nmr":
         calculator_name = args.backend or nmr_params.get("backend", "orca")
 
+    # F4: route --keep-artifacts into ExaChem calculator kwargs so workers
+    # build the artifact manifest. Setdefault preserves a YAML-supplied
+    # explicit value if the user already pinned it.
+    if (
+        str(calculator_name).lower() == "exachem"
+        and getattr(args, "keep_artifacts", False)
+    ):
+        calc_params.setdefault("keep_artifacts", True)
+
     # Resolve inputs.
     try:
         xyz_files, input_mode, number_of_xyz, number_of_files = _build_xyz_input_set(
