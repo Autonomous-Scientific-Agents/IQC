@@ -328,6 +328,17 @@ def _add_parsl_args(parser: argparse.ArgumentParser) -> None:
             "owns the worker nodes."
         ),
     )
+    group.add_argument(
+        "--parsl-one-worker-per-node",
+        action="store_true",
+        help=(
+            "Run a single Parsl worker per node that owns the whole node "
+            "(all 12 PVC tiles). Required for ExaChem, which needs all 12 "
+            "tiles per node via its own internal mpiexec. Without this, the "
+            "default config pins each worker to one tile and ExaChem aborts "
+            "with 'GPU devices not available' the moment it spawns -ppn>1."
+        ),
+    )
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -465,6 +476,7 @@ def _build_parsl_config(args):
         return make_aurora_single_alloc_config(
             nodes_per_block=nodes,
             retries=args.parsl_retries,
+            one_worker_per_node=getattr(args, "parsl_one_worker_per_node", False),
         )
 
     if args.parsl_local:
