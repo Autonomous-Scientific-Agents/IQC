@@ -835,28 +835,31 @@ def test_get_uma_calculator_can_load_local_checkpoint(tmp_path):
     assert calculator.model_name == str(checkpoint)
 
 
-def test_uma_device_validation_rejects_xpu_before_fairchem_import():
-    """UMA should fail clearly for XPU rather than falling back to MACE."""
+def test_uma_device_validation_rejects_unsupported_device():
+    """UMA should fail clearly for an unsupported device rather than falling
+    back to MACE. cpu/cuda/xpu are accepted (xpu enabled for Intel GPUs);
+    anything else must raise before FAIRChem is imported."""
 
     _validate_uma_device({"device": "cpu"})
     _validate_uma_device({"device": "cuda"})
+    _validate_uma_device({"device": "xpu"})
 
     with pytest.raises(RuntimeError) as excinfo:
-        _get_uma_calculator("uma-s-omol", device="xpu")
+        _get_uma_calculator("uma-s-omol", device="tpu")
 
     message = str(excinfo.value)
-    assert "device='xpu'" in message
-    assert "Use one of: cpu, cuda" in message
+    assert "device='tpu'" in message
+    assert "Use one of: cpu, cuda, xpu" in message
 
 
 def test_get_calculator_uma_invalid_device_does_not_fallback_to_mace():
     """Configuration errors should not be hidden behind fallback attempts."""
 
     with pytest.raises(RuntimeError) as excinfo:
-        get_calculator(name="uma-s-omol", device="xpu")
+        get_calculator(name="uma-s-omol", device="tpu")
 
     message = str(excinfo.value)
-    assert "device='xpu'" in message
+    assert "device='tpu'" in message
     assert "UMA" in message
 
 
