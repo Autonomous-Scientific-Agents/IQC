@@ -214,6 +214,21 @@ def _row_app(
 ) -> Optional[dict]:
     """Parsl app: process one input row. Returns the result dict, or None if skipped."""
 
+    # CRITICAL: must happen before torch is imported anywhere. Aurora compute
+    # nodes default ZE_FLAT_DEVICE_HIERARCHY=FLAT (set by PALS / frameworks),
+    # which makes Intel GPU tiles top-level Level Zero devices indexed 0..11.
+    # Parsl's available_accelerators uses the COMPOSITE-mode dot notation
+    # ("0.0", "0.1", ..., "5.1" — GPU.subdevice), and exports it as
+    # ZE_AFFINITY_MASK. In FLAT mode "0.0" parses to an invalid device →
+    # torch.xpu sees 0 devices → MACE-Polar checkpoint deserialize fails
+    # with "Attempting to deserialize object on a XPU device but
+    # torch.xpu.is_available() is False". Forcing COMPOSITE here makes the
+    # dot-notation valid again. (UMA/FAIRChem dodged this because its loader
+    # uses CPU map_location, but MACE's torch.load(map_location=device)
+    # surfaces the broken xpu state immediately.)
+    import os as _os
+    _os.environ["ZE_FLAT_DEVICE_HIERARCHY"] = "COMPOSITE"
+
     # ASE before any MPI-aware imports (mirrors the comment in iqc.main.main()).
     import ase  # noqa: F401
     import ase.parallel as asepar
