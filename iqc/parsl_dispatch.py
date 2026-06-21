@@ -226,8 +226,18 @@ def _row_app(
     # dot-notation valid again. (UMA/FAIRChem dodged this because its loader
     # uses CPU map_location, but MACE's torch.load(map_location=device)
     # surfaces the broken xpu state immediately.)
+    #
+    # Gate on dot-notation ZE_AFFINITY_MASK so we ONLY override the hierarchy
+    # when Parsl has actually pinned us to a tile (tile-per-worker MACE/UMA
+    # mode). ExaChem runs with one_worker_per_node=True don't get
+    # ZE_AFFINITY_MASK set, internally launch their own mpiexec across all
+    # 12 tiles, and assume the FLAT-mode device layout the cluster ships
+    # with — flipping them to COMPOSITE would silently re-enumerate devices
+    # under their launcher.
     import os as _os
-    _os.environ["ZE_FLAT_DEVICE_HIERARCHY"] = "COMPOSITE"
+    _zam = _os.environ.get("ZE_AFFINITY_MASK", "")
+    if "." in _zam:
+        _os.environ["ZE_FLAT_DEVICE_HIERARCHY"] = "COMPOSITE"
 
     # ASE before any MPI-aware imports (mirrors the comment in iqc.main.main()).
     import ase  # noqa: F401
