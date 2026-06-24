@@ -73,12 +73,46 @@ def collect_field_names_and_schema(input_path: Path) -> tuple[list[str], pa.Sche
     for data in iter_jsonl_records(input_path, warn=False):
         for key, value in data.items():
             fields.setdefault(key, None)
-            if value is not None and key not in example:
+            if value is None:
+                continue
+            current = example.get(key)
+            # Prefer a non-empty list/dict over an empty one so pyarrow can
+            # type-infer the element. An empty list infers as list<null>,
+            # which then rejects any later non-empty list as "Invalid null
+            # value" (the bug behind the silently skipped UMA parquet
+            # conversions, where row 0 had warnings=[] but later rows had
+            # warnings=["Translational or rotational modes are too high"]).
+            if isinstance(value, (list, dict)) and len(value) == 0:
+                if key not in example:
+                    example[key] = value
+                continue
+            if (
+                key not in example
+                or (isinstance(current, (list, dict)) and len(current) == 0)
+            ):
                 example[key] = value
     field_names = list(fields)
     schema_row = {field: example.get(field) for field in field_names}
     schema = pa.Table.from_pylist([schema_row]).schema
+    # Defensive fallback: if every observation of a list-typed field was
+    # empty (so it still infers as list<null>), coerce to list<string>.
+    # Real IQC list-typed fields ("warnings", etc.) are list<str>.
+    schema = _coerce_null_list_to_string_list(schema)
     return field_names, schema
+
+
+def _coerce_null_list_to_string_list(schema: pa.Schema) -> pa.Schema:
+    """Replace any list<null> with list<string> (recursing through nested lists)."""
+
+    def fix(t: pa.DataType) -> pa.DataType:
+        if pa.types.is_list(t) or pa.types.is_large_list(t):
+            value = t.value_type
+            if pa.types.is_null(value):
+                return pa.list_(pa.string())
+            return pa.list_(fix(value))
+        return t
+
+    return pa.schema([pa.field(f.name, fix(f.type), nullable=True) for f in schema])
 
 
 def normalize_rows(rows: list[dict], field_names: list[str]) -> list[dict]:
