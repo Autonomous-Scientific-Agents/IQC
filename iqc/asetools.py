@@ -778,12 +778,12 @@ def get_calculator(name="mace", **kwargs):
                 calculator = mace_mp(**mace_kwargs)
                 calculator.model_name = mace_kwargs["model"]
                 logging.info(f"Using MACE calculator with arguments: {mace_kwargs}")
-        except ImportError:
-            logging.warning(
-                "MACE not found. Install with 'pip install mace'. Falling back to EMT."
-            )
-        except RuntimeError as e:
-            logging.warning(f"MACE initialization failed: {e}. Falling back to EMT.")
+        except ImportError as e:
+            raise RuntimeError(
+                "MACE not found. Install with 'pip install mace' (or `iqc[mace]`)."
+            ) from e
+        except Exception as e:
+            raise RuntimeError(f"MACE initialization failed: {e}") from e
 
     elif name == "mace-polar":
         try:
@@ -808,12 +808,12 @@ def get_calculator(name="mace", **kwargs):
             xtb_kwargs = {"method": "GFN2-xTB", **kwargs}
             calculator = XTB(**xtb_kwargs)
             logging.info(f"Using XTB calculator with arguments: {xtb_kwargs}")
-        except ImportError:
-            logging.warning(
-                "XTB not found. Install with 'pip install xtb' or 'pip install iqc[xtb]'. Falling back to MACE."
-            )
+        except ImportError as e:
+            raise RuntimeError(
+                "XTB not found. Install with 'pip install xtb' or 'pip install iqc[xtb]'."
+            ) from e
         except Exception as e:
-            logging.warning(f"XTB initialization failed: {e}. Falling back to MACE.")
+            raise RuntimeError(f"XTB initialization failed: {e}") from e
 
     elif name == "emt":
         try:
@@ -835,14 +835,12 @@ def get_calculator(name="mace", **kwargs):
             logging.error(str(e))
             raise RuntimeError(str(e)) from e
         except ImportError as e:
-            logging.warning(
-                "FAIRChem UMA calculator import failed: %s. Install fairchem-core "
-                "with compatible dependencies and follow the MACE/UMA install "
-                "workaround. Falling back to MACE.",
-                e,
-            )
+            raise RuntimeError(
+                f"FAIRChem UMA import failed: {e}. Install fairchem-core with "
+                "compatible dependencies (see the MACE/UMA install workaround)."
+            ) from e
         except Exception as e:
-            logging.warning(f"UMA initialization failed: {e}. Falling back to MACE.")
+            raise RuntimeError(f"UMA initialization failed: {e}") from e
 
     elif name == "orca":
         import shutil
@@ -881,12 +879,12 @@ def get_calculator(name="mace", **kwargs):
                     f"Using ORCA calculator (ASE config) with "
                     f"arguments: {orca_kwargs}"
                 )
-        except ImportError:
-            logging.warning(
-                "ASE ORCA calculator not available. Falling back to MACE."
-            )
+        except ImportError as e:
+            raise RuntimeError(
+                f"ASE ORCA calculator not available: {e}"
+            ) from e
         except Exception as e:
-            logging.warning(f"ORCA initialization failed: {e}. Falling back to MACE.")
+            raise RuntimeError(f"ORCA initialization failed: {e}") from e
 
     elif name == "exachem":
         # ExaChem is only ever requested explicitly (there is no implicit
@@ -913,66 +911,19 @@ def get_calculator(name="mace", **kwargs):
             raise RuntimeError(message) from e
 
     else:
-        logging.warning(f"Unknown calculator '{name}'. Falling back to MACE.")
-
-    # Fallback to MACE if the requested calculator failed or was unknown
-    # MACE is a required dependency, so it should be available
-    if calculator is None:
-        logging.warning(
-            f"Calculator '{name}' failed or not found. Attempting fallback to MACE."
+        raise RuntimeError(
+            f"Unknown calculator {name!r}. Supported: mace, mace-polar, xtb, "
+            f"emt, orca, exachem, uma, uma-s-omol, uma-s-omat, uma-s-odac, "
+            f"uma-m-omol, uma-m-omat, uma-m-odac."
         )
-        try:
-            _patch_e3nn_mace_compatibility()
-            from mace.calculators import mace_mp
 
-            mace_kwargs = {
-                "model": "large",
-                "dispersion": True,
-                "default_dtype": "float64",
-                "device": "cpu",
-            }
-            try:
-                calculator = mace_mp(**mace_kwargs)
-                calculator.model_name = mace_kwargs["model"]
-                logging.info("Using MACE calculator as fallback.")
-            except Exception as e:
-                # Try without dispersion if the first attempt failed
-                logging.warning(
-                    f"Failed to initialize MACE fallback with dispersion: {str(e)}. Trying without dispersion."
-                )
-                mace_kwargs["dispersion"] = False
-                calculator = mace_mp(**mace_kwargs)
-                calculator.model_name = mace_kwargs["model"]
-                logging.info("Using MACE calculator as fallback (without dispersion).")
-            # Tag so callers can detect that they got a fallback rather than
-            # the calculator they asked for. SumCalculator(MACE+D3) hides the
-            # MACE class name from a naive `type()` check.
-            try:
-                calculator._iqc_fallback_from = name
-            except (AttributeError, TypeError):
-                pass
-        except ImportError:
-            logging.error(
-                "MACE fallback calculator could not be imported. MACE is a required dependency."
-            )
-            raise RuntimeError(
-                "No suitable ASE calculator found. MACE (required dependency) is not available."
-            )
-        except Exception as e:
-            logging.error(f"MACE fallback initialization failed: {e}")
-            # Last resort: try EMT
-            try:
-                from ase.calculators.emt import EMT
-
-                calculator = EMT()
-                logging.warning("Using EMT calculator as last resort fallback.")
-            except ImportError:
-                logging.error(
-                    "All fallback calculators failed. No calculator available."
-                )
-                raise RuntimeError(
-                    "No suitable ASE calculator found or could be initialized."
-                )
+    if calculator is None:
+        # All known-calculator branches now either set `calculator` or raise,
+        # so reaching this should never happen. Keep as a defensive guard.
+        raise RuntimeError(
+            f"Calculator {name!r} returned None unexpectedly (no exception, "
+            "but no instance either)."
+        )
 
     return _normalize_calculator_compatibility(calculator)
 

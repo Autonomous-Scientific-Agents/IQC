@@ -494,25 +494,13 @@ def test_get_calculator_mace_success():
         pytest.skip(f"Could not initialize MACE or fallback: {e}")
 
 
-def test_get_calculator_mace_unavailable_fallback():
-    """Test fallback to EMT when MACE is not available."""
-    # Mock the import to simulate MACE not being available
-    with patch.dict(sys.modules, {"mace.calculators": None, "mace": None}):
-        try:
-            calculator = get_calculator(name="mace")
-            # It should fallback to EMT
-            assert isinstance(calculator, EMT)
+def test_get_calculator_mace_unavailable_raises():
+    """get_calculator must raise (not silently substitute) when MACE is missing."""
 
-            # Test calculation with fallback
-            atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
-            atoms.calc = calculator
-            energy = atoms.get_potential_energy()
-            assert isinstance(energy, float)
-        except RuntimeError as e:
-            pytest.skip(f"Could not initialize EMT fallback: {e}")
-        except ImportError:
-            # This could happen if EMT also fails to import
-            pytest.skip("Neither MACE nor EMT fallback available.")
+    with patch.dict(sys.modules, {"mace.calculators": None, "mace": None}):
+        with pytest.raises(RuntimeError) as excinfo:
+            get_calculator(name="mace")
+    assert "MACE" in str(excinfo.value)
 
 
 def test_get_mace_polar_calculator_uses_mace_polar_loader(monkeypatch):
@@ -863,34 +851,21 @@ def test_get_calculator_uma_invalid_device_does_not_fallback_to_mace():
     assert "UMA" in message
 
 
-def test_get_calculator_uma_unavailable_falls_back_to_mace():
-    """Test UMA import failure follows the existing MACE fallback path."""
-
-    mace_calculators_module = types.ModuleType("mace.calculators")
-
-    def fake_mace_mp(**kwargs):
-        calculator = EMT()
-        calculator.mace_kwargs = kwargs
-        return calculator
-
-    mace_calculators_module.mace_mp = fake_mace_mp
-    mace_module = types.ModuleType("mace")
-    mace_module.calculators = mace_calculators_module
+def test_get_calculator_uma_unavailable_raises():
+    """A failed UMA load must raise — silently substituting MACE for UMA caused
+    the 2026-06 rosmi sweep to record ~116k 'uma-m-omol' rows that were actually
+    MACE-large + DFTD3 self-consistency at MACE's own minima."""
 
     with patch.dict(
         sys.modules,
         {
             "fairchem": None,
             "fairchem.core": None,
-            "mace": mace_module,
-            "mace.calculators": mace_calculators_module,
         },
     ):
-        calculator = get_calculator(name="uma-s-omol")
-
-    assert isinstance(calculator, EMT)
-    assert calculator.model_name == "large"
-    assert calculator.mace_kwargs["dispersion"] is True
+        with pytest.raises(RuntimeError) as excinfo:
+            get_calculator(name="uma-s-omol")
+    assert "UMA" in str(excinfo.value) or "fairchem" in str(excinfo.value).lower()
 
 
 def test_mace_uma_dependency_workaround_is_declared():
@@ -937,36 +912,13 @@ def test_get_calculator_xtb_success():
         pytest.skip(f"Could not initialize XTB or fallback: {e}")
 
 
-def test_get_calculator_xtb_unavailable_fallback():
-    """Test fallback when XTB is not available."""
-    # Mock the import to simulate XTB not being available
-    with patch.dict(sys.modules, {"xtb.ase.calculator": None, "xtb": None}):
-        try:
-            calculator = get_calculator(name="xtb")
-            # It should fallback to MACE or EMT
-            assert calculator is not None
-            # Check type for EMT or name for MACE/Sum(MACE)
-            is_fallback_ok = False
-            if isinstance(calculator, EMT):
-                is_fallback_ok = True
-            elif isinstance(calculator, SumCalculator):
-                # Correct attribute is 'calcs'
-                is_fallback_ok = any("mace" in c.name.lower() for c in calculator.calcs)
-            else:
-                is_fallback_ok = "mace" in calculator.name.lower()
-            assert (
-                is_fallback_ok
-            ), f"Fallback calculator {calculator.name} is not MACE or EMT"
+def test_get_calculator_xtb_unavailable_raises():
+    """A failed XTB import must raise — no silent substitution."""
 
-            # Test calculation with fallback
-            atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
-            atoms.calc = calculator
-            energy = atoms.get_potential_energy()
-            assert isinstance(energy, float)
-        except RuntimeError as e:
-            pytest.skip(f"Could not initialize MACE/EMT fallback: {e}")
-        except ImportError:
-            pytest.skip("Neither XTB nor fallbacks available.")
+    with patch.dict(sys.modules, {"xtb.ase.calculator": None, "xtb": None}):
+        with pytest.raises(RuntimeError) as excinfo:
+            get_calculator(name="xtb")
+    assert "XTB" in str(excinfo.value)
 
 
 def test_get_calculator_emt_direct():
@@ -988,34 +940,14 @@ def test_get_calculator_emt_direct():
         pytest.skip("EMT calculator not available (ASE issue?).")
 
 
-def test_get_calculator_unknown_fallback():
-    """Test fallback when an unknown calculator is requested."""
-    try:
-        calculator = get_calculator(name="unknown_calc")
-        # It should fallback (likely to EMT after trying MACE/XTB)
-        assert calculator is not None
-        # Check if it's EMT or MACE/Sum(MACE)
-        is_fallback_ok = False
-        if isinstance(calculator, EMT):
-            is_fallback_ok = True
-        elif isinstance(calculator, SumCalculator):
-            # Correct attribute is 'calcs'
-            is_fallback_ok = any("mace" in c.name.lower() for c in calculator.calcs)
-        else:
-            is_fallback_ok = "mace" in calculator.name.lower()
-        assert (
-            is_fallback_ok
-        ), f"Fallback calculator {calculator.name} is not MACE or EMT"
+def test_get_calculator_unknown_raises():
+    """An unknown calculator name must raise (used to silently substitute MACE)."""
 
-        # Test calculation with fallback
-        atoms = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
-        atoms.calc = calculator
-        energy = atoms.get_potential_energy()
-        assert isinstance(energy, float)
-    except RuntimeError as e:
-        pytest.skip(f"Could not initialize fallback calculator: {e}")
-    except ImportError:
-        pytest.skip("Fallback calculator not available.")
+    with pytest.raises(RuntimeError) as excinfo:
+        get_calculator(name="unknown_calc")
+    msg = str(excinfo.value)
+    assert "unknown_calc" in msg.lower()
+    assert "supported" in msg.lower()
 
 
 def test_is_linear_by_inertia():
