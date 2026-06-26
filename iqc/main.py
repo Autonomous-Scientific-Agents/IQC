@@ -384,12 +384,27 @@ class _SkipExisting:
     skip-existing key. Lets the caller distinguish it from a ``None`` return
     (which means the input could not be read) so ``skipped_existing`` only
     counts the cases the user asked about with ``--skip-existing``.
+
+    ``__reduce__`` keeps the pickle round-trip identity-preserving so the
+    Parsl driver's ``result is SKIPPED_EXISTING`` check survives the trip
+    back from a worker process. Without it, every worker returns a fresh
+    ``_SkipExisting()`` instance, ``is`` returns False, and the dispatcher
+    falls through to ``result.pop("_unique_name", None)`` which raises
+    ``AttributeError: '_SkipExisting' object has no attribute 'pop'``.
     """
 
     __slots__ = ()
 
     def __repr__(self):
         return "<SKIPPED_EXISTING>"
+
+    def __reduce__(self):
+        # Tell pickle to recover the same module-level singleton on unpickle.
+        return (_get_skipped_existing_singleton, ())
+
+
+def _get_skipped_existing_singleton():
+    return SKIPPED_EXISTING
 
 
 SKIPPED_EXISTING = _SkipExisting()
