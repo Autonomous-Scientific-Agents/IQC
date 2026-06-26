@@ -40,7 +40,7 @@ Interactive Quantum Chemistry
 
 1. First, install a package manager (Conda, Miniconda, Mamba, or MicroMamba)
    - Download Miniconda from the [official page](https://docs.conda.io/en/latest/miniconda.html)
-   - Follow the installation instructions for your operating system
+   - Follow the installation instructions for your operating system.
 
 2. Create and activate the environment:
    ```bash
@@ -151,15 +151,15 @@ mapping, and Hugging Face setup.
    docker run -p 8888:8888 -it iqc
    ```
 
-3. Access Jupyter Lab by opening `http://localhost:8888` in your web browser
+3. Access Jupyter Lab by opening `http://localhost:8888` in your web browser.
 
 To persist your notebooks, you can mount a local directory:
 ```bash
 docker run -p 8888:8888 -v $(pwd)/notebooks:/app/notebooks -it iqc
 ```
 
-# Troubleshooting
-If you see (a possible OpenMPI error):
+## Troubleshooting
+If you encounter a possible OpenMPI error:
 
 ```bash
 shmem: mmap: an error occurred while determining whether or not /tmp/ompi.yv.1001/jf.0/3074883584/sm_segment.yv.1001.b7470000.0 could be created
