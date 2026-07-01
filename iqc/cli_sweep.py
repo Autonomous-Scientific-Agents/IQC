@@ -14,6 +14,13 @@ import logging
 import sys
 from pathlib import Path
 
+from iqc.sweep_estimator import (
+    DEFAULT_CACHE_PATH,
+    DEFAULT_RUNS_ROOT,
+    DEFAULT_SAFETY_FACTOR,
+    DEFAULT_STARTUP_OVERHEAD_S,
+    cli_main as _estimate_cli_main,
+)
 from iqc.sweep_orchestrator import chunk_inputs, status, submit_sweep
 
 
@@ -130,6 +137,79 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    est = sub.add_parser(
+        "estimate",
+        help="Estimate PBS walltime for a chunk parquet from past run timings.",
+    )
+    est.add_argument("--chunk", type=Path, help="Chunk parquet to estimate for.")
+    est.add_argument(
+        "--nodes",
+        type=int,
+        default=None,
+        help="Total nodes the PBS job will request (required for walltime).",
+    )
+    est.add_argument(
+        "--npm",
+        default=None,
+        help=(
+            "nodes_per_mol (per ExaChem sub-allocation). Integer, or 'auto' "
+            "to pick from the chunk's max heavy-atom value via NPM_POLICY."
+        ),
+    )
+    est.add_argument(
+        "--queue",
+        default=None,
+        help=(
+            "Target queue; result is clamped to that queue's walltime cap. "
+            "Use 'auto' to pick from the chunk's max heavy-atom value via "
+            "QUEUE_POLICY (capacity for h≤5, prod otherwise)."
+        ),
+    )
+    est.add_argument(
+        "--aggregate",
+        default="p90",
+        choices=("median", "mean", "p90"),
+        help="Which per-mol statistic to use (default p90).",
+    )
+    est.add_argument(
+        "--safety",
+        type=float,
+        default=DEFAULT_SAFETY_FACTOR,
+        help="Multiplicative safety factor on top of the aggregate.",
+    )
+    est.add_argument(
+        "--startup-overhead-s",
+        type=float,
+        default=DEFAULT_STARTUP_OVERHEAD_S,
+        help="Per-job startup overhead in seconds.",
+    )
+    est.add_argument(
+        "--cache-path",
+        type=Path,
+        default=DEFAULT_CACHE_PATH,
+        help="Timing-stats cache parquet (auto-built if missing).",
+    )
+    est.add_argument(
+        "--runs-root",
+        type=Path,
+        default=DEFAULT_RUNS_ROOT,
+        help="Root of run directories used when (re)building the cache.",
+    )
+    est.add_argument(
+        "--rebuild-cache",
+        action="store_true",
+        help="Rescan runs_root and overwrite the cache before estimating.",
+    )
+    est.add_argument(
+        "--print",
+        default="report",
+        choices=("report", "walltime", "npm", "queue", "params"),
+        help=(
+            "`walltime` / `npm` / `queue` print just that field; `params` "
+            "prints '<npm> <walltime> <queue>' on one line (for shell capture)."
+        ),
+    )
+
     st = sub.add_parser("status", help="Print registry counts + failed chunks.")
     st.add_argument("--registry", type=Path, required=True, help="SQLite registry path.")
     st.add_argument(
@@ -223,6 +303,8 @@ def main(argv=None) -> int:
         return _run_submit(ns)
     if ns.command == "status":
         return _run_status(ns)
+    if ns.command == "estimate":
+        return _estimate_cli_main(ns)
     parser.error(f"Unknown command: {ns.command}")
     return 2
 
