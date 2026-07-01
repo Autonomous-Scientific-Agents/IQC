@@ -76,7 +76,23 @@ def _default_skip_existing_sources(cwd="."):
 
 
 def _candidate_result_files(source):
-    """Return JSON/JSONL result files under a file or directory source."""
+    """Return IQC result JSON/JSONL files under a file or directory source.
+
+    Targeted patterns only — does NOT descend into exachem_run_*/ or other
+    calculator working dirs, which hold thousands of internal cache files
+    matching *.json. Previously the naive ``path.rglob("*.json")`` walked
+    100k+ files in a 68-rundir sweep tree, taking ~22 min per job startup on
+    Lustre (HiFiThermKin sweep 8575817). Limiting to the known IQC output
+    layouts cuts that to under 30 s for the same tree.
+
+    Matched layouts:
+      <source>/iqc_*_results_*.jsonl                (single-shot run, results at root)
+      <source>/<rundir>/iqc_*_results_*.jsonl       (multi-job sweep tree)
+      <source>/tmp_*/*.json                         (parsl per-row temp files at depth 1)
+      <source>/<rundir>/tmp_*/*.json                (parsl per-row temp files at depth 2)
+      <source>/results_partials/row_*.jsonl         (EL dispatcher partials at depth 1)
+      <source>/<rundir>/results_partials/row_*.jsonl (EL dispatcher partials at depth 2)
+    """
 
     path = Path(source).expanduser()
     if not path.exists():
@@ -85,8 +101,12 @@ def _candidate_result_files(source):
         return [path] if path.suffix.lower() in {".json", ".jsonl"} else []
 
     files = []
-    for pattern in ("*.json", "*.jsonl"):
-        files.extend(path.rglob(pattern))
+    files.extend(path.glob("iqc_*_results_*.jsonl"))
+    files.extend(path.glob("*/iqc_*_results_*.jsonl"))
+    files.extend(path.glob("tmp_*/*.json"))
+    files.extend(path.glob("*/tmp_*/*.json"))
+    files.extend(path.glob("results_partials/row_*.jsonl"))
+    files.extend(path.glob("*/results_partials/row_*.jsonl"))
     return sorted(set(files))
 
 
