@@ -3056,9 +3056,7 @@ def get_geometry_type(atoms):
         return "monatomic"
     elif len(atoms) == 2:
         return "linear"
+    elif is_linear_by_inertia(atoms):
+        return "linear"
     else:
-        symmetry, symmetry_number = get_symmetry_info(atoms)
-        if "*" in symmetry:
-            return "linear"
-        else:
-            return "nonlinear"
+        return "nonlinear"

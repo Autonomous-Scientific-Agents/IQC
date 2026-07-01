@@ -32,6 +32,7 @@ from iqc.asetools import (
     XTB,
     is_linear_by_inertia,
     get_symmetry_info,
+    get_geometry_type,
     run_ir,
     run_ir_thermo,
     run_optimization,
@@ -1021,6 +1022,81 @@ def test_get_symmetry_info():
         pointgroup, sym_number = get_symmetry_info(h2o)
         assert pointgroup == "C1"
         assert sym_number == 1
+
+
+def test_get_geometry_type():
+    """Geometry classification must handle monatomic, diatomic, and linear polyatomics."""
+    # Monatomic
+    ar = Atoms("Ar", positions=[[0, 0, 0]], pbc=False)
+    assert get_geometry_type(ar) == "monatomic"
+
+    # Diatomic (handled by len==2 shortcut)
+    n2 = Atoms("N2", positions=[[0, 0, 0], [0, 0, 1.10]], pbc=False)
+    assert get_geometry_type(n2) == "linear"
+
+    # Linear polyatomic — regression test for the "*" in symmetry bug:
+    # PointGroupAnalyzer returns a PointGroupOperations object, not a str,
+    # and the previous check silently classified CO2 as nonlinear.
+    co2 = Atoms(
+        "CO2",
+        positions=[[0, 0, 0], [0, 0, 1.16], [0, 0, -1.16]],
+        pbc=False,
+    )
+    assert get_geometry_type(co2) == "linear"
+
+    hcn = Atoms(
+        "HCN",
+        positions=[[0, 0, 0], [0, 0, 1.06], [0, 0, 2.22]],
+        pbc=False,
+    )
+    assert get_geometry_type(hcn) == "linear"
+
+    # Nonlinear polyatomic
+    h2o = Atoms(
+        "H2O",
+        positions=[[0, 0, 0], [0.76, 0.59, 0], [-0.76, 0.59, 0]],
+        pbc=False,
+    )
+    assert get_geometry_type(h2o) == "nonlinear"
+
+
+def test_thermo_co2_uses_linear_geometry_and_sigma_2():
+    """CO2 must reach IdealGasThermo with geometry='linear' and symmetrynumber=2.
+
+    Regression: get_geometry_type previously classified CO2 as 'nonlinear',
+    which made IdealGasThermo use 3 rot DOF and 3N-6 vibrational modes.
+    """
+    pytest.importorskip("pymatgen")
+    from iqc.asetools import _add_thermo_results_from_vibrations
+
+    co2 = Atoms(
+        "CO2",
+        positions=[[0, 0, 0], [0, 0, 1.16], [0, 0, -1.16]],
+        pbc=False,
+    )
+    co2.calc = EMT()
+    # 3N-5 = 4 real vibrational modes for linear CO2 (plausible eV values).
+    results = {
+        "vib_energies": [0.290, 0.165, 0.083, 0.083],
+        "number_of_imaginary": 0,
+        "opt_sym_number": 2,
+        "multiplicity": 1,
+        "error": "",
+    }
+
+    captured = {}
+    from ase.thermochemistry import IdealGasThermo as real_igt
+
+    def spy(**kwargs):
+        captured.update(kwargs)
+        return real_igt(**kwargs)
+
+    with patch("iqc.asetools.IdealGasThermo", side_effect=spy):
+        thermo, out = _add_thermo_results_from_vibrations(co2, results)
+
+    assert thermo is not None, out.get("error")
+    assert captured.get("geometry") == "linear"
+    assert captured.get("symmetrynumber") == 2
 
 
 def test_run_vibrations_error_handling(tmp_path):
