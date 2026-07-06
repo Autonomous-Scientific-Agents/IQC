@@ -600,7 +600,7 @@ def main() -> int:
         num_slots = 1
         head_nodes = all_nodes
     else:
-        all_nodes = _read_pbs_nodes()
+        all_nodes = [node.split(".")[0] for node in _read_pbs_nodes()]
         total_nodes = len(all_nodes)
         num_slots = total_nodes // nodes_per_mol
         if num_slots < 1:
