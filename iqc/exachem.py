@@ -42,7 +42,7 @@ _HARTREE_TO_EV = units.Hartree
 # Default ExaChem binary location on this system. Overridable via the
 # ``EXACHEM_BINARY`` environment variable or the ``binary=`` calculator
 # argument.
-_DEFAULT_BINARY = "/home/keceli/soft/nwx/exachem/build/install/bin/ExaChem"
+_DEFAULT_BINARY = "/home/keceli/IQC/keceli/nwx/install_gpu/bin/ExaChem"
 
 # Mapping from user-facing method aliases to the TASK flags ExaChem expects.
 # Each value is the list of TASK keys to enable. SCF is always enabled

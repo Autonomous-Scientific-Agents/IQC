@@ -734,6 +734,130 @@ def _get_uma_calculator(name, **kwargs):
     return calculator
 
 
+class NumericalForceCalculator:
+    """Wrap an energy-only calculator so it exposes finite-difference forces.
+
+    Some electronic-structure backends (ExaChem, PySCF correlated methods such
+    as CCSD(T)) return only the energy. IQC's geometry optimization and
+    vibrational analysis are force-driven, so those methods cannot be used for
+    thermochemistry as-is. This wrapper adds forces via ASE's finite-difference
+    machinery (``ase.calculators.fd.calculate_numerical_forces``) — the same
+    numerical-force routine behind ``FiniteDifferenceCalculator`` — while
+    delegating energy (and dipole, if the inner calculator provides it) to the
+    wrapped calculator.
+
+    Unlike ``ase.calculators.fd.FiniteDifferenceCalculator``, this wrapper does
+    **not** attempt a numerical stress: that requires a periodic cell and a
+    defined volume, which an isolated molecule does not have (``get_volume``
+    would raise). Stress is only computed when the atoms actually have a full
+    3D cell.
+
+    IQC metadata (``_iqc_spin_charge_convention``, ``_iqc_calculator_family``,
+    ``model_name``) and the inner ``parameters`` mapping are exposed on the
+    wrapper so ``apply_spin_charge`` and result-labeling keep working: mutating
+    ``wrapper.parameters`` mutates the inner calculator's parameters (same dict).
+    """
+
+    def __init__(self, calc, eps_disp: float = 0.01, force_consistent: bool = False):
+        from ase.calculators.calculator import BaseCalculator
+
+        self.calc = calc
+        self.eps_disp = float(eps_disp)
+        self.force_consistent = bool(force_consistent)
+        self.results: dict = {}
+        self.atoms = None
+        # Expose the inner calculator's IQC hints + parameter dict.
+        self.parameters = getattr(calc, "parameters", {})
+        self._iqc_calculator_family = getattr(calc, "_iqc_calculator_family", None)
+        self._iqc_spin_charge_convention = getattr(
+            calc, "_iqc_spin_charge_convention", ""
+        )
+        self.model_name = getattr(calc, "model_name", getattr(calc, "label", "calc"))
+        base_props = list(getattr(calc, "implemented_properties", ["energy"]) or ["energy"])
+        if "forces" not in base_props:
+            base_props.append("forces")
+        self.implemented_properties = base_props
+
+    def __getattr__(self, item):
+        # Delegate anything not defined here (e.g. get_dipole_moment helpers)
+        # to the wrapped calculator.
+        return getattr(self.__dict__["calc"], item)
+
+    def get_potential_energy(self, atoms=None, force_consistent=False):
+        target = atoms if atoms is not None else self.atoms
+        return self.calc.get_potential_energy(target)
+
+    def get_forces(self, atoms=None):
+        from ase.calculators.fd import calculate_numerical_forces
+
+        target = atoms if atoms is not None else self.atoms
+        work = target.copy()
+        work.calc = self.calc
+        return calculate_numerical_forces(
+            work, eps=self.eps_disp, force_consistent=self.force_consistent
+        )
+
+    def get_property(self, name, atoms=None, allow_calculation=True):
+        target = atoms if atoms is not None else self.atoms
+        if name == "forces":
+            return self.get_forces(target)
+        if name in ("energy", "free_energy"):
+            return self.get_potential_energy(target)
+        return self.calc.get_property(name, target, allow_calculation)
+
+    def calculate(self, atoms=None, properties=("energy", "forces"), system_changes=None):
+        target = atoms if atoms is not None else self.atoms
+        self.atoms = target.copy()
+        self.results = {}
+        self.results["energy"] = self.calc.get_potential_energy(target)
+        inner = getattr(self.calc, "results", {}) or {}
+        if "free_energy" in inner:
+            self.results["free_energy"] = inner["free_energy"]
+        else:
+            self.results["free_energy"] = self.results["energy"]
+        if "forces" in properties:
+            self.results["forces"] = self.get_forces(target)
+        if "dipole" in inner:
+            self.results["dipole"] = inner["dipole"]
+        # Surface energy-component / timing metadata from the inner calculator
+        # (e.g. scf/ccsd/(t) breakdown) so the orchestrator can persist it.
+        for key, value in inner.items():
+            if key.endswith("_eV") or key.endswith("_s"):
+                self.results[key] = value
+
+    def reset(self):
+        self.results = {}
+        if hasattr(self.calc, "reset"):
+            self.calc.reset()
+
+    def __repr__(self):
+        return f"NumericalForceCalculator({self.calc!r}, eps_disp={self.eps_disp})"
+
+
+def _wrap_with_numerical_forces(calc, eps_disp: float = None):
+    """Return ``calc`` with finite-difference forces if it lacks native ones.
+
+    Calculators that already implement forces (MACE, PySCF DFT/HF, VASP) are
+    returned unchanged. Energy-only calculators (ExaChem, PySCF CCSD(T)) are
+    wrapped so the force-driven optimization/vibration code can use them. The
+    displacement defaults to the value stashed on the calculator
+    (``_iqc_fd_eps``, set by get_calculator) or 0.01 Å.
+    """
+    if calc is None:
+        return calc
+    props = getattr(calc, "implemented_properties", []) or []
+    if "forces" in props:
+        return calc
+    if eps_disp is None:
+        eps_disp = float(getattr(calc, "_iqc_fd_eps", 0.01))
+    logging.info(
+        "Wrapping %s with finite-difference forces (eps_disp=%.3g Å).",
+        type(calc).__name__,
+        eps_disp,
+    )
+    return NumericalForceCalculator(calc, eps_disp=eps_disp)
+
+
 def get_calculator(name="mace", **kwargs):
     """Initializes and returns the specified ASE calculator.
 
@@ -891,6 +1015,61 @@ def get_calculator(name="mace", **kwargs):
         except Exception as e:
             raise RuntimeError(f"ORCA initialization failed: {e}") from e
 
+    elif name == "pyscf" or name.startswith("pyscf-"):
+        # PySCF: DFT/HF (energy+forces+dipole) or MP2/CCSD/CCSD(T) (energy).
+        # `pyscf-ccsd(t)` etc. select the method via the name suffix; a bare
+        # `pyscf` takes its method from calculator_params (default PBE DFT).
+        try:
+            from iqc.pyscf_calc import PySCFCalculator
+
+            pyscf_kwargs = dict(kwargs)
+            fd_eps = float(pyscf_kwargs.pop("fd_eps", 0.01))
+            if name.startswith("pyscf-"):
+                pyscf_kwargs.setdefault("method", name.split("-", 1)[1])
+            calculator = PySCFCalculator(**pyscf_kwargs)
+            logging.info(
+                "Using PySCF calculator (method=%s, xc=%s, basis=%s)",
+                calculator.parameters.get("method"),
+                calculator.parameters.get("xc"),
+                calculator.parameters.get("basis"),
+            )
+            # Remember the FD step so the force-driven pipeline (opt/vibrations)
+            # can add finite-difference forces for energy-only methods (CCSD(T)).
+            calculator._iqc_fd_eps = fd_eps
+        except ImportError as e:
+            message = (
+                f"PySCF calculator not importable: {e}. "
+                "Install pyscf (pip install pyscf) or pick a different calculator."
+            )
+            logging.error(message)
+            raise RuntimeError(message) from e
+        except Exception as e:
+            message = f"PySCF initialization failed: {e}"
+            logging.error(message)
+            raise RuntimeError(message) from e
+
+    elif name == "vasp":
+        # VASP configured to match the MACE-MP (MPtrj) training level: PBE,
+        # ENCUT 520 eV, spin-polarized, standard PBE PAW potentials.
+        try:
+            from iqc.vasp_calc import get_vasp_calculator
+
+            calculator = get_vasp_calculator(**kwargs)
+            logging.info(
+                "Using VASP calculator (%s)", getattr(calculator, "model_name", "vasp")
+            )
+        except ImportError as e:
+            message = (
+                f"VASP calculator not importable: {e}. Ensure ASE is installed "
+                "and VASP is available on this system."
+            )
+            logging.error(message)
+            raise RuntimeError(message) from e
+        except Exception as e:
+            message = f"VASP initialization failed: {e}"
+            logging.error(message)
+            raise RuntimeError(message) from e
+
     elif name == "exachem":
         # ExaChem is only ever requested explicitly (there is no implicit
         # exachem path in the codebase). Silently falling back to MACE would
@@ -898,11 +1077,16 @@ def get_calculator(name="mace", **kwargs):
         try:
             from iqc.exachem import ExaChemCalculator
 
-            calculator = ExaChemCalculator(**kwargs)
+            exachem_kwargs = dict(kwargs)
+            fd_eps = float(exachem_kwargs.pop("fd_eps", 0.01))
+            calculator = ExaChemCalculator(**exachem_kwargs)
             logging.info(
                 f"Using ExaChem calculator with method={calculator.parameters.get('method')}, "
                 f"basis={calculator.parameters.get('basis')}, nproc={calculator.parameters.get('nproc')}"
             )
+            # Remember the FD step; energy-only ExaChem gets finite-difference
+            # forces from the force-driven pipeline (opt/vibrations) on demand.
+            calculator._iqc_fd_eps = fd_eps
         except ImportError as e:
             message = (
                 f"ExaChem calculator not importable: {e}. "
@@ -918,7 +1102,8 @@ def get_calculator(name="mace", **kwargs):
     else:
         raise RuntimeError(
             f"Unknown calculator {name!r}. Supported: mace, mace-polar, xtb, "
-            f"emt, orca, exachem, uma, uma-s-omol, uma-s-omat, uma-s-odac, "
+            f"emt, orca, exachem, pyscf, pyscf-<method>, vasp, uma, "
+            f"uma-s-omol, uma-s-omat, uma-s-odac, "
             f"uma-m-omol, uma-m-omat, uma-m-odac."
         )
 
@@ -1708,6 +1893,29 @@ def apply_spin_charge(atoms, calculator, multiplicity=None, charge=0):
                 parameters["scf_type"] = (
                     "restricted" if multiplicity == 1 else "unrestricted"
                 )
+    elif spin_charge_convention == "pyscf":
+        # PySCF reads charge and spin (2S = unpaired electrons) from its
+        # calculator parameters when it builds the gto.Mole per call.
+        parameters = getattr(calculator, "parameters", None)
+        if parameters is not None:
+            parameters["charge"] = charge
+            parameters["multiplicity"] = multiplicity
+            parameters["spin"] = unpaired
+    elif spin_charge_convention == "vasp":
+        # VASP: spin via total magnetic moment (ISPIN=2 already set). Place all
+        # unpaired electrons as an initial moment on atom 0; VASP relaxes it.
+        # Non-zero charge requires an explicit NELECT (handled in the factory).
+        magmoms = [0.0] * n
+        if n and unpaired:
+            magmoms[0] = float(unpaired)
+        atoms.set_initial_magnetic_moments(magmoms)
+        if charge != 0:
+            logging.warning(
+                "VASP: charge=%d requires an explicit NELECT via "
+                "calculator_params; spin multiplicity=%d applied via magmoms.",
+                charge,
+                multiplicity,
+            )
     elif calc_class in {"MACECalculator", "EMT"}:
         default_mult = get_multiplicity(atoms, charge=charge)
         if charge != 0 or multiplicity != default_mult:
@@ -2318,6 +2526,10 @@ def _prepare_calculation(
         atoms, calc, multiplicity=multiplicity, charge=charge
     )
 
+    # Energy-only calculators (ExaChem, PySCF CCSD(T)) get finite-difference
+    # forces so the force-driven optimizer can use them (no-op otherwise).
+    calc = _wrap_with_numerical_forces(calc)
+
     # Get initial data
     initial_smiles = atoms2smiles(atoms)
     initial_xyz = atoms2xyz(atoms)
@@ -2686,6 +2898,10 @@ def run_vibrations(
         logging.error(error)
         return None, results
 
+    # Energy-only calculators (ExaChem, PySCF CCSD(T)) get finite-difference
+    # forces so the Hessian (and any non-optimizing path) can use them.
+    calc = _wrap_with_numerical_forces(calc)
+
     _assign_orca_work_directory(calc, unique_name, purpose="vib")
     _ensure_orca_engrad_for_forces(calc)
     logging.debug(
@@ -2844,8 +3060,16 @@ def _add_thermo_results_from_vibrations(
     results,
     ignore_imag_modes=True,
     multiplicity=None,
+    potentialenergy=None,
 ):
-    """Append IdealGasThermo properties using vibrational data in results."""
+    """Append IdealGasThermo properties using vibrational data in results.
+
+    ``potentialenergy`` (eV) overrides the electronic energy that anchors the
+    thermochemistry. This enables composite schemes where the geometry and
+    Hessian come from a cheap force-capable calculator (e.g. MACE) while the
+    electronic energy comes from a higher level of theory (e.g. CCSD(T)); if
+    None, the energy of the calculator currently attached to ``atoms`` is used.
+    """
 
     thermo = None
     try:
@@ -2868,13 +3092,24 @@ def _add_thermo_results_from_vibrations(
                 logging.error(error)
                 return None, results
 
+        if potentialenergy is None:
+            potentialenergy = atoms.get_potential_energy()
+        # ASE's IdealGasThermo rejects periodic atoms (it is a gas-phase model).
+        # Plane-wave backends (VASP) need a periodic cell, so the molecule was
+        # wrapped in a box. Use a non-periodic copy for the thermo — the
+        # positions/masses that set the moments of inertia are unchanged.
+        thermo_atoms = atoms
+        if bool(getattr(atoms, "pbc", None) is not None and atoms.pbc.any()):
+            thermo_atoms = atoms.copy()
+            thermo_atoms.pbc = False
+            thermo_atoms.calc = None
         start_time = time.time()
         thermo = IdealGasThermo(
             vib_energies=vib_energies,
-            geometry=get_geometry_type(atoms),
-            atoms=atoms,
-            potentialenergy=atoms.get_potential_energy(),
-            spin=get_spin(atoms, results.get("multiplicity", multiplicity)),
+            geometry=get_geometry_type(thermo_atoms),
+            atoms=thermo_atoms,
+            potentialenergy=potentialenergy,
+            spin=get_spin(thermo_atoms, results.get("multiplicity", multiplicity)),
             symmetrynumber=results.get("opt_sym_number", 1),
             ignore_imag_modes=ignore_imag_modes,
         )
@@ -3327,6 +3562,21 @@ def run_ir_thermo(
     return atoms, results
 
 
+# Energy-component keys copied from a composite thermo energy calculator
+# (ExaChem / PySCF) into the top-level results so they are persisted directly.
+_ENERGY_COMPONENT_FIELDS = (
+    "scf_energy_eV",
+    "mp2_correlation_eV",
+    "ccsd_correlation_eV",
+    "t_correction_eV",
+    "total_energy_eV",
+    "scf_time_s",
+    "mp2_time_s",
+    "ccsd_time_s",
+    "t_time_s",
+)
+
+
 def run_thermo(
     atoms,
     calculator=None,
@@ -3336,27 +3586,50 @@ def run_thermo(
     save_geometry=False,
     multiplicity=None,
     charge=0,
+    optimization_calculator=None,
+    vibration_calculator=None,
+    energy_calculator=None,
     **params,
 ):
     """
     Run thermochemistry calculations for an ASE Atoms object.
 
+    Supports two modes:
+
+    * **Single-level** (default): one ``calculator`` does geometry
+      optimization, the Hessian, and the electronic energy. Correct for
+      force-capable methods (MACE, MACE-Polar, PySCF DFT/HF).
+
+    * **Composite**: a force-capable ``vibration_calculator`` (falling back to
+      ``optimization_calculator`` / ``calculator``) provides the optimized
+      geometry and harmonic frequencies, while a separate ``energy_calculator``
+      provides the electronic energy via a single point at the optimized
+      geometry. This is how energy-only correlated methods (PySCF CCSD(T),
+      ExaChem CCSD(T)) are turned into thermochemistry — e.g. CCSD(T) energy on
+      a MACE geometry with MACE harmonic ZPE/thermal corrections.
+
     Args:
         atoms (ase.Atoms): ASE Atoms object
-        calculator (ase.calculators.calculator.Calculator, optional): Calculator instance. Defaults to None (uses get_calculator).
+        calculator: Fallback calculator used for any role not set explicitly.
         ignore_imag_modes (bool): Whether to ignore imaginary vibrational modes
         unique_name (str): Unique name for the molecule
         trajectory (str): Path to save trajectory file during optimization
-        save_geometry (bool): Whether to save the final optimized geometry to xyz file
+        save_geometry (bool): Whether to save the final optimized geometry
+        optimization_calculator: Force-capable calc for the geometry step.
+        vibration_calculator: Force-capable calc for the Hessian step.
+        energy_calculator: Calc providing the final electronic energy.
         **opt_params: Additional keyword arguments passed to run_optimization.
 
     Returns:
-        tuple: A tuple containing the thermochemistry results and a dictionary with calculated properties
+        tuple: (thermo, results)
     """
+
+    # Geometry + Hessian require forces; pick the first force-capable role.
+    geom_calc = vibration_calculator or optimization_calculator or calculator
 
     atoms, results = run_vibrations(
         atoms,
-        calculator=calculator,
+        calculator=geom_calc,
         optimize=True,
         unique_name=unique_name,
         trajectory=trajectory,
@@ -3371,11 +3644,37 @@ def run_thermo(
         )
         return None, results
 
+    # Composite scheme: substitute the electronic energy from a higher level.
+    potentialenergy = None
+    if energy_calculator is not None and energy_calculator is not geom_calc:
+        try:
+            apply_spin_charge(
+                atoms, energy_calculator, multiplicity=multiplicity, charge=charge
+            )
+            _assign_orca_work_directory(
+                energy_calculator, unique_name, purpose="thermo_energy"
+            )
+            atoms.calc = energy_calculator
+            potentialenergy = atoms.get_potential_energy()
+            results["energy_calculator"] = str(energy_calculator)
+            results["electronic_energy_eV"] = potentialenergy
+            energy_results = getattr(energy_calculator, "results", {}) or {}
+            for key in _ENERGY_COMPONENT_FIELDS:
+                if key in energy_results:
+                    results[key] = energy_results[key]
+            _store_calculator_observables(results, energy_calculator, prefix="")
+        except Exception as e:
+            error = f"Energy calculator single-point failed: {e}\n"
+            results["error"] += error
+            logging.error(error)
+            return None, results
+
     thermo, results = _add_thermo_results_from_vibrations(
         atoms,
         results,
         ignore_imag_modes=ignore_imag_modes,
         multiplicity=multiplicity,
+        potentialenergy=potentialenergy,
     )
     if results["error"]:
         return None, results

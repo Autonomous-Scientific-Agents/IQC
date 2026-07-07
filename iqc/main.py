@@ -446,6 +446,13 @@ SUPPORTED_CALCULATOR_NAMES = {
     "emt",
     "orca",
     "exachem",
+    "pyscf",
+    "pyscf-dft",
+    "pyscf-hf",
+    "pyscf-mp2",
+    "pyscf-ccsd",
+    "pyscf-ccsd(t)",
+    "vasp",
     "uma",
     "uma-s-omol",
     "uma-s-omat",
@@ -469,6 +476,14 @@ def _resolve_role_calculators(run_params, roles, calc_params):
     role_calculators = {}
     for role in roles:
         name = run_params.pop(role, None)
+        # Per-role calculator params (e.g. `energy_calculator_params`) let a
+        # composite workflow mix calculators of different types — a MACE
+        # vibration_calculator (no params) with a PySCF/ExaChem
+        # energy_calculator (basis/method params). When absent, fall back to
+        # the shared top-level calc_params (preserves the homogeneous IR case).
+        role_params = run_params.pop(f"{role}_params", None)
+        if role_params is None:
+            role_params = calc_params
         if name is None:
             continue
         if isinstance(name, str):
@@ -480,7 +495,7 @@ def _resolve_role_calculators(run_params, roles, calc_params):
                     "instantiated calculator via the Python API."
                 )
             try:
-                instance = get_calculator(name=name, **calc_params)
+                instance = get_calculator(name=name, **role_params)
             except RuntimeError as e:
                 raise RuntimeError(
                     f"Failed to initialize {role} '{name}': {e}"
@@ -890,9 +905,25 @@ def _process_one_row(
                 )
                 thermo_run_params["output_dir"] = output_dir
                 save_geometry = True
+            # Composite thermochemistry roles: a force-capable calculator can
+            # provide geometry + Hessian while a separate energy_calculator
+            # (e.g. CCSD(T)/ExaChem, which have no forces) supplies the
+            # electronic energy at the optimized geometry.
+            role_calculators = _resolve_role_calculators(
+                thermo_run_params,
+                (
+                    "optimization_calculator",
+                    "vibration_calculator",
+                    "energy_calculator",
+                ),
+                calc_params,
+            )
             explicit_params = {
                 "atoms",
                 "calculator",
+                "optimization_calculator",
+                "vibration_calculator",
+                "energy_calculator",
                 "unique_name",
                 "ignore_imag_modes",
                 "trajectory",
@@ -912,6 +943,7 @@ def _process_one_row(
                 save_geometry=save_geometry,
                 multiplicity=ase_multiplicity,
                 charge=ase_charge,
+                **role_calculators,
                 **thermo_params_filtered,
             )
         elif task == "nmr":
