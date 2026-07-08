@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - main
+      - dev
   pull_request:
     branches:
       - main
+      - dev
 
 jobs:
   test:
@@ -18,20 +20,36 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
+
+    - name: Free runner disk space
+      # ubuntu-latest ships ~14 GB free out of 84 GB; ~25 GB of
+      # preinstalled tooling (dotnet, android, ghc, code, etc.) is
+      # irrelevant to a python conda env and pushes the runner past the
+      # disk limit when the heavy pip layer lands (issue: "No space
+      # left on device"). Reclaim ~25 GB before creating the env.
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                    /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                    "$AGENT_TOOLSDIRECTORY" || true
+        df -h /
+
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
-    
+
     - name: Install Miniconda
       uses: conda-incubator/setup-miniconda@v2
       with:
         auto-update-conda: true
         python-version: ${{ matrix.python-version }}
-    
+
     - name: Create conda environment
-      run: conda env create -f env.yml
+      # Use the slim CI env — no pytorch / mace / fairchem. Every iqc
+      # module imports those lazily (inside functions), so tests
+      # exercising the general iqc paths pass without them. See
+      # env-ci.yml for the pared-down dep list.
+      run: conda env create -f env-ci.yml
     
     - name: Install iqc
       run: conda run -n iqc-env pip install -e .
