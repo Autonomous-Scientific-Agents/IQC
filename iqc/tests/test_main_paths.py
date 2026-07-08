@@ -78,6 +78,22 @@ def test_default_skip_existing_sources_finds_iqc_result_files(tmp_path):
     ]
 
 
+def test_default_skip_existing_sources_finds_results_partials(tmp_path):
+    partials_dir = tmp_path / "results_partials"
+    partials_dir.mkdir()
+    row0 = partials_dir / "row_0000000.jsonl"
+    row0.write_text("{}", encoding="utf-8")
+    row1 = partials_dir / "row_0000001.jsonl"
+    row1.write_text("{}", encoding="utf-8")
+    ignored = partials_dir / "notes.txt"
+    ignored.write_text("scratch", encoding="utf-8")
+
+    result = _default_skip_existing_sources(tmp_path)
+    assert row0 in result
+    assert row1 in result
+    assert ignored not in result
+
+
 def test_validate_input_args_rejects_jsonl_as_xyz():
     args = get_args(["--xyz", "iqc_single_results_20260101_000000.jsonl"])
 

@@ -61,10 +61,19 @@ def _rank_output_parent(cwd="."):
 
 
 def _default_skip_existing_sources(cwd="."):
-    """Return default IQC result files to scan for completed calculations."""
+    """Return default IQC result files to scan for completed calculations.
+
+    Includes ``results_partials/row_*.jsonl`` so that if an earlier iqc-el
+    run was SIGTERM'd before its epilogue wrote the consolidated
+    ``iqc_*_results_*.jsonl``, a resubmit still picks up the per-row
+    partials and skips already-completed rows (job 8648581 finish attempt
+    into rundir with 415 partials but no consolidated JSONL re-ran all
+    500 rows because this glob was missing).
+    """
 
     root = Path(cwd).expanduser()
     sources = list(root.glob("iqc_*_results_*.jsonl"))
+    sources.extend(root.glob("results_partials/row_*.jsonl"))
     tmp_parents = [root, _rank_output_parent(root)]
     for tmp_parent in tmp_parents:
         if not tmp_parent.is_dir():
