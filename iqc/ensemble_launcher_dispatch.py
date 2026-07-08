@@ -466,13 +466,25 @@ def _read_pbs_nodes() -> list[str]:
 
 
 def _auto_nlevels(num_slots: int) -> int:
+    """Pick hierarchy depth.
+
+    Always returns 1 when there is real work (num_slots > 1) because EL's
+    default `FixedLeafNodePolicy` uses `2**ceil(log2(leaf_nodes))` internally,
+    which raises a silently-swallowed `ValueError` for non-power-of-2
+    `leaf_nodes` (job 8648581 with num_slots=85 → 128 workers requested from
+    16 sub-masters owning 5–6 nodes each → ValueError → sub-master hangs).
+    At nlevels=1 combined with `simple_split_children_policy` (see main()),
+    the master directly manages `nchildren=num_slots` workers via even
+    split, which works for any node count.
+
+    Override via `--el-nlevels` for scaling experiments — the underlying
+    ZMQ/heartbeat load on a single master starts to matter above a few
+    hundred workers per the ensemble_launcher developer.
+    """
+
     if num_slots <= 1:
         return 0
-    if num_slots <= 64:
-        return 1
-    if num_slots <= 2048:
-        return 2
-    return 3
+    return 1
 
 
 def main() -> int:
@@ -669,8 +681,17 @@ def main() -> int:
     checkpoint_dir = os.path.join(head_output_dir, "el_checkpoint")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
+    # SimpleSplitChildrenPolicy uses `nchildren` directly (even split of
+    # `nodes` across `nchildren` workers) — no log2 rounding, so it works
+    # for any num_slots, not just powers of 2. FixedLeafNodePolicy (the
+    # previous choice) computes 2**ceil(log2(leaf_nodes)) which over-
+    # allocates workers for non-pow2 sizes and raises ValueError inside
+    # each sub-master's `get_children_resources`; the ValueError is
+    # silently swallowed and sub-masters hang in a restart loop until
+    # walltime (job 8648581, num_slots=85).
     policy_config = PolicyConfig(
         nlevels=nlevels,
+        nchildren=num_slots,
         leaf_nodes=num_slots,
     )
     mpi_config = MPIConfig(
@@ -681,7 +702,7 @@ def main() -> int:
     launcher_config = LauncherConfig(
         child_executor_name="async_mpi",
         task_executor_name=["async_loky", "async_mpi"],
-        children_scheduler_policy="fixed_leafs_children_policy",
+        children_scheduler_policy="simple_split_children_policy",
         comm_name="async_zmq",
         cluster=True,
         checkpoint_dir=checkpoint_dir,
