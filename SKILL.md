@@ -5,9 +5,18 @@ description: Run quantum-chemistry calculations (single point, geometry optimiza
 
 # IQC — Interactive Quantum Chemistry
 
-IQC wraps ASE-based calculators (xtb, MACE, UMA, ORCA, EMT) and exposes a
-consistent API for the most common molecular-property workflows. The MCP
-server (`iqc-mcp`) exposes a focused subset designed for agent use.
+IQC wraps ASE-based calculators (xtb, MACE, MACE-Polar, UMA, ORCA, EMT, PySCF,
+ExaChem, VASP) and exposes a consistent API for the most common
+molecular-property workflows. The MCP server (`iqc-mcp`) exposes a focused
+subset designed for agent use.
+
+Energy-only backends (ExaChem, and PySCF's MP2/CCSD/CCSD(T) methods) are given
+finite-difference forces automatically (via `ase.calculators.fd`), so they can
+drive geometry optimization and vibrations like any force-capable calculator.
+`run_thermo` / `run_ir` also accept per-role calculators
+(`optimization_calculator`, `vibration_calculator`, `energy_calculator`,
+`dipole_calculator`) for composite workflows — e.g. a MACE geometry + Hessian
+with a CCSD(T) single-point energy.
 
 ## When to invoke
 
@@ -20,8 +29,10 @@ Use IQC tools when the user wants any of:
 - A schema/preview of a tabular IQC results file (parquet, CSV, JSONL, …)
 
 **Do not** use IQC for:
-- Periodic / crystalline / surface calculations (it's molecular-only here)
 - Excited states, TD-DFT, or multireference work
+- Crystalline / surface periodic optimization. (VASP *is* available for
+  molecular thermochemistry — the molecule is wrapped in a large periodic box
+  with Γ-point sampling — but IQC is not a general solid-state/surface tool.)
 - Anything the user wants to run themselves on an HPC queue — point them at
   the `iqc` CLI instead
 
@@ -49,10 +60,20 @@ tool's docstring for full signatures.
 | ---------------- | ----------- | ------------------ | ------------ | ----------------------------- |
 | `xtb` *(default)* | fast        | semi-empirical     | yes          | `pip install iqc[xtb]`        |
 | `mace`           | fast        | DFT-quality MLIP   | no           | `pip install iqc[mlip]` + MACE |
-| `mace-polar`     | fast        | MLIP + electrostat | yes          | MACE main branch + graph_electrostatics |
+| `mace-polar`     | fast        | MLIP + electrostat | yes          | MACE + graph_electrostatics¹  |
 | `uma-s-omol`     | fast        | MLIP (FAIRChem)    | no           | `pip install iqc[mlip]`       |
+| `pyscf`          | med–slow    | DFT/HF (analytic forces) | yes    | `pip install pyscf`           |
+| `pyscf-ccsd(t)`  | slow        | CCSD(T) (FD forces) | no          | `pip install pyscf`           |
+| `exachem`        | slow        | CCSD(T) etc. (MPI/GPU) | no       | ExaChem binary²               |
+| `vasp`           | slow        | plane-wave PBE (MP-compatible) | no | VASP binary + POTCARs²    |
 | `orca`           | slow        | DFT/HF/post-HF     | yes          | ORCA binary on PATH           |
 | `emt`            | trivial     | metals only        | no           | built into ASE                |
+
+¹ MACE-Polar needs `graph_longrange`, installed from
+  `git+https://github.com/WillBaldwin0/graph_electrostatics`; this pins
+  e3nn 0.4.4 (incompatible with UMA/fairchem — see the `iqc-polaris-*` notes).
+² ExaChem/VASP are HPC/GPU binaries; see the `iqc-polaris-exachem-vasp` memory
+  note for the launch-wrapper pattern used on ALCF Polaris.
 
 Decision rules:
 
@@ -60,6 +81,14 @@ Decision rules:
   dipoles built in).
 - **Switch to `mace` or `uma-s-omol`** when the user wants DFT-quality
   energies / geometries without paying DFT cost, and IR is not needed.
+- **Use `pyscf`** for a real all-electron DFT/HF number (`calculator_params=
+  {"method": "dft", "xc": "pbe", "basis": "def2-svp"}`); use PBE to match the
+  MACE-MP (MPtrj) level. `pyscf-ccsd(t)` (or `exachem`) for coupled-cluster;
+  they are energy-only, so their forces come from finite differences — the FD
+  Hessian is expensive (hundreds of single points), so prefer a composite run
+  (`energy_calculator="pyscf-ccsd(t)"` on a MACE geometry+Hessian).
+- **Use `vasp`** for a plane-wave PBE reference comparable to MACE-MP; IQC wraps
+  the molecule in a box with MP-compatible settings (ENCUT 520, spin-polarized).
 - **Use `orca`** only when the user asks for DFT explicitly. Set
   `calculator_params={"orcasimpleinput": "B3LYP def2-SVP",
   "orcablocks": "%pal nprocs 4 end"}` and confirm ORCA is on PATH.
@@ -101,7 +130,14 @@ Decision rules:
 - **MLIPs with dipoles**: regular `mace` / `uma-*` raise on IR — fall back to
   `xtb`, `orca`, or `mace-polar`.
 - **First MACE/UMA call** downloads checkpoints (hundreds of MB). Tell the
-  user to expect a one-time delay.
+  user to expect a one-time delay. On no-internet compute nodes, pre-cache on a
+  login node first.
+- **Energy-only methods (`exachem`, `pyscf-ccsd(t)`) self-consistent thermo is
+  expensive**: their forces are finite differences, so a full opt+Hessian is
+  hundreds of single points. For a CCSD(T) thermo number prefer the composite
+  route — MACE (or PySCF-DFT) geometry+Hessian + a CCSD(T) `energy_calculator`
+  single point. Note the composite `opt_energy_eV` is the *geometry* calc's
+  energy; the CCSD(T) value is in `electronic_energy_eV`.
 - **Imaginary frequencies** after `run_vibrations` usually mean the geometry
   was not at a stationary point. Re-run `run_optimization` with a tighter
   `fmax` (e.g. `0.001`) first.
