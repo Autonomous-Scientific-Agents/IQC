@@ -1,0 +1,27 @@
+name: iqc-env
+# Slim environment used by GitHub Actions CI. Excludes the heavy MLIP
+# stack (pytorch, mace-torch, fairchem-core, torch-*) because every test
+# in iqc/tests imports torch/mace/fairchem lazily (inside functions), so
+# tests exercising the general iqc paths run fine without them. Full
+# environment for local/prod use is in env.yml.
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - psutil
+  - ase
+  - rdkit
+  - matplotlib
+  - mpi4py
+  - pyarrow
+  - pandas
+  - openpyxl
+  - xlrd
+  - pip
+  - pip:
+      - argcomplete
+      - nglview
+      - pubchempy
+      - pymatgen
+      - PyYAML
+      - pydantic>=2.12,<3
