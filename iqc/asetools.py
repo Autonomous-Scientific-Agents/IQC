@@ -14,7 +14,7 @@ from ase import Atoms, build
 from ase.calculators.calculator import PropertyNotImplementedError, PropertyNotPresent
 from ase.calculators.emt import EMT
 from ase.io import read, write
-from ase.optimize import BFGS
+from ase.optimize import BFGS, FIRE, LBFGS
 from ase.thermochemistry import IdealGasThermo
 from ase.vibrations import Vibrations
 from ase.visualize import view
@@ -746,8 +746,13 @@ def get_calculator(name="mace", **kwargs):
 
     Returns:
         ase.calculators.calculator.Calculator: The initialized calculator instance.
-                                                 Returns EMT as a fallback if the requested
-                                                 calculator is not available or fails to initialize.
+
+    Raises:
+        RuntimeError: if the requested calculator is unknown, its dependency is
+            missing, or initialization fails. This function never silently
+            substitutes a different calculator (e.g. EMT/MACE) — doing so would
+            change the level of theory under the user. Callers that want a
+            fallback must catch the error and choose one explicitly.
     """
     name = name.lower()
     calculator = None
@@ -1941,6 +1946,336 @@ def _validate_geometry(
         )
 
 
+def validate_physical_results(results, atoms=None):
+    """Flag nonphysical quantities in a result dict *without terminating*.
+
+    Detects the failure modes seen in production (BFGS energy blow-ups to
+    ~1e56 eV, ZPE/frequency overflow, negative entropy, NaN/Inf) so downstream
+    aggregation can exclude them instead of silently averaging garbage. This
+    never raises and never drops the row: on any violation it sets
+    ``results['nonphysical'] = True`` and appends human-readable reasons to
+    ``results['validation_messages']`` and ``results['warnings']``, and logs at
+    ERROR level. It is idempotent — safe to call after each stage and again
+    centrally — because messages are de-duplicated and the flag is recomputed.
+
+    Thresholds are overridable via environment variables:
+      ``IQC_MAX_ENERGY_PER_ATOM_EV`` (default 1e4),
+      ``IQC_MAX_ZPE_PER_ATOM_EV`` (default 1.0),
+      ``IQC_MAX_FREQ_CM`` (default 8000).
+
+    Args:
+        results (dict): result dict produced by a run_* function (mutated).
+        atoms (ase.Atoms, optional): used only to recover the atom count when
+            ``number_of_atoms`` is missing from ``results``.
+
+    Returns:
+        dict: the same ``results`` object, mutated in place.
+    """
+    n_atoms = results.get("number_of_atoms")
+    if not n_atoms and atoms is not None:
+        n_atoms = len(atoms)
+    n_atoms = int(n_atoms) if n_atoms else 1
+
+    max_e = float(os.environ.get("IQC_MAX_ENERGY_PER_ATOM_EV", 1e4)) * n_atoms
+    max_zpe = float(os.environ.get("IQC_MAX_ZPE_PER_ATOM_EV", 1.0)) * n_atoms
+    max_freq = float(os.environ.get("IQC_MAX_FREQ_CM", 8000.0))
+
+    msgs = []
+
+    def _num(key):
+        value = results.get(key)
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    # Energies: finite and within a generous per-atom magnitude bound.
+    for key in ("initial_energy_eV", "opt_energy_eV", "energy_eV", "G_eV", "H_eV"):
+        value = _num(key)
+        if value is None:
+            continue
+        if not np.isfinite(value):
+            msgs.append(f"{key} is non-finite ({results.get(key)!r})")
+        elif abs(value) > max_e:
+            msgs.append(
+                f"{key}={value:.3e} eV exceeds |E| <= {max_e:.3e} eV "
+                f"({n_atoms} atoms)"
+            )
+
+    # Zero-point energy: finite, non-negative, bounded.
+    zpe = _num("E_ZPE_eV")
+    if zpe is not None:
+        if not np.isfinite(zpe):
+            msgs.append(f"E_ZPE_eV is non-finite ({results.get('E_ZPE_eV')!r})")
+        elif zpe < 0:
+            msgs.append(f"E_ZPE_eV={zpe:.3e} eV is negative")
+        elif zpe > max_zpe:
+            msgs.append(f"E_ZPE_eV={zpe:.3e} eV exceeds {max_zpe:.3g} eV")
+
+    # Entropy: finite and non-negative.
+    entropy = _num("S_eV/K")
+    if entropy is not None:
+        if not np.isfinite(entropy):
+            msgs.append(f"S_eV/K is non-finite ({results.get('S_eV/K')!r})")
+        elif entropy < 0:
+            msgs.append(f"S_eV/K={entropy:.3e} eV/K is negative")
+
+    # Vibrational frequencies: finite and bounded in magnitude.
+    freqs = results.get("vibrational_frequencies_cm^-1")
+    if freqs is not None and len(freqs):
+        arr = np.asarray(freqs, dtype=float)
+        if not np.all(np.isfinite(arr)):
+            msgs.append("vibrational_frequencies_cm^-1 contains non-finite values")
+        elif np.max(np.abs(arr)) > max_freq:
+            msgs.append(
+                f"max|frequency|={np.max(np.abs(arr)):.3e} cm^-1 exceeds "
+                f"{max_freq:g} cm^-1"
+            )
+
+    # Imaginary modes are informational (a real TS/under-optimized minimum),
+    # not by themselves nonphysical; surface them as a flag for triage.
+    try:
+        if int(results.get("number_of_imaginary") or 0) > 0:
+            results["has_imaginary"] = True
+    except (TypeError, ValueError):
+        pass
+
+    existing = list(results.get("validation_messages", []))
+    new_msgs = [m for m in msgs if m not in existing]
+    if new_msgs:
+        results["validation_messages"] = existing + new_msgs
+        warnings = results.get("warnings")
+        if isinstance(warnings, list):
+            warnings.extend(new_msgs)
+        else:
+            results["warnings"] = list(new_msgs)
+        label = results.get("unique_name") or results.get("_unique_name") or ""
+        logging.error(
+            "Nonphysical result(s) detected for %s: %s", label, "; ".join(new_msgs)
+        )
+    results["nonphysical"] = bool(results.get("validation_messages"))
+    return results
+
+
+def check_suspicious_no_op(results):
+    """Warn if an optimization task looks like it never actually ran.
+
+    This is the exact signature that let a silently-substituted calculator (the
+    2026-06 UMA-on-XPU jobs that fell back to MACE) pass as a real result:
+    ``opt_steps == 0``, sub-50 ms ``opt_time``, and ``opt_energy_eV`` identical
+    to ``initial_energy_eV``. A genuinely pre-converged geometry is legal, so
+    this only warns (sets ``results['suspicious_no_op'] = True``) and never
+    fails the row. Non-optimization tasks (no ``opt_steps``) are ignored.
+    """
+    if "opt_steps" not in results:
+        return results
+    try:
+        steps = int(results.get("opt_steps"))
+        opt_time = float(results.get("opt_time"))
+        initial_e = results.get("initial_energy_eV")
+        opt_e = results.get("opt_energy_eV")
+        if (
+            steps == 0
+            and opt_time < 0.05
+            and initial_e is not None
+            and opt_e is not None
+            and float(initial_e) == float(opt_e)
+        ):
+            msg = (
+                "suspicious no-op optimization: 0 steps, "
+                f"opt_time={opt_time:.4g}s, opt_energy==initial_energy — the "
+                "requested calculator may not have actually run"
+            )
+            results["suspicious_no_op"] = True
+            warnings = results.get("warnings")
+            if isinstance(warnings, list):
+                if msg not in warnings:
+                    warnings.append(msg)
+            else:
+                results["warnings"] = [msg]
+            logging.error("%s (%s)", msg, results.get("unique_name", ""))
+    except (TypeError, ValueError):
+        pass
+    return results
+
+
+class _OptimizerDiverged(Exception):
+    """Raised internally to stop an optimization whose energy has blown up."""
+
+
+def _make_optimizer(name, atoms, trajectory=None, maxstep=None):
+    """Instantiate an ASE optimizer by short name, capping the step if given.
+
+    Supported: ``bfgs`` (default), ``lbfgs``, ``fire``. ``maxstep`` caps the
+    per-step displacement (Å), which is the single most effective guard against
+    the BFGS energy blow-ups seen with the mace-polar model.
+    """
+    name = (name or "bfgs").lower()
+    kwargs = {}
+    if maxstep is not None:
+        kwargs["maxstep"] = maxstep
+    if name == "bfgs":
+        return BFGS(atoms, trajectory=trajectory, **kwargs)
+    if name in ("lbfgs", "l-bfgs"):
+        return LBFGS(atoms, trajectory=trajectory, **kwargs)
+    if name == "fire":
+        try:
+            return FIRE(atoms, trajectory=trajectory, **kwargs)
+        except TypeError:
+            # Older ASE FIRE spells the cap differently; fall back to default.
+            return FIRE(atoms, trajectory=trajectory)
+    raise ValueError(f"Unknown optimizer {name!r}. Use 'bfgs', 'lbfgs', or 'fire'.")
+
+
+def _run_staged_optimization(
+    atoms,
+    fmax,
+    max_steps,
+    trajectory,
+    optimizer="bfgs",
+    maxstep=None,
+    recover=False,
+    recover_optimizers=("lbfgs", "fire"),
+    max_recovery_attempts=2,
+):
+    """Optimize ``atoms``, with an energy-divergence guard and staged restarts.
+
+    Runs ``optimizer`` first. A per-step observer aborts the run the moment the
+    energy becomes non-finite or exceeds a per-atom magnitude bound (default
+    ``IQC_MAX_ENERGY_PER_ATOM_EV`` × natoms), so a diverging trajectory no
+    longer grinds to ``max_steps`` and emits a 1e56 eV energy. If ``recover`` is
+    set and the run does not converge to a finite geometry, it restarts from the
+    current positions with the next optimizer in ``recover_optimizers`` (up to
+    ``max_recovery_attempts`` extra tries).
+
+    Returns ``(converged, total_steps, optimizer_used, recovery_used, attempts)``.
+    """
+    n_atoms = max(len(atoms), 1)
+    energy_bound = float(os.environ.get("IQC_MAX_ENERGY_PER_ATOM_EV", 1e4)) * n_atoms
+
+    def _attempt(opt_name):
+        dyn = _make_optimizer(opt_name, atoms, trajectory=trajectory, maxstep=maxstep)
+
+        def _guard():
+            try:
+                energy = atoms.get_potential_energy()
+            except Exception:
+                return
+            if not np.isfinite(energy) or abs(energy) > energy_bound:
+                raise _OptimizerDiverged(
+                    f"energy {energy:.3e} eV diverged (|E| > {energy_bound:.3e})"
+                )
+
+        dyn.attach(_guard, interval=1)
+        try:
+            converged = bool(dyn.run(fmax=fmax, steps=max_steps))
+        except _OptimizerDiverged as exc:
+            logging.warning("Optimizer '%s' diverged and was aborted: %s", opt_name, exc)
+            converged = False
+        return converged, dyn.get_number_of_steps()
+
+    sequence = [optimizer] + (list(recover_optimizers or ()) if recover else [])
+    total_steps = 0
+    attempts = 0
+    used = optimizer
+    converged = False
+    for i, opt_name in enumerate(sequence):
+        if i > 0:
+            if attempts >= max_recovery_attempts:
+                break
+            attempts += 1
+            logging.info(
+                "Optimization recovery attempt %d: restarting with '%s'",
+                attempts,
+                opt_name,
+            )
+        converged, steps = _attempt(opt_name)
+        total_steps += steps
+        used = opt_name
+        try:
+            energy = atoms.get_potential_energy()
+            finite = bool(np.isfinite(energy)) and abs(energy) <= energy_bound
+        except Exception:
+            finite = False
+        if (converged and finite) or not recover:
+            break
+    return converged, total_steps, used, attempts > 0, attempts
+
+
+def _imaginary_mode_vectors(frequencies, vib_modes, nrot, max_vib_imag):
+    """Return the (N,3) displacement vectors for imaginary vibrational modes.
+
+    ``frequencies`` is the complex frequency array from ASE; ``vib_modes`` are
+    the corresponding modes (shape ``(3N, N, 3)``). The first ``3 + nrot``
+    entries are translations/rotations and are skipped, mirroring the imaginary
+    count elsewhere in this module.
+    """
+    vectors = []
+    if vib_modes is None or len(vib_modes) == 0:
+        return vectors
+    body_freqs = frequencies[3 + nrot:]
+    body_modes = vib_modes[3 + nrot:]
+    for freq, mode in zip(body_freqs, body_modes):
+        if abs(getattr(freq, "imag", 0.0)) > max_vib_imag:
+            vectors.append(np.asarray(mode, dtype=float))
+    return vectors
+
+
+def _recover_imaginary(
+    atoms, results, mode_vectors, recompute_fn, displacement=0.3,
+    max_attempts=1, unique_name="",
+):
+    """Displace along imaginary modes, recompute, and keep the best geometry.
+
+    ``recompute_fn(new_atoms) -> (new_atoms, new_results)`` re-optimizes and
+    recomputes the Hessian (via run_vibrations or run_ir). A trial is accepted
+    only if it errors out less and has strictly fewer imaginary modes; on
+    acceptance ``atoms`` is moved to the improved geometry and the new result
+    (tagged ``imag_recovery_used``/``imag_recovery_before``/``after``) is
+    returned. Never raises — on any failure the original ``results`` is kept.
+    """
+    n_before = int(results.get("number_of_imaginary", 0) or 0)
+    if n_before <= 0 or not mode_vectors:
+        return results
+    best = results
+    for attempt in range(1, max_attempts + 1):
+        disp = np.zeros((len(atoms), 3))
+        for vec in mode_vectors:
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                disp += vec / norm
+        if not np.any(disp):
+            break
+        trial = atoms.copy()
+        trial.set_positions(trial.get_positions() + displacement * disp)
+        logging.info(
+            "Imaginary-mode recovery attempt %d/%d for %s (currently %d imaginary)",
+            attempt, max_attempts, unique_name,
+            int(best.get("number_of_imaginary", 0) or 0),
+        )
+        try:
+            trial, rec = recompute_fn(trial)
+        except Exception as exc:  # never let recovery crash the parent task
+            logging.warning("Imaginary-mode recovery attempt failed: %s", exc)
+            break
+        if not rec or rec.get("error"):
+            break
+        n_new = int(rec.get("number_of_imaginary", n_before) or 0)
+        if n_new < int(best.get("number_of_imaginary", 0) or 0):
+            rec["imag_recovery_used"] = True
+            rec["imag_recovery_before"] = n_before
+            rec["imag_recovery_after"] = n_new
+            best = rec
+            atoms.set_positions(trial.get_positions())
+            if n_new == 0:
+                break
+        else:
+            break
+    return best
+
+
 def _prepare_calculation(
     atoms, calculator=None, unique_name="", multiplicity=None, charge=0
 ):
@@ -2114,6 +2449,11 @@ def run_optimization(
     output_dir=None,
     multiplicity=None,
     charge=0,
+    optimizer="bfgs",
+    maxstep=None,
+    recover=False,
+    recover_optimizers=("lbfgs", "fire"),
+    max_recovery_attempts=2,
 ):
     """
     Run geometry optimization for an ASE Atoms object.
@@ -2134,6 +2474,15 @@ def run_optimization(
     Returns:
         tuple: A tuple containing the optimized atoms and a dictionary with calculated properties
     """
+    # Coerce numeric params that may arrive as strings from YAML. YAML 1.1
+    # parses unquoted scientific notation like "1e-3" as a *string*, not a
+    # float; passing that straight to the optimizer otherwise surfaces as a
+    # cryptic "ufunc 'less' ... Float64/StrDType" error at step 0.
+    fmax = float(fmax)
+    max_steps = int(max_steps)
+    if maxstep is not None:
+        maxstep = float(maxstep)
+
     _ensure_orca_engrad_for_forces(calculator or atoms.calc)
     calc, results = _prepare_calculation(
         atoms, calculator, unique_name, multiplicity=multiplicity, charge=charge
@@ -2153,6 +2502,9 @@ def run_optimization(
             "opt_time": 0,
             "opt_steps": 0,
             "opt_converged": False,
+            "opt_optimizer": optimizer,
+            "opt_recovery_used": False,
+            "opt_recovery_attempts": 0,
             "opt_forces": [],
             "trajectory_file": trajectory if trajectory else "",
             "optimized_geometry_file": "",
@@ -2174,11 +2526,29 @@ def run_optimization(
             atoms.cell = atoms.cell.astype(np.float64)
 
         start_time = time.time()
-        dyn = BFGS(atoms, trajectory=trajectory)
-        converged = dyn.run(fmax=fmax, steps=max_steps)
+        (
+            converged,
+            n_steps,
+            optimizer_used,
+            recovery_used,
+            recovery_attempts,
+        ) = _run_staged_optimization(
+            atoms,
+            fmax=fmax,
+            max_steps=max_steps,
+            trajectory=trajectory,
+            optimizer=optimizer,
+            maxstep=maxstep,
+            recover=recover,
+            recover_optimizers=recover_optimizers,
+            max_recovery_attempts=max_recovery_attempts,
+        )
         results["opt_time"] = time.time() - start_time
-        results["opt_steps"] = dyn.get_number_of_steps()
+        results["opt_steps"] = n_steps
         results["opt_converged"] = converged
+        results["opt_optimizer"] = optimizer_used
+        results["opt_recovery_used"] = recovery_used
+        results["opt_recovery_attempts"] = recovery_attempts
         results["opt_forces"] = atoms.get_forces().tolist()
 
         if trajectory:
@@ -2225,16 +2595,30 @@ def run_optimization(
             except Exception as e:
                 logging.warning(f"Failed to save optimized geometry: {e}")
 
+    validate_physical_results(results, atoms=atoms)
     logging.info(f"Geometry optimization for {unique_name} completed")
     return atoms, results
 
 
 def _optimization_extra_params(params):
-    """Return only params accepted by run_optimization beyond common arguments."""
+    """Return only params accepted by run_optimization beyond common arguments.
+
+    Includes the optimizer/recovery knobs so they propagate from
+    ``optimization_params`` in the config through the vibration/IR/thermo paths
+    (which forward ``**params``) down to ``run_optimization``.
+    """
 
     return {
         key: params[key]
-        for key in ("max_steps", "output_dir")
+        for key in (
+            "max_steps",
+            "output_dir",
+            "optimizer",
+            "maxstep",
+            "recover",
+            "recover_optimizers",
+            "max_recovery_attempts",
+        )
         if key in params
     }
 
@@ -2254,6 +2638,9 @@ def run_vibrations(
     save_geometry=False,
     multiplicity=None,
     charge=0,
+    imag_recovery=False,
+    imag_displacement=0.3,
+    max_imag_attempts=1,
     **params,
 ):
     """
@@ -2326,6 +2713,7 @@ def run_vibrations(
             "No optimization requested, using given geometry for the vibrations."
         )
 
+    imag_vectors = []
     try:
         start_time = time.time()
         vib_name = f"tmp_vib_{unique_name}"
@@ -2394,6 +2782,9 @@ def run_vibrations(
         results["vibrational_frequencies_cm^-1"] = [
             f.real for f in frequencies[3 + nrot :]
         ]
+        imag_vectors = _imaginary_mode_vectors(
+            frequencies, vib_modes, nrot, max_vib_imag
+        )
 
         logging.debug(
             f"Vibrational analysis completed in {results['vib_time']} seconds."
@@ -2409,6 +2800,40 @@ def run_vibrations(
         error = f"Error in vibrational analysis: {e}\n"
         results["error"] += error
         logging.error(error)
+
+    if (
+        imag_recovery
+        and not results.get("error")
+        and int(results.get("number_of_imaginary", 0) or 0) > 0
+        and imag_vectors
+    ):
+        def _recompute(new_atoms):
+            return run_vibrations(
+                new_atoms,
+                calculator=calc,
+                optimize=True,
+                unique_name=f"{unique_name}_imagrec",
+                vib_dir=vib_dir,
+                indices=indices,
+                fmax=fmax,
+                delta=delta,
+                max_trans_rot=max_trans_rot,
+                max_vib_imag=max_vib_imag,
+                multiplicity=multiplicity,
+                charge=charge,
+                imag_recovery=False,
+                **params,
+            )
+
+        results = _recover_imaginary(
+            atoms,
+            results,
+            imag_vectors,
+            _recompute,
+            displacement=imag_displacement,
+            max_attempts=max_imag_attempts,
+            unique_name=unique_name,
+        )
 
     logging.info(f"Vibrational analysis for {unique_name} completed")
     return atoms, results
@@ -2467,6 +2892,7 @@ def _add_thermo_results_from_vibrations(
         logging.error(error)
         return None, results
 
+    validate_physical_results(results, atoms=atoms)
     return thermo, results
 
 
@@ -2492,6 +2918,9 @@ def run_ir(
     max_vib_imag=50,
     multiplicity=None,
     charge=0,
+    imag_recovery=False,
+    imag_displacement=0.3,
+    max_imag_attempts=1,
     **params,
 ):
     """
@@ -2675,6 +3104,7 @@ def run_ir(
                 results["dipole"] = self._dip_calc.get_dipole_moment(atoms)
             return results
 
+    imag_vectors = []
     try:
         start_time = time.time()
         ir_name = f"tmp_ir_{unique_name}"
@@ -2726,6 +3156,9 @@ def run_ir(
         results["vibrational_frequencies_cm^-1"] = [
             f.real for f in mode_frequencies[3 + nrot :]
         ]
+        imag_vectors = _imaginary_mode_vectors(
+            mode_frequencies, vib_modes, nrot, max_vib_imag
+        )
 
         freq_intensity = ir.get_spectrum(
             start=ir_spectrum_start,
@@ -2780,6 +3213,47 @@ def run_ir(
         error = f"Error in IR analysis: {e}\n"
         results["error"] += error
         logging.error(error)
+
+    if (
+        imag_recovery
+        and not results.get("error")
+        and int(results.get("number_of_imaginary", 0) or 0) > 0
+        and imag_vectors
+    ):
+        def _recompute(new_atoms):
+            return run_ir(
+                new_atoms,
+                calculator=calculator,
+                optimization_calculator=optimization_calculator,
+                vibration_calculator=vibration_calculator,
+                dipole_calculator=dipole_calculator,
+                optimize=True,
+                unique_name=f"{unique_name}_imagrec",
+                vib_dir=vib_dir,
+                indices=indices,
+                fmax=fmax,
+                delta=delta,
+                ir_spectrum_start=ir_spectrum_start,
+                ir_spectrum_end=ir_spectrum_end,
+                sparse_spectrum=sparse_spectrum,
+                intensity_threshold=intensity_threshold,
+                max_trans_rot=max_trans_rot,
+                max_vib_imag=max_vib_imag,
+                multiplicity=multiplicity,
+                charge=charge,
+                imag_recovery=False,
+                **params,
+            )
+
+        results = _recover_imaginary(
+            atoms,
+            results,
+            imag_vectors,
+            _recompute,
+            displacement=imag_displacement,
+            max_attempts=max_imag_attempts,
+            unique_name=unique_name,
+        )
 
     logging.info(f"IR analysis for {unique_name} completed")
     return atoms, results
