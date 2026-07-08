@@ -411,6 +411,10 @@ class ExaChemCalculator(Calculator):
         self.last_run_dir: Optional[Path] = None
         self.last_output_payload: Optional[Dict[str, Any]] = None
         self.cluster_client = None
+        # Non-kept scratch dir from the previous call, reclaimed on the next
+        # call so per-call mkdtemp scratch does not accumulate (see
+        # _prepare_run_dir). None when the previous run kept its files.
+        self._scratch_to_reclaim: Optional[Path] = None
 
     # ------------------------------------------------------------------
     # Public ASE entry point
@@ -569,21 +573,29 @@ class ExaChemCalculator(Calculator):
         ExaChem fails with "Could not locate ExaChem JSON output".
         Each call therefore mkdtemp's its own sibling under the base.
 
-        When ``keep_files`` is False, this instance's previous run_dir is
-        rm-tree'd first so long-lived workers processing many rows do not
-        accumulate hundreds of stale exachem_run_* siblings. Concurrent
-        instances each track their own ``last_run_dir`` so there is no
-        cross-instance interference.
+        Scratch hygiene: when ``keep_files`` is False, the directory created
+        here is scheduled for removal on the *next* call (serial reuse of the
+        same instance) so per-call scratch does not accumulate. The most recent
+        dir always survives until the next call — long enough for the caller to
+        read results. When ``keep_files`` is True the dir is never scheduled for
+        removal. (Reclaim assumes serial reuse per instance; genuinely
+        concurrent use requires separate instances, which ASE calculators need
+        anyway because per-call state lives on ``self``.)
         """
 
         base = Path(self.directory).resolve()
         base.mkdir(parents=True, exist_ok=True)
-        if not keep_files and self.last_run_dir is not None:
-            try:
-                shutil.rmtree(self.last_run_dir)
-            except (FileNotFoundError, OSError):
-                pass
-        return Path(tempfile.mkdtemp(prefix="exachem_run_", dir=base))
+
+        # Reclaim the previous non-kept scratch dir before creating a new one.
+        prev = self._scratch_to_reclaim
+        if prev is not None and Path(prev).exists():
+            shutil.rmtree(prev, ignore_errors=True)
+        self._scratch_to_reclaim = None
+
+        run_dir = Path(tempfile.mkdtemp(prefix="exachem_run_", dir=base))
+        if not keep_files:
+            self._scratch_to_reclaim = run_dir
+        return run_dir
 
     def _stage_restart_inputs(
         self, restart_from: Any, run_dir: Path
