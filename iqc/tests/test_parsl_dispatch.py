@@ -14,6 +14,8 @@ from unittest import mock
 
 import pytest
 
+pytest.importorskip("parsl")
+
 from iqc import parsl_dispatch as pd
 from iqc.databasetools import calculation_key, calculation_key_from_record
 
