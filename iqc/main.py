@@ -61,10 +61,19 @@ def _rank_output_parent(cwd="."):
 
 
 def _default_skip_existing_sources(cwd="."):
-    """Return default IQC result files to scan for completed calculations."""
+    """Return default IQC result files to scan for completed calculations.
+
+    Includes ``results_partials/row_*.jsonl`` so that if an earlier iqc-el
+    run was SIGTERM'd before its epilogue wrote the consolidated
+    ``iqc_*_results_*.jsonl``, a resubmit still picks up the per-row
+    partials and skips already-completed rows (job 8648581 finish attempt
+    into rundir with 415 partials but no consolidated JSONL re-ran all
+    500 rows because this glob was missing).
+    """
 
     root = Path(cwd).expanduser()
     sources = list(root.glob("iqc_*_results_*.jsonl"))
+    sources.extend(root.glob("results_partials/row_*.jsonl"))
     tmp_parents = [root, _rank_output_parent(root)]
     for tmp_parent in tmp_parents:
         if not tmp_parent.is_dir():
@@ -476,17 +485,15 @@ def _resolve_role_calculators(run_params, roles, calc_params):
                 raise RuntimeError(
                     f"Failed to initialize {role} '{name}': {e}"
                 ) from e
-            # get_calculator silently falls back to MACE when its target fails.
-            # For per-role overrides the user explicitly asked for a calculator,
-            # so fail instead of quietly changing methods.
-            fallback_from = getattr(instance, "_iqc_fallback_from", None)
-            if fallback_from is not None:
+            # get_calculator now raises on any failure instead of silently
+            # substituting EMT/MACE (commit 7d05fc4). Keep a defensive guard so
+            # that if a silent fallback is ever reintroduced it fails loudly for
+            # per-role overrides, where the user explicitly named a calculator.
+            if name.lower() != "emt" and instance.__class__.__name__ == "EMT":
                 raise RuntimeError(
-                    f"Requested {role}='{name}' but get_calculator silently "
-                    f"fell back to MACE (was: '{fallback_from}'). Check earlier "
-                    "warnings — typical causes: missing executable (e.g. ORCA "
-                    "not on PATH and ASE_ORCA_COMMAND unset), missing Python "
-                    "package, or initialization failure."
+                    f"Requested {role}='{name}' but received an EMT calculator — "
+                    "this indicates a silent fallback. Check earlier warnings "
+                    "(missing dependency/executable or initialization failure)."
                 )
             role_calculators[role] = instance
         else:
@@ -536,6 +543,7 @@ def _process_one_row(
 
     from iqc.asetools import (
         atoms2xyz,
+        check_suspicious_no_op,
         get_ase_version,
         get_atoms_from_smiles,
         get_atoms_from_xyz,
@@ -545,6 +553,7 @@ def _process_one_row(
         run_single_point,
         run_thermo,
         run_vibrations,
+        validate_physical_results,
     )
     from iqc.nmr import run_nmr_workflow
 
@@ -920,6 +929,12 @@ def _process_one_row(
             raise ValueError(f"Unsupported task '{task}'")
 
         results.update(task_results)
+        # Flag nonphysical quantities (energy/ZPE blow-ups, negative entropy,
+        # NaN/Inf, out-of-range frequencies) and suspicious no-op optimizations
+        # without terminating the run — the row is still written, tagged with
+        # `nonphysical`/`suspicious_no_op` and `validation_messages`.
+        validate_physical_results(results, atoms=atoms)
+        check_suspicious_no_op(results)
         logging.debug(f"Completed {task} calculations for file: {xyz_file}")
     except Exception as e:
         results[f"{task}_error"] = str(e)

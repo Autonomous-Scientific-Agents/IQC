@@ -196,24 +196,22 @@ def _row_callable(
     calc_name: str,
     calc_params: dict,
     side_cache_path: str,
-    slot_node_lists: Optional[list],
-    hostfile_tmpdir: Optional[str],
-    ranks_per_mol: int,
+    nodes_per_mol: int,
     ppn: int,
+    checkpoint_dir: str,
     process_kwargs: dict,
 ) -> Optional[dict]:
     """Worker entry point. One row → one ``_process_one_row`` call.
+
+    Runs as a serial task (async_loky). For ExaChem calculators, the
+    calculator itself submits the binary to the EL cluster via
+    ClusterClient (async_mpi) — no manual mpiexec here.
 
     Returns the result dict, ``None`` (bad input), or the
     ``SKIPPED_EXISTING`` sentinel. The orchestrator side maps each of
     the three outcomes to a counter and an optional JSONL append.
     """
 
-    # CRITICAL: Aurora hierarchy fixup must precede any torch import.
-    # See parsl_dispatch._row_app for the full reasoning — short version:
-    # if Parsl-style "0.0"/"0.1" tile names are in ZE_AFFINITY_MASK, the
-    # cluster's default FLAT hierarchy makes them parse to invalid
-    # devices. Flip to COMPOSITE only when dot-notation is present.
     import os as _os
 
     _zam = _os.environ.get("ZE_AFFINITY_MASK", "")
@@ -227,82 +225,37 @@ def _row_callable(
 
     from iqc.main import _process_one_row as _proc
 
-    # Re-import sibling helpers (same caveat as parsl_dispatch — the
-    # function's pickled __globals__ may not include them on a fresh
-    # worker process).
     from iqc.ensemble_launcher_dispatch import (
         _get_worker_calculator as _get_calc,
         _load_side_cache as _load_cache,
     )
 
-    # Self-identify which slot this worker belongs to by matching the
-    # local hostname against the per-slot node lists. This avoids the
-    # race that pre-baked hostfile paths created: ensemble_launcher's
-    # scheduler picks which node a worker lands on independently of any
-    # caller-supplied slot ID, so the worker MUST derive its slot at
-    # execution time. If no match (single-node / local smoke), fall back
-    # to whatever mpi_command calc_params already specifies.
-    import socket as _socket
-    import uuid as _uuid
-
     cp = dict(calc_params)
-    if slot_node_lists and hostfile_tmpdir:
-        my_host = _socket.gethostname()
-        my_host_short = my_host.split(".")[0]
-        my_slot = None
-        for j, nodes in enumerate(slot_node_lists):
-            for n in nodes:
-                if n == my_host or n.split(".")[0] == my_host_short:
-                    my_slot = j
-                    break
-            if my_slot is not None:
-                break
-        if my_slot is None:
-            logging.warning(
-                "_row_callable on host %s could not match any slot; "
-                "defaulting to slot 0",
-                my_host,
-            )
-            my_slot = 0
-        hf_path = _os.path.join(
-            hostfile_tmpdir,
-            f"hostfile_slot{my_slot}_{_uuid.uuid4().hex[:8]}.txt",
-        )
-        with open(hf_path, "w") as _hf:
-            _hf.write("\n".join(slot_node_lists[my_slot]) + "\n")
-        cp["nproc"] = ranks_per_mol
-        cp["mpi_command"] = [
-            "mpiexec",
-            "--hostfile",
-            hf_path,
-            "-ppn",
-            str(ppn),
-            "--cpu-bind=depth",
-            "-d",
-            "8",
-        ]
+    cp["el_nnodes"] = nodes_per_mol
+    cp["el_ppn"] = ppn
 
     side = _load_cache(side_cache_path)
     pk = {
         **process_kwargs,
         "xyz_files": side["xyz_files"],
         "completed_file_index": side["completed_file_index"],
-        # The patched calc_params must override what the head sent.
         "calc_params": cp,
     }
-    # SIGTERM-graceful partial write: pop partials_dir out of pk before
-    # _proc receives it (iqc.main._process_one_row doesn't know about it).
     partials_dir = pk.pop("partials_dir", None)
 
     calc = _get_calc(calc_name, cp)
-    result = _proc(xyz_index, calculator=calc, **pk)
 
-    # Persist the result as a single-line JSONL fragment immediately, so
-    # it survives a SIGTERM that kills the EL master before its epilogue
-    # runs. The dispatcher's epilogue still writes the consolidated
-    # iqc_*_results_*.jsonl from raw_results on clean exit; this is the
-    # fallback. _candidate_result_files() globs */results_partials/*.jsonl
-    # so the next job's --skip-existing-from sees these and won't re-run.
+    from ensemble_launcher.orchestrator import ClusterClient
+
+    client = ClusterClient(checkpoint_dir=checkpoint_dir)
+    client.start()
+    calc.cluster_client = client
+    try:
+        result = _proc(xyz_index, calculator=calc, **pk)
+    finally:
+        calc.cluster_client = None
+        client.teardown()
+
     if isinstance(result, dict) and partials_dir:
         import json as _json
         from iqc.main import ComplexEncoder as _Enc
@@ -385,15 +338,6 @@ def _add_el_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Single-host smoke test (no $PBS_NODEFILE). Uses the current "
             "hostname as the only node; per-slot hostfile is omitted."
-        ),
-    )
-    group.add_argument(
-        "--el-hostfile-dir",
-        type=str,
-        default=None,
-        help=(
-            "Directory for per-slot hostfiles. Defaults to "
-            "<rundir>/host_chunks (same convention as _split_template.sh)."
         ),
     )
 
@@ -520,35 +464,27 @@ def _read_pbs_nodes() -> list[str]:
     return nodes
 
 
-def _split_into_hostfiles(
-    nodes: list[str], nodes_per_mol: int, hostfile_dir: Path
-) -> list[Path]:
-    """Write per-slot hostfiles (host_00000 ... host_K-1) and return their paths.
-
-    Mirrors `_split_template.sh` lines 64-67. Returns one Path per slot.
-    Tail nodes that don't fill a complete slot are dropped (same as
-    `split -l` behavior in the bash version).
-    """
-
-    hostfile_dir.mkdir(parents=True, exist_ok=True)
-    num_slots = len(nodes) // nodes_per_mol
-    paths: list[Path] = []
-    for j in range(num_slots):
-        chunk = nodes[j * nodes_per_mol : (j + 1) * nodes_per_mol]
-        p = hostfile_dir / f"host_{j:05d}"
-        p.write_text("\n".join(chunk) + "\n")
-        paths.append(p)
-    return paths
-
 
 def _auto_nlevels(num_slots: int) -> int:
+    """Pick hierarchy depth.
+
+    Always returns 1 when there is real work (num_slots > 1) because EL's
+    default `FixedLeafNodePolicy` uses `2**ceil(log2(leaf_nodes))` internally,
+    which raises a silently-swallowed `ValueError` for non-power-of-2
+    `leaf_nodes` (job 8648581 with num_slots=85 → 128 workers requested from
+    16 sub-masters owning 5–6 nodes each → ValueError → sub-master hangs).
+    At nlevels=1 combined with `simple_split_children_policy` (see main()),
+    the master directly manages `nchildren=num_slots` workers via even
+    split, which works for any node count.
+
+    Override via `--el-nlevels` for scaling experiments — the underlying
+    ZMQ/heartbeat load on a single master starts to matter above a few
+    hundred workers per the ensemble_launcher developer.
+    """
+
     if num_slots <= 1:
         return 0
-    if num_slots <= 64:
-        return 1
-    if num_slots <= 2048:
-        return 2
-    return 3
+    return 1
 
 
 def main() -> int:
@@ -673,11 +609,10 @@ def main() -> int:
         import socket
 
         all_nodes = [socket.gethostname()]
-        hostfile_paths: list[Optional[Path]] = [None]
         num_slots = 1
         head_nodes = all_nodes
     else:
-        all_nodes = _read_pbs_nodes()
+        all_nodes = [node.split(".")[0] for node in _read_pbs_nodes()]
         total_nodes = len(all_nodes)
         num_slots = total_nodes // nodes_per_mol
         if num_slots < 1:
@@ -687,28 +622,6 @@ def main() -> int:
                 total_nodes,
             )
             return 1
-        hostfile_dir = (
-            Path(args.el_hostfile_dir)
-            if args.el_hostfile_dir
-            else Path.cwd() / "host_chunks"
-        )
-        hostfile_dir.mkdir(parents=True, exist_ok=True)
-        # slot_node_lists[j] = list of N=nodes_per_mol nodes assigned to
-        # slot j. Workers pick their slot at task time by matching their
-        # own hostname (see _row_callable). The pre-baked host_chunks
-        # files written below are now diagnostic only — the worker writes
-        # its own per-call hostfile at execution time.
-        slot_node_lists: list[list[str]] = [
-            all_nodes[j * nodes_per_mol : (j + 1) * nodes_per_mol]
-            for j in range(num_slots)
-        ]
-        # Still write diagnostic per-slot hostfiles so the run dir is
-        # self-documenting and matches _split_template.sh's layout.
-        _split_into_hostfiles(all_nodes, nodes_per_mol, hostfile_dir)
-        # Pass ALL nodes (not just slot heads) to ensemble_launcher so
-        # it can place workers across the full allocation. nchildren =
-        # num_slots in the PolicyConfig below will then place one worker
-        # on each slot's first node.
         head_nodes = all_nodes
         logging.info(
             "Topology: total_nodes=%d nodes_per_mol=%d num_slots=%d ranks_per_mol=%d",
@@ -757,100 +670,30 @@ def main() -> int:
         "db_path": db_path,
     }
 
-    # Build the Task ensemble. Tasks declare (nnodes=nodes_per_mol,
-    # ppn=cpus_per_node) so the scheduler reserves the whole slot per task
-    # — preventing two tasks from packing onto the same slot and colliding
-    # on the slot's hostfile when each tries to spawn its own ExaChem mpiexec
-    # over the same N nodes. Without this, at npm=2 the scheduler packs 2
-    # tasks per 2-node worker (each task=1 node), both try mpiexec on the
-    # slot's hostfile → mutual deadlock (smoke 8575800: 8 exachem_run_*
-    # dirs created, 0 completions in 30 min).
-    # Requires the local EL patch in
-    # /lus/flare/projects/HiFiThermKin/keceli/ensemble_launcher/ensemble_launcher/
-    # executors/async_mp_executor.py allowing multi-node JobResources through
-    # AsyncProcessPoolExecutor (runs callable on node 0; caller orchestrates
-    # multi-node via inner mpiexec/hostfile). Without that patch every task
-    # silently hangs in TaskStatus.RUNNING forever (smoke 8575783: 0 mols
-    # completed in 30 min, only a single "MultiProcessingExecutor can only
-    # execute single node tasks" line in main.w0.log betrayed it).
     from ensemble_launcher import EnsembleLauncher
-    from ensemble_launcher.config import LauncherConfig, MPIConfig, PolicyConfig
+    from ensemble_launcher.config import LauncherConfig, MPIConfig, PolicyConfig, SystemConfig
     from ensemble_launcher.ensemble import Task
+    from ensemble_launcher.orchestrator import ClusterClient
 
     cpus_per_node = int(args.el_cpus_per_node)
-    # SIGTERM-graceful partial result writes — each row callable drops a
-    # single-line JSONL fragment here as soon as it finishes, so a walltime
-    # SIGTERM that kills the EL master before its epilogue runs doesn't lose
-    # the results that were already in raw_results. _candidate_result_files()
-    # in iqc.main globs */results_partials/*.jsonl so the next job's
-    # --skip-existing-from picks them up just like the consolidated JSONL.
     partials_dir = str(Path.cwd() / "results_partials")
-    tasks: dict = {}
-    for i in range(number_of_xyz):
-        pk = dict(process_kwargs_base)
-        pk["worker_id"] = i
-        pk["partials_dir"] = partials_dir
-        tid = f"row-{i:07d}"
-        tasks[tid] = Task(
-            task_id=tid,
-            nnodes=nodes_per_mol,
-            ppn=cpus_per_node,
-            executable=_row_callable,
-            args=(i,),
-            kwargs=dict(
-                calc_name=calculator_name,
-                calc_params=calc_params,
-                side_cache_path=side_cache_path,
-                slot_node_lists=(
-                    slot_node_lists if not args.el_local else None
-                ),
-                hostfile_tmpdir=(
-                    str(hostfile_dir) if not args.el_local else None
-                ),
-                ranks_per_mol=ranks_per_mol,
-                ppn=ppn,
-                process_kwargs=pk,
-            ),
-        )
 
-    logging.info(
-        "Submitting %d row(s) to Ensemble Launcher (nlevels=%d, num_slots=%d)",
-        number_of_xyz,
-        nlevels,
-        num_slots,
-    )
+    checkpoint_dir = os.path.join(head_output_dir, "el_checkpoint")
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # nlevels and nchildren live INSIDE PolicyConfig in LauncherConfig.
-    # Earlier versions of this file passed them as top-level LauncherConfig
-    # kwargs — Pydantic silently accepted the extras and the defaults
-    # (nchildren=1) won, producing one worker instead of K. nchildren must
-    # equal num_slots so SimpleSplitChildrenPolicy spreads workers one-per-
-    # slot across the allocation.
+    # SimpleSplitChildrenPolicy uses `nchildren` directly (even split of
+    # `nodes` across `nchildren` workers) — no log2 rounding, so it works
+    # for any num_slots, not just powers of 2. FixedLeafNodePolicy (the
+    # previous choice) computes 2**ceil(log2(leaf_nodes)) which over-
+    # allocates workers for non-pow2 sizes and raises ValueError inside
+    # each sub-master's `get_children_resources`; the ValueError is
+    # silently swallowed and sub-masters hang in a restart loop until
+    # walltime (job 8648581, num_slots=85).
     policy_config = PolicyConfig(
         nlevels=nlevels,
-        nchildren=num_slots if nlevels > 0 else 1,
-        leaf_nodes=nodes_per_mol,
+        nchildren=num_slots,
+        leaf_nodes=num_slots,
     )
-    # child_executor_name="async_mpi" launches each worker via mpiexec
-    # so they land on DIFFERENT nodes — required for the per-worker
-    # hostname-to-slot identification in _row_callable. The default
-    # "async_processpool" spawns workers as local subprocesses of the
-    # master, so all workers see the master's hostname and self-identify
-    # as the same slot. (Discovered in v3 smoke: both workers wrote
-    # hostfile_slot0 because both ran on x4517c2s3b0n0.)
-    # MPI config — IMPORTANT: cpu_bind_method="none" so EL does not emit
-    # `--cpu-bind list:0-0` for level-2 child sub-master spawns when nlevels>=2
-    # (which kicks in above 64 slots in _auto_nlevels). Aurora reserves cpus 0
-    # and 52 for system services since 2025-03-31, so PALS rejects list:0-0
-    # with "fewer CPUs (0) than depth (1)" — every child spawn fails, cascading
-    # into RPC-broken / chdir-denied errors on every compute node (256-node EL
-    # run 8574618: 244 MB of worker logs, 0 mols completed). The inner ExaChem
-    # mpiexec keeps its own --cpu-bind=depth -d 8 -ppn 13 from
-    # sweep_params_1n.yaml (separate code path; unaffected by this flag).
-    # flavor="cray-pals" sets the PALS-specific flag names (-n, --ppn,
-    # --hostfile) instead of the "mpich" default; on Aurora both PALS and
-    # MPICH flavors happen to resolve to the same `mpiexec` binary, but the
-    # PALS flavor is the correct semantic mapping.
     mpi_config = MPIConfig(
         flavor="cray-pals",
         cpu_bind_method="none",
@@ -858,8 +701,11 @@ def main() -> int:
 
     launcher_config = LauncherConfig(
         child_executor_name="async_mpi",
-        task_executor_name="async_processpool",
+        task_executor_name=["async_loky", "async_mpi"],
+        children_scheduler_policy="simple_split_children_policy",
         comm_name="async_zmq",
+        cluster=True,
+        checkpoint_dir=checkpoint_dir,
         report_interval=args.el_report_interval,
         worker_logs=True,
         master_logs=True,
@@ -868,68 +714,95 @@ def main() -> int:
         mpi_config=mpi_config,
     )
 
-    # SystemConfig declares each node's CPU capacity so the Task.ppn gate
-    # above means "one task per node" rather than "all task ppn against an
-    # auto-detected larger count."
-    from ensemble_launcher.config import SystemConfig
-
+    # Aurora node: 104 physical cores (2× Xeon Max), cores 0 and 52 reserved
+    # for system services → 102 usable physical cpus. 12 PVC tiles (6 GPUs ×
+    # 2 tiles under ZE_FLAT_DEVICE_HIERARCHY=FLAT). We declare 13 gpu slots
+    # per node with tile 0 duplicated so `--ppn 13` (12 compute ranks + 1 GA
+    # progress rank) each get a ZE_AFFINITY_MASK entry. Rank 12 shares tile
+    # 0 with rank 0 but is CPU-only for GA progress — benign overlap.
+    # Combined with ngpus_per_process=1 on the inner Task, this gates one
+    # ExaChem instance per node (13/13 slots consumed).
     system_config = SystemConfig(
         name="aurora",
-        ncpus=cpus_per_node,
-        ngpus=0,
+        ncpus=102,
+        ngpus=13,
+        gpus=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0],
     )
 
     el = EnsembleLauncher(
-        ensemble_file=tasks,
+        ensemble_file={},
         system_config=system_config,
         launcher_config=launcher_config,
         Nodes=head_nodes,
-        pin_resources=False,  # iqc's inner mpiexec does its own pinning.
+        pin_resources=False,
     )
 
+    logging.info(
+        "Starting cluster (nlevels=%d, num_slots=%d, leaf_nodes=%d)",
+        nlevels,
+        num_slots,
+        num_slots,
+    )
+    el.start(wait_time=5)
+
     raw_results: dict = {}
+    task_ids: list[str] = []
     try:
-        raw_results_obj = el.run()
-    except Exception as e:  # noqa: BLE001 — top-level safety net
-        logging.error("Ensemble Launcher run() raised: %s", e, exc_info=True)
-        raw_results_obj = None
-
-    # Unwrap EL's return value into {task_id: row_callable_return}. Newer EL
-    # versions return a ResultBatch(data=[Result(...), ...]); the Result
-    # wrapper has .data (our row_callable return), .success (bool), and
-    # .exception (str traceback if .success is False). Older EL versions
-    # returned a plain dict already in this shape. Without this unwrapping,
-    # `raw_results.get(tid)` raises AttributeError on ResultBatch and the
-    # dispatcher loses every result of an otherwise-successful run (smoke
-    # 8597150: all 32 mols completed on the compute side, 0 JSONL written
-    # because of this very crash).
-    if raw_results_obj is None:
-        raw_results = {}
-    elif hasattr(raw_results_obj, "data") and isinstance(raw_results_obj.data, list):
-        for r in raw_results_obj.data:
-            if not getattr(r, "success", True) and getattr(r, "exception", None):
-                # exception is a str traceback here; wrap in a real Exception
-                # so the downstream `isinstance(result, BaseException)` branch
-                # routes it to _synthesize_failure_row().
-                raw_results[r.task_id] = Exception(r.exception)
-            else:
-                raw_results[r.task_id] = r.data
-    elif isinstance(raw_results_obj, dict):
-        raw_results = raw_results_obj
-    else:
-        logging.error(
-            "Ensemble Launcher returned unexpected type %s; treating as empty.",
-            type(raw_results_obj),
+        client = ClusterClient(
+            checkpoint_dir=checkpoint_dir, checkpoint_timeout=120.0,
         )
+        client.start()
+        try:
+            futures = {}
+            for i in range(number_of_xyz):
+                pk = dict(process_kwargs_base)
+                pk["worker_id"] = i
+                pk["partials_dir"] = partials_dir
+                tid = f"row-{i:07d}"
+                task_ids.append(tid)
+                futures[tid] = client.submit(
+                    Task(
+                        task_id=tid,
+                        nnodes=1,
+                        ppn=1,
+                        executable=_row_callable,
+                        args=(i,),
+                        kwargs=dict(
+                            calc_name=calculator_name,
+                            calc_params=calc_params,
+                            side_cache_path=side_cache_path,
+                            nodes_per_mol=nodes_per_mol,
+                            ppn=ppn,
+                            checkpoint_dir=checkpoint_dir,
+                            process_kwargs=pk,
+                        ),
+                        executor_name="async_loky",
+                    )
+                )
 
-    # Accounting + JSONL write (mirrors parsl_dispatch's final loop).
+            logging.info(
+                "Submitted %d row(s) to cluster", number_of_xyz,
+            )
+
+            for tid, fut in futures.items():
+                try:
+                    raw_results[tid] = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    raw_results[tid] = e
+        finally:
+            client.teardown()
+    except Exception as e:  # noqa: BLE001
+        logging.error("Cluster client error: %s", e, exc_info=True)
+    finally:
+        el.stop()
+
     jsonl_file = f"iqc_{task}_results_{run_id}.jsonl"
     completed = 0
     failed = 0
     skipped_existing = 0
     bad_inputs = 0
     with open(jsonl_file, "w") as outfile:
-        for tid in tasks:
+        for tid in task_ids:
             row_idx = int(tid.split("-")[1])
             result = raw_results.get(tid)
             if isinstance(result, BaseException):
@@ -955,9 +828,6 @@ def main() -> int:
                 bad_inputs += 1
                 continue
             if not isinstance(result, dict):
-                # Defensive: unexpected return type → log + count as failure
-                # without trying to round-trip through the skip-existing
-                # index (we don't have the calculation_key fields).
                 failed += 1
                 logging.error("row %s returned unexpected type %s", tid, type(result))
                 continue

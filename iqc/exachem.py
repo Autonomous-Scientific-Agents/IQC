@@ -379,6 +379,8 @@ class ExaChemCalculator(Calculator):
         # level — the orchestrator / CLI enables it for production sweeps so
         # interactive single-shot calls don't accumulate archives.
         "artifact_retention": None,
+        "el_nnodes": None,
+        "el_ppn": None,
     }
 
     def __init__(
@@ -408,6 +410,7 @@ class ExaChemCalculator(Calculator):
         self.last_stdout_path: Optional[Path] = None
         self.last_run_dir: Optional[Path] = None
         self.last_output_payload: Optional[Dict[str, Any]] = None
+        self.cluster_client = None
 
     # ------------------------------------------------------------------
     # Public ASE entry point
@@ -458,26 +461,28 @@ class ExaChemCalculator(Calculator):
             run_dir,
         )
 
-        with open(stdout_path, "w") as log_fh:
-            completed = subprocess.run(
-                cmd,
-                cwd=str(run_dir),
-                stdout=log_fh,
-                stderr=subprocess.STDOUT,
-                env=env,
-                check=False,
-            )
+        if self.cluster_client is not None:
+            self._run_via_cluster(cmd, env, run_dir, stdout_path, params)
+        else:
+            with open(stdout_path, "w") as log_fh:
+                completed = subprocess.run(
+                    cmd,
+                    cwd=str(run_dir),
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    check=False,
+                )
+            if completed.returncode != 0:
+                tail = self._tail(stdout_path, 40)
+                raise CalculationFailed(
+                    f"ExaChem exited with code {completed.returncode}. "
+                    f"Command: {' '.join(cmd)}\nLog tail:\n{tail}"
+                )
 
         self.last_input_path = input_path
         self.last_stdout_path = stdout_path
         self.last_run_dir = run_dir
-
-        if completed.returncode != 0:
-            tail = self._tail(stdout_path, 40)
-            raise CalculationFailed(
-                f"ExaChem exited with code {completed.returncode}. "
-                f"Command: {' '.join(cmd)}\nLog tail:\n{tail}"
-            )
 
         output_path, payload = self._locate_output(
             run_dir, input_path.stem, input_json
@@ -657,6 +662,54 @@ class ExaChemCalculator(Calculator):
         if omp is not None:
             env["OMP_NUM_THREADS"] = str(int(omp))
         return env
+
+    def _run_via_cluster(
+        self,
+        cmd: List[str],
+        env: Dict[str, str],
+        run_dir: Path,
+        stdout_path: Path,
+        params: Dict[str, Any],
+    ) -> None:
+        from ensemble_launcher.ensemble import Task
+        import uuid as _uuid
+
+        el_nnodes = params.get("el_nnodes") or 1
+        el_ppn = params.get("el_ppn") or params.get("nproc", 1)
+
+        binary = self._resolve_binary(params)
+        bin_idx = cmd.index(binary)
+        bare_cmd = " ".join(cmd[bin_idx:])
+
+        # ngpus_per_process=1: each of the ppn ranks per node claims one GPU
+        # slot. Combined with SystemConfig(ngpus=13, gpus=[0..11,0]) on the
+        # dispatcher side, the scheduler treats ExaChem as a full-node
+        # consumer and refuses to co-schedule a second instance on the same
+        # node — preventing the multi-instance tile contention that trips
+        # TAMM OOM (run 8646411) and CH4 CCSD-iterations stalls (run 8648167).
+        # EL also uses this to export ZE_AFFINITY_MASK=<gpus[rank]> per rank
+        # via async_mpi_executor's affinity script (gen_affinity_bash_script*).
+        task = Task(
+            task_id=f"exachem-{_uuid.uuid4().hex[:8]}",
+            nnodes=el_nnodes,
+            ppn=el_ppn,
+            ngpus_per_process=1,
+            executable=bare_cmd,
+            executor_name="async_mpi",
+            env={k: v for k, v in env.items()
+                 if k not in os.environ or os.environ[k] != v},
+            stdout_file=str(stdout_path),
+            run_dir=str(run_dir),
+        )
+        future = self.cluster_client.submit(task)
+        try:
+            future.result()
+        except Exception:
+            tail = self._tail(stdout_path, 40) if stdout_path.exists() else ""
+            raise CalculationFailed(
+                f"ExaChem cluster task failed. "
+                f"Command: {bare_cmd}\nLog tail:\n{tail}"
+            )
 
     @staticmethod
     def _default_scf_type(multiplicity: int) -> str:
