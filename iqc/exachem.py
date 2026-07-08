@@ -681,10 +681,19 @@ class ExaChemCalculator(Calculator):
         bin_idx = cmd.index(binary)
         bare_cmd = " ".join(cmd[bin_idx:])
 
+        # ngpus_per_process=1: each of the ppn ranks per node claims one GPU
+        # slot. Combined with SystemConfig(ngpus=13, gpus=[0..11,0]) on the
+        # dispatcher side, the scheduler treats ExaChem as a full-node
+        # consumer and refuses to co-schedule a second instance on the same
+        # node — preventing the multi-instance tile contention that trips
+        # TAMM OOM (run 8646411) and CH4 CCSD-iterations stalls (run 8648167).
+        # EL also uses this to export ZE_AFFINITY_MASK=<gpus[rank]> per rank
+        # via async_mpi_executor's affinity script (gen_affinity_bash_script*).
         task = Task(
             task_id=f"exachem-{_uuid.uuid4().hex[:8]}",
             nnodes=el_nnodes,
             ppn=el_ppn,
+            ngpus_per_process=1,
             executable=bare_cmd,
             executor_name="async_mpi",
             env={k: v for k, v in env.items()

@@ -693,10 +693,19 @@ def main() -> int:
         mpi_config=mpi_config,
     )
 
+    # Aurora node: 104 physical cores (2× Xeon Max), cores 0 and 52 reserved
+    # for system services → 102 usable physical cpus. 12 PVC tiles (6 GPUs ×
+    # 2 tiles under ZE_FLAT_DEVICE_HIERARCHY=FLAT). We declare 13 gpu slots
+    # per node with tile 0 duplicated so `--ppn 13` (12 compute ranks + 1 GA
+    # progress rank) each get a ZE_AFFINITY_MASK entry. Rank 12 shares tile
+    # 0 with rank 0 but is CPU-only for GA progress — benign overlap.
+    # Combined with ngpus_per_process=1 on the inner Task, this gates one
+    # ExaChem instance per node (13/13 slots consumed).
     system_config = SystemConfig(
         name="aurora",
-        ncpus=cpus_per_node,
-        ngpus=0,
+        ncpus=102,
+        ngpus=13,
+        gpus=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0],
     )
 
     el = EnsembleLauncher(
