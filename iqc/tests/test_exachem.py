@@ -927,11 +927,13 @@ def test_calculate_default_leaves_manifest_empty_and_run_dir_null(tmp_path, wate
 
 
 def test_keep_artifacts_false_reverts_to_existing_rmtree(tmp_path, water):
-    """The first call leaves files; the second call wipes them as before.
+    """When keep_artifacts=False the previous run_dir is rm-tree'd on the
+    next call so long-lived workers don't accumulate stale siblings.
 
-    This pins the behaviour the contract calls out: when --keep-artifacts is
-    off, ``_prepare_run_dir`` still rm-trees the previous run on the next
-    call (existing semantics preserved).
+    The concurrent-safe _prepare_run_dir always mkdtemp's a NEW unique
+    dir (so two ExaChemCalculator instances can't collide on input.json),
+    but it cleans up THIS instance's prior run_dir first — sentinel gone
+    AND the old path itself removed.
     """
 
     calc = ExaChemCalculator(method="scf", directory=str(tmp_path))
@@ -944,10 +946,13 @@ def test_keep_artifacts_false_reverts_to_existing_rmtree(tmp_path, water):
         assert sentinel.exists()
 
         calc.calculate(water)
-        # Same path is reused, but its previous contents (incl. the sentinel)
-        # were rm-tree'd at the start of the second call.
-        assert calc.last_run_dir == first_run_dir
+        # Previous run_dir (and its sentinel) rm-tree'd; new unique dir
+        # taken for the second call so concurrent callers don't collide.
+        assert not first_run_dir.exists()
         assert not sentinel.exists()
+        assert calc.last_run_dir != first_run_dir
+        assert calc.last_run_dir.exists()
+        assert calc.last_run_dir.parent == first_run_dir.parent
 
 
 def test_keep_artifacts_true_preserves_run_dir_between_calls(tmp_path, water):

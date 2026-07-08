@@ -564,14 +564,25 @@ class ExaChemCalculator(Calculator):
         """Return a fresh unique run directory under ``self.directory``.
 
         Concurrent calculate() calls (e.g. one ExaChemCalculator instance
-        reused across many Parsl tasks per worker) MUST get disjoint
+        reused across many Parsl/EL tasks per worker) MUST get disjoint
         run_dirs or they overwrite each other's input.json / output and
         ExaChem fails with "Could not locate ExaChem JSON output".
         Each call therefore mkdtemp's its own sibling under the base.
+
+        When ``keep_files`` is False, this instance's previous run_dir is
+        rm-tree'd first so long-lived workers processing many rows do not
+        accumulate hundreds of stale exachem_run_* siblings. Concurrent
+        instances each track their own ``last_run_dir`` so there is no
+        cross-instance interference.
         """
 
         base = Path(self.directory).resolve()
         base.mkdir(parents=True, exist_ok=True)
+        if not keep_files and self.last_run_dir is not None:
+            try:
+                shutil.rmtree(self.last_run_dir)
+            except (FileNotFoundError, OSError):
+                pass
         return Path(tempfile.mkdtemp(prefix="exachem_run_", dir=base))
 
     def _stage_restart_inputs(
