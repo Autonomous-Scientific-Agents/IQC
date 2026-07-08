@@ -1,5 +1,126 @@
-from mpi4py import MPI
 import os
+
+
+MPI = None
+
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off"}
+_MPI_RANK_ENV_VARS = (
+    "PMI_RANK",
+    "PMIX_RANK",
+    "PMI_ID",
+    "OMPI_COMM_WORLD_RANK",
+    "MV2_COMM_WORLD_RANK",
+    "SLURM_PROCID",
+    "PALS_RANKID",
+)
+_MPI_SIZE_ENV_VARS = (
+    "PMI_SIZE",
+    "PMIX_SIZE",
+    "OMPI_COMM_WORLD_SIZE",
+    "MV2_COMM_WORLD_SIZE",
+    "SLURM_NTASKS",
+)
+
+
+class SerialComm:
+    """Small MPI-like communicator for single-process execution."""
+
+    def Get_rank(self):
+        return 0
+
+    def Get_size(self):
+        return 1
+
+    def bcast(self, value, root=0):
+        return value
+
+    def Barrier(self):
+        return None
+
+    def barrier(self):
+        return self.Barrier()
+
+    def reduce(self, value, op=None, root=0):
+        return value
+
+    def allreduce(self, value, op=None):
+        return value
+
+    def gather(self, value, root=0):
+        return [value]
+
+    def Abort(self, errorcode=1):
+        raise SystemExit(errorcode)
+
+
+class SerialMPI:
+    """Minimal MPI namespace used by IQC in serial mode."""
+
+    SUM = "sum"
+    MAX = "max"
+    COMM_WORLD = SerialComm()
+
+
+def _env_flag(name, env=os.environ):
+    value = env.get(name)
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+    return None
+
+
+def _first_int_env(names, env=os.environ):
+    for name in names:
+        value = env.get(name)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except ValueError:
+            continue
+    return None
+
+
+def should_initialize_mpi(env=os.environ):
+    """Return True when the process appears to be part of a multi-rank launch."""
+
+    if _env_flag("IQC_DISABLE_MPI", env) is True:
+        return False
+    if _env_flag("IQC_ENABLE_MPI", env) is True:
+        return True
+
+    rank = _first_int_env(_MPI_RANK_ENV_VARS, env)
+    size = _first_int_env(_MPI_SIZE_ENV_VARS, env)
+    if size is not None:
+        return rank is not None and size > 1
+    # Some launchers (e.g. Aurora PALS) set a rank var but no global-size var.
+    # A launcher-provided rank is itself proof of a multi-rank launch.
+    return rank is not None
+
+
+def get_mpi_context():
+    """Return ``(comm, mpi_namespace)`` without initializing MPI for serial runs."""
+
+    global MPI
+
+    if not should_initialize_mpi():
+        return SerialMPI.COMM_WORLD, SerialMPI
+
+    import mpi4py
+
+    mpi4py.rc.initialize = False
+    from mpi4py import MPI as real_mpi
+
+    if not real_mpi.Is_initialized():
+        real_mpi.Init_thread(required=real_mpi.THREAD_FUNNELED)
+
+    MPI = real_mpi
+    return real_mpi.COMM_WORLD, real_mpi
 
 
 def get_mpi_rank(comm=None):
@@ -9,7 +130,7 @@ def get_mpi_rank(comm=None):
     Priority:
     1. From `comm` object if provided.
     2. From environment variables (PMI_RANK, PMI_ID, OMPI_COMM_WORLD_RANK).
-    3. From `MPI.COMM_WORLD` as a final fallback.
+    3. From initialized `MPI.COMM_WORLD` as a final fallback.
 
     Returns 0 if MPI is not available and no environment variables are set.
     """
@@ -24,18 +145,14 @@ def get_mpi_rank(comm=None):
             pass
 
     # 2. Check environment variables
-    env_vars = ["PMI_RANK", "PMI_ID", "OMPI_COMM_WORLD_RANK"]
-    for var in env_vars:
-        if os.getenv(var) is not None:
-            return int(os.getenv(var))
+    rank = _first_int_env(_MPI_RANK_ENV_VARS)
+    if rank is not None:
+        return rank
 
-    # 3. Use global MPI as a fallback
-    try:
-        from mpi4py import MPI
-
+    if MPI is not None:
         return MPI.COMM_WORLD.Get_rank()
-    except ImportError:
-        return 0  # Default rank if MPI is not available
+
+    return 0  # Default rank if MPI is not initialized
 
 
 def get_mpi_size(comm=None, default=1):
@@ -45,7 +162,7 @@ def get_mpi_size(comm=None, default=1):
     Priority:
     1. From `comm` object if provided.
     2. From environment variables (PMI_SIZE, OMPI_COMM_WORLD_SIZE).
-    3. From `MPI.COMM_WORLD` as a final fallback.
+    3. From initialized `MPI.COMM_WORLD` as a final fallback.
 
     Returns `default` if MPI is not available and no environment variables are set.
     """
@@ -60,18 +177,14 @@ def get_mpi_size(comm=None, default=1):
             pass
 
     # 2. Check environment variables
-    env_vars = ["PMI_SIZE", "OMPI_COMM_WORLD_SIZE"]
-    for var in env_vars:
-        if os.getenv(var) is not None:
-            return int(os.getenv(var))
+    size = _first_int_env(_MPI_SIZE_ENV_VARS)
+    if size is not None:
+        return size
 
-    # 3. Use global MPI as a fallback
-    try:
-        from mpi4py import MPI
-
+    if MPI is not None:
         return MPI.COMM_WORLD.Get_size()
-    except ImportError:
-        return default  # Default size if MPI is not available
+
+    return default  # Default size if MPI is not initialized
 
 
 def get_mpi_local_rank(default=0):
@@ -97,11 +210,8 @@ def get_mpi_local_rank(default=0):
     See https://www.open-mpi.org/faq/?category=running#mpi-environmental-variables
     for more information about MPI environment variables.
     """
-    if os.getenv("OMPI_COMM_WORLD_LOCAL_RANK") is not None:
-        rank = int(os.getenv("OMPI_COMM_WORLD_LOCAL_RANK"))
-    else:
-        rank = default
-    return rank
+    rank = _first_int_env(["OMPI_COMM_WORLD_LOCAL_RANK"])
+    return rank if rank is not None else default
 
 
 def get_mpi_local_size(default=1):
@@ -125,11 +235,8 @@ def get_mpi_local_size(default=1):
     See https://www.open-mpi.org/faq/?category=running#mpi-environmental-variables
     for more information about MPI environment variables.
     """
-    if os.getenv("OMPI_COMM_WORLD_LOCAL_SIZE") is not None:
-        size = int(os.getenv("OMPI_COMM_WORLD_LOCAL_SIZE"))
-    else:
-        size = default
-    return size
+    size = _first_int_env(["OMPI_COMM_WORLD_LOCAL_SIZE"])
+    return size if size is not None else default
 
 
 def get_ppn():
@@ -228,7 +335,7 @@ if __name__ == "__main__":
     For example:
         mpiexec -n 4 python iqc/mpitools.py
     """
-    comm = MPI.COMM_WORLD
+    comm, _mpi = get_mpi_context()
     rank = comm.Get_rank()
     size = comm.Get_size()
 

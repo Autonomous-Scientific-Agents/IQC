@@ -2,13 +2,16 @@ import pytest
 from unittest.mock import patch, MagicMock
 import os
 from iqc.mpitools import (
+    SerialMPI,
     get_mpi_rank,
     get_mpi_size,
     get_mpi_local_rank,
     get_mpi_local_size,
+    get_mpi_context,
     get_ppn,
     get_total_memory,
     get_start_end,
+    should_initialize_mpi,
 )
 import sys
 
@@ -45,9 +48,18 @@ def clear_mpi_env(monkeypatch):
     vars_to_clear = [
         "PMI_RANK",
         "PMI_ID",
+        "PMIX_RANK",
         "OMPI_COMM_WORLD_RANK",
+        "MV2_COMM_WORLD_RANK",
+        "SLURM_PROCID",
+        "PALS_RANKID",
         "PMI_SIZE",
+        "PMIX_SIZE",
         "OMPI_COMM_WORLD_SIZE",
+        "MV2_COMM_WORLD_SIZE",
+        "SLURM_NTASKS",
+        "IQC_DISABLE_MPI",
+        "IQC_ENABLE_MPI",
     ]
     for var in vars_to_clear:
         monkeypatch.delenv(var, raising=False)
@@ -67,9 +79,8 @@ def test_get_mpi_rank_priority(mock_env_pmi, mock_env_ompi, monkeypatch):
 
 
 def test_get_mpi_rank_no_mpi(clear_mpi_env):
-    # Test that it returns 0 if MPI is not installed and no env vars are set
-    with patch("iqc.mpitools.MPI", side_effect=ImportError):
-        assert get_mpi_rank() == 0
+    # Test that it returns 0 if MPI is not initialized and no env vars are set
+    assert get_mpi_rank() == 0
 
 
 def test_get_mpi_size_priority(mock_env_pmi, mock_env_ompi, monkeypatch):
@@ -86,16 +97,40 @@ def test_get_mpi_size_priority(mock_env_pmi, mock_env_ompi, monkeypatch):
 
 
 def test_get_mpi_size_no_mpi(clear_mpi_env):
-    # Test that it returns default value if MPI is not installed and no env vars are set
-    original_import = __import__
+    # Test that it returns default value if MPI is not initialized.
+    assert get_mpi_size(default=2) == 2
 
-    def import_mock(name, *args, **kwargs):
-        if name == "mpi4py":
-            raise ImportError
-        return original_import(name, *args, **kwargs)
 
-    with patch("builtins.__import__", side_effect=import_mock):
-        assert get_mpi_size(default=2) == 2
+def test_should_initialize_mpi_only_for_multi_rank_launch(clear_mpi_env):
+    assert should_initialize_mpi() is False
+
+    with patch.dict(os.environ, {"PMI_RANK": "0", "PMI_SIZE": "1"}, clear=False):
+        assert should_initialize_mpi() is False
+
+    with patch.dict(os.environ, {"PMI_RANK": "0", "PMI_SIZE": "2"}, clear=False):
+        assert should_initialize_mpi() is True
+
+    with patch.dict(
+        os.environ,
+        {"PMI_RANK": "0", "PMI_SIZE": "2", "IQC_DISABLE_MPI": "1"},
+        clear=False,
+    ):
+        assert should_initialize_mpi() is False
+
+    with patch.dict(os.environ, {"IQC_ENABLE_MPI": "1"}, clear=True):
+        assert should_initialize_mpi() is True
+
+
+def test_get_mpi_context_returns_serial_without_mpi_launch(clear_mpi_env):
+    comm, mpi = get_mpi_context()
+
+    assert mpi is SerialMPI
+    assert comm.Get_rank() == 0
+    assert comm.Get_size() == 1
+    assert comm.bcast("value", root=0) == "value"
+    assert comm.reduce(3, op=mpi.SUM, root=0) == 3
+    assert comm.allreduce(4, op=mpi.MAX) == 4
+    assert comm.gather("x", root=0) == ["x"]
 
 
 def test_get_mpi_local_rank():
@@ -116,6 +151,33 @@ def test_get_mpi_local_size():
 def test_get_mpi_local_size_default():
     with patch.dict(os.environ, {}, clear=True):
         assert get_mpi_local_size(default=1) == 1
+
+
+def test_get_mpi_rank_ignores_non_integer_env(monkeypatch):
+    """Junk in an MPI rank env var must not crash; should fall through to 0."""
+    for var in ["PMI_RANK", "PMI_ID", "PMIX_RANK", "OMPI_COMM_WORLD_RANK",
+                "MV2_COMM_WORLD_RANK", "SLURM_PROCID", "PALS_RANKID"]:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("PMI_RANK", "not-an-int")
+    assert get_mpi_rank() == 0
+
+
+def test_get_mpi_size_ignores_non_integer_env(monkeypatch):
+    for var in ["PMI_SIZE", "PMIX_SIZE", "OMPI_COMM_WORLD_SIZE",
+                "MV2_COMM_WORLD_SIZE", "SLURM_NTASKS"]:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("PMI_SIZE", "garbage")
+    assert get_mpi_size(default=7) == 7
+
+
+def test_get_mpi_local_rank_ignores_non_integer_env(monkeypatch):
+    monkeypatch.setenv("OMPI_COMM_WORLD_LOCAL_RANK", "garbage")
+    assert get_mpi_local_rank(default=3) == 3
+
+
+def test_get_mpi_local_size_ignores_non_integer_env(monkeypatch):
+    monkeypatch.setenv("OMPI_COMM_WORLD_LOCAL_SIZE", "garbage")
+    assert get_mpi_local_size(default=5) == 5
 
 
 def test_get_ppn():

@@ -12,16 +12,53 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
+    "argcomplete",
     "numpy",
     "mpi4py",
     "psutil",
     "ase",
     "rdkit",
+    "matplotlib",
     "nglview",
     "pandas",
+    "pyarrow",
+    "openpyxl",
+    "xlrd",
+    "pymatgen",
+    "pubchempy",
 ]
 
 [project.optional-dependencies]
+mlip = [
+    # Keep e3nn unpinned for UMA/fairchem compatibility. MACE metadata pins
+    # e3nn==0.4.4, so install mace-torch separately with --no-deps.
+    "e3nn>=0.5",
+    "fairchem-core>=2.0; python_version >= '3.11'",
+    "pydantic>=2.12,<3",
+    "torch-dftd",
+    "torch-ema",
+    "prettytable",
+    "matscipy",
+    "h5py",
+    "torchmetrics",
+    "python-hostlist",
+    "configargparse",
+    "GitPython",
+    "PyYAML",
+    "tqdm",
+    "lmdb",
+    "orjson",
+    "opt_einsum",
+]
+xtb = [
+    "xtb",
+]
+parsl = [
+    "parsl>=2025.1.13",
+]
+mcp = [
+    "mcp",
+]
 test = [
     "pytest>=7.0",
     "pytest-mock",
@@ -33,7 +70,8 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["iqc*"]
+include = ["iqc*", "scripts"]
+exclude = ["iqc.tests*"]
 namespaces = false
 
 [tool.pytest.ini_options]
@@ -52,3 +90,14 @@ multi_line_output = 3
 
 [project.scripts]
 iqc = "iqc.main:main"
+iqc-parsl = "iqc.parsl_dispatch:run_cli"
+iqc-el = "iqc.ensemble_launcher_dispatch:run_cli"
+iqc-mcp = "iqc.mcp_server:main"
+iqc-sweep = "iqc.cli_sweep:main"
+iqc-status = "iqc.status_query:main"
+iqc-jsonl2parquet = "scripts.jsonl2parquet:run_cli"
+iqc-chunk-parquet = "scripts.chunk_parquet:run_cli"
+iqc-optimize-parquet = "scripts.optimize_parquet:run_cli"
+iqc-read-parquet = "scripts.read_parquet:run_cli"
+iqc-reduce-parquet = "scripts.reduce_parquet:run_cli"
+iqc-sort-opt-xyz-parquet = "scripts.sort_opt_xyz_parquet:run_cli"

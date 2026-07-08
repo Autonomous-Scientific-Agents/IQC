@@ -32,3 +32,15 @@ vibration_params:
 # Parameters specific to the thermo task
 thermo_params:
  ignore_imag_modes: false # Overrides --ignore-imag CLI flag if needed (current logic uses CLI flag)
+
+# --- ExaChem-specific Settings ---
+# Parameters routed to the ExaChem ASE calculator. The artifact_retention block
+# controls F9: per-run archiving of MOs, amplitudes, and Cholesky vectors so
+# scratch wipes don't destroy data needed for analysis or restarts.
+exachem:
+  artifact_retention:
+    enabled: true                              # Master on/off switch. Default 'true' for production sweeps.
+    destination_root: /lus/flare/projects/HiFiThermKin/keceli/exachem/artifacts/
+                                               # Override with the IQC_ARTIFACT_ROOT env var or --artifact-root.
+    keep_n_days: 30                            # cleanup_by_policy removes archives older than this.
+    compress: true                             # Write .tar.gz (true) or plain .tar (false).

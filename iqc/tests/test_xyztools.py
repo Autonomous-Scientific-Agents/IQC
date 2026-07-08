@@ -101,3 +101,79 @@ def test_dataframe_to_xyz_column_selection(xyz_file, tmp_path):
     out_file = tmp_path / "col.xyz"
     xyztools.dataframe_to_xyz(df, out_file, xyz_column="xyz")
     assert out_file.read_text().startswith("3\nwater molecule")
+
+
+TRUNCATED_XYZ = """3
+first
+O 0 0 0
+H 0 0 1
+H 1 0 0
+2
+truncated
+H 0 0 0
+"""
+
+
+def test_XYZReader_truncated_frame_excluded_from_counts(tmp_path):
+    """A frame whose atom block is truncated must not show up in counts."""
+    f = tmp_path / "trunc.xyz"
+    f.write_text(TRUNCATED_XYZ)
+    reader = xyztools.XYZReader(str(f))
+    assert reader.count_configurations() == 1
+    # get_atom_counts must agree with iter_configurations (no phantom 2-atom frame).
+    assert reader.get_atom_counts() == [3]
+    configs = list(reader.iter_configurations())
+    assert len(configs) == 1
+    assert configs[0].num_atoms == 3
+
+
+MALFORMED_COUNT_XYZ = """3
+first
+O 0 0 0
+H 0 0 1
+H 1 0 0
+not-a-number
+2
+trailing
+H 0 0 0
+H 1 0 0
+"""
+
+
+def test_XYZReader_malformed_count_stops_iter(tmp_path):
+    """Bad atom-count line must stop iteration (cannot resynchronize without it)."""
+    f = tmp_path / "bad.xyz"
+    f.write_text(MALFORMED_COUNT_XYZ)
+    reader = xyztools.XYZReader(str(f))
+    # Only the first valid frame is yielded; the rest is unparseable past the bad count.
+    assert reader.count_configurations() == 1
+    assert reader.get_atom_counts() == [3]
+    configs = list(reader.iter_configurations())
+    assert len(configs) == 1
+
+
+PARTIAL_ATOM_XYZ = """3
+incomplete atom
+O 0 0 0
+H 0 0 1
+bogus line
+2
+ok
+H 0 0 0
+H 1 0 0
+"""
+
+
+def test_XYZReader_iter_skips_malformed_atom_frame(tmp_path):
+    """A frame with an unparseable atom line is skipped (not yielded with mismatch)."""
+    f = tmp_path / "partial.xyz"
+    f.write_text(PARTIAL_ATOM_XYZ)
+    reader = xyztools.XYZReader(str(f))
+    configs = list(reader.iter_configurations())
+    # First frame is malformed; we must still recover and yield the second one
+    # (verifies frame alignment after skipping).
+    assert len(configs) == 1
+    assert configs[0].num_atoms == 2
+    # Yielded configs must never have a mismatch between num_atoms and len(atoms).
+    for c in configs:
+        assert c.num_atoms == len(c.atoms)

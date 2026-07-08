@@ -1,4 +1,4 @@
- """sqltools.py – helper utilities for storing and retrieving
+"""sqltools.py – helper utilities for storing and retrieving
  compressed quantum‑chemistry log blobs in a single SQLite database.
 
 Designed for the single‑writer (rank‑0 fan‑in) pattern demonstrated in
