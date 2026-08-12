@@ -2485,7 +2485,12 @@ def _recover_imaginary(
 
 
 def _prepare_calculation(
-    atoms, calculator=None, unique_name="", multiplicity=None, charge=0
+    atoms,
+    calculator=None,
+    unique_name="",
+    multiplicity=None,
+    charge=0,
+    apply_numerical_forces=True,
 ):
     """
     Prepare atoms and calculator for a calculation.
@@ -2527,8 +2532,18 @@ def _prepare_calculation(
     )
 
     # Energy-only calculators (ExaChem, PySCF CCSD(T)) get finite-difference
-    # forces so the force-driven optimizer can use them (no-op otherwise).
-    calc = _wrap_with_numerical_forces(calc)
+    # forces so the force-driven optimizer / Hessian can use them (no-op for
+    # calculators that already implement forces). Gated by
+    # apply_numerical_forces: force-needing tasks (opt/vib/ir/thermo) leave it
+    # True (the default); `--task single` energy calculations pass False so
+    # they do NOT pay for a full FD stencil (1 + 6*N_atoms extra single-point
+    # invocations per molecule) they never use. This gating restores the
+    # pre-2026-07-08 single-point behavior; without it, every ExaChem/PySCF
+    # `--task single` silently ran a finite-difference forces stencil, making
+    # sweep jobs ~10-100x slower and timing out (h=10 CCSD(T)/aug-cc-pVTZ:
+    # ~30x exachem_run dirs per molecule, batch never finished).
+    if apply_numerical_forces:
+        calc = _wrap_with_numerical_forces(calc)
 
     # Get initial data
     initial_smiles = atoms2smiles(atoms)
@@ -2601,8 +2616,16 @@ def run_single_point(
     """
     logging.info(f"Starting single point calculation for {unique_name}")
 
+    # Energy-only task: do NOT wrap energy-only calculators in finite-difference
+    # forces. Single-point results discard forces (results["forces"] = [] below),
+    # so an FD stencil would be pure waste (~6*N_atoms extra single points).
     calc, results = _prepare_calculation(
-        atoms, calculator, unique_name, multiplicity=multiplicity, charge=charge
+        atoms,
+        calculator,
+        unique_name,
+        multiplicity=multiplicity,
+        charge=charge,
+        apply_numerical_forces=False,
     )
 
     start_time = time.time()
