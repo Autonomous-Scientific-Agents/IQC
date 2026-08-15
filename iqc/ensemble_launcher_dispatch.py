@@ -250,30 +250,50 @@ def _row_callable(
     client = ClusterClient(checkpoint_dir=checkpoint_dir)
     client.start()
     calc.cluster_client = client
+    result = None
     try:
         result = _proc(xyz_index, calculator=calc, **pk)
+
+        # Write partial JSONL BEFORE ClusterClient teardown. Teardown at
+        # high inner-task rank counts (h=10 npm=32 → 416-rank inner mpiexec)
+        # can hang for long periods; if walltime kills the worker during that
+        # hang, the partial would be lost. Empirically at h=10 npm=32 only
+        # 6/829 exachem_run dirs produced a partial JSONL despite 75% of
+        # them completing CCSD(T) and 68% having artifact tarballs written
+        # (job 8670952, 2026-07-16). Same code produced 98.7% partial write
+        # rate at h=6 npm=4 (inner mpiexec = 52 ranks, no teardown hang).
+        # Writing the partial before teardown makes it survive even if
+        # teardown blocks until walltime SIGTERM.
+        if isinstance(result, dict) and partials_dir:
+            import json as _json
+            from iqc.main import ComplexEncoder as _Enc
+
+            try:
+                _os.makedirs(partials_dir, exist_ok=True)
+                partial_path = _os.path.join(
+                    partials_dir, f"row_{xyz_index:07d}.jsonl"
+                )
+                tmp_path = partial_path + ".tmp"
+                with open(tmp_path, "w") as f:
+                    f.write(_json.dumps(result, cls=_Enc))
+                    f.write("\n")
+                _os.rename(tmp_path, partial_path)
+            except Exception as e:  # noqa: BLE001
+                logging.warning(
+                    "row %d: partial write to %s failed: %s",
+                    xyz_index, partials_dir, e,
+                )
     finally:
         calc.cluster_client = None
-        client.teardown()
-
-    if isinstance(result, dict) and partials_dir:
-        import json as _json
-        from iqc.main import ComplexEncoder as _Enc
-
+        # Also protect teardown itself — if teardown raises, the exception
+        # would propagate up and the row would be counted as failed by EL
+        # even though the compute (and partial write above) succeeded.
         try:
-            _os.makedirs(partials_dir, exist_ok=True)
-            partial_path = _os.path.join(
-                partials_dir, f"row_{xyz_index:07d}.jsonl"
-            )
-            tmp_path = partial_path + ".tmp"
-            with open(tmp_path, "w") as f:
-                f.write(_json.dumps(result, cls=_Enc))
-                f.write("\n")
-            _os.rename(tmp_path, partial_path)
+            client.teardown()
         except Exception as e:  # noqa: BLE001
             logging.warning(
-                "row %d: partial write to %s failed: %s",
-                xyz_index, partials_dir, e,
+                "row %d: client.teardown() failed (ignoring): %s",
+                xyz_index, e,
             )
     return result
 
