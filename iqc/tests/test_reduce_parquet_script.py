@@ -220,3 +220,84 @@ def test_pyproject_exposes_script_entry_points():
         'iqc-sort-opt-xyz-parquet = "scripts.sort_opt_xyz_parquet:run_cli"'
         in text
     )
+
+
+def test_jsonl2parquet_promotes_mixed_int_float_columns(tmp_path):
+    """A field seen first as int and later as float must not be truncated."""
+    jsonl_path = tmp_path / "mixed.jsonl"
+    jsonl_path.write_text(
+        '{"task": "opt", "opt_energy_eV": -18}\n'
+        '{"task": "opt", "opt_energy_eV": -22.94308767458058}\n'
+    )
+    output_path = tmp_path / "mixed.parquet"
+
+    jsonl2parquet.convert_jsonl_to_parquet(str(jsonl_path), str(output_path))
+
+    table = pq.read_table(output_path)
+    assert table.schema.field("opt_energy_eV").type == pa.float64()
+    assert table["opt_energy_eV"].to_pylist() == [-18.0, -22.94308767458058]
+
+
+def test_jsonl2parquet_unions_struct_keys_across_rows(tmp_path):
+    """Dict fields must keep keys that only appear in later rows."""
+    jsonl_path = tmp_path / "structs.jsonl"
+    jsonl_path.write_text(
+        '{"task": "opt", "meta": {"a": 1}}\n'
+        '{"task": "opt", "meta": {"a": 1, "b": 99}}\n'
+    )
+    output_path = tmp_path / "structs.parquet"
+
+    jsonl2parquet.convert_jsonl_to_parquet(str(jsonl_path), str(output_path))
+
+    rows = pq.read_table(output_path)["meta"].to_pylist()
+    assert rows[1] == {"a": 1, "b": 99}
+
+
+def test_optimize_parquet_keeps_rows_when_all_columns_constant(tmp_path):
+    """An all-constant table must not collapse to zero rows in-place."""
+    input_path = tmp_path / "constant.parquet"
+    pq.write_table(
+        pa.table({"calculator": ["uma"], "task": ["thermo"]}), input_path
+    )
+
+    optimize_parquet.optimize_parquet(str(input_path))
+
+    table = pq.read_table(input_path)
+    assert table.num_rows == 1
+    assert table.column_names == ["calculator"]
+    constants = optimize_parquet.read_constant_columns(str(input_path))
+    assert constants == {"task": "thermo"}
+
+
+def test_optimize_parquet_merges_previous_constant_metadata(tmp_path):
+    """A second optimize pass must keep constants stored by the first."""
+    input_path = tmp_path / "twopass.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "calculator": ["uma", "uma"],
+                "task": ["thermo", "opt"],
+                "energy": [1.0, 2.0],
+            }
+        ),
+        input_path,
+    )
+
+    # First pass moves 'calculator' into metadata.
+    optimize_parquet.optimize_parquet(str(input_path))
+    assert optimize_parquet.read_constant_columns(str(input_path)) == {
+        "calculator": "uma"
+    }
+
+    # Rewrite the data so 'task' becomes constant while 'energy' still varies,
+    # then optimize again: the first pass's 'calculator' entry must survive.
+    table = pq.read_table(input_path)
+    rewritten = pa.table({"task": ["thermo", "thermo"], "energy": [1.0, 2.0]})
+    rewritten = rewritten.cast(
+        rewritten.schema.with_metadata(table.schema.metadata)
+    )
+    pq.write_table(rewritten, input_path)
+    optimize_parquet.optimize_parquet(str(input_path))
+
+    constants = optimize_parquet.read_constant_columns(str(input_path))
+    assert constants == {"calculator": "uma", "task": "thermo"}
