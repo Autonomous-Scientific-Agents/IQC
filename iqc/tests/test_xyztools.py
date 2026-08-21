@@ -177,3 +177,54 @@ def test_XYZReader_iter_skips_malformed_atom_frame(tmp_path):
     # Yielded configs must never have a mismatch between num_atoms and len(atoms).
     for c in configs:
         assert c.num_atoms == len(c.atoms)
+
+
+BLANK_LINE_XYZ = """3
+water molecule
+O 0.000000 0.000000 0.000000
+H 0.757000 0.586000 0.000000
+H -0.757000 0.586000 0.000000
+
+2
+hydrogen molecule
+H 0.000000 0.000000 0.000000
+H 0.740000 0.000000 0.000000
+
+"""
+
+
+@pytest.fixture
+def blank_line_xyz_file(tmp_path):
+    file = tmp_path / "blank_lines.xyz"
+    file.write_text(BLANK_LINE_XYZ)
+    return file
+
+
+def test_count_xyz_frames_tolerates_blank_lines(blank_line_xyz_file):
+    """Blank lines between frames and at EOF must not break counting."""
+    assert xyztools.count_xyz_frames(blank_line_xyz_file) == 2
+
+
+def test_iter_xyz_tolerates_blank_lines(blank_line_xyz_file):
+    frames = list(xyztools.iter_xyz(blank_line_xyz_file))
+    assert len(frames) == 2
+    assert frames[0][0] == 3
+    assert frames[1][0] == 2
+
+
+def test_XYZReader_count_tolerates_blank_lines(blank_line_xyz_file):
+    reader = xyztools.XYZReader(str(blank_line_xyz_file))
+    assert reader.count_configurations() == 2
+
+
+def test_XYZReader_atom_counts_tolerates_blank_lines(blank_line_xyz_file):
+    reader = xyztools.XYZReader(str(blank_line_xyz_file))
+    assert reader.get_atom_counts() == [3, 2]
+
+
+def test_XYZReader_iter_tolerates_blank_lines(blank_line_xyz_file):
+    reader = xyztools.XYZReader(str(blank_line_xyz_file))
+    configs = list(reader.iter_configurations())
+    assert len(configs) == 2
+    assert configs[0].num_atoms == 3
+    assert configs[1].num_atoms == 2
