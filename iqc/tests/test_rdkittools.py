@@ -130,22 +130,37 @@ H       0.950000    0.000000    0.000000"""
         self.assertEqual(get_num_heavy_atoms(self.water_mol), 1)  # 1 O
 
     def test_get_num_hydrogens(self):
-        """Test get_num_hydrogens function."""
-        # RDKit's CalcNumHBD counts hydrogen bond donors
-        # For methane and water, results may vary based on how bonds are interpreted
-        result = get_num_hydrogens(self.methane_mol)
-        self.assertGreaterEqual(result, 0)
+        """Hydrogen counts must be actual H atoms, not H-bond donors."""
+        # Methane has 4 hydrogens (the old CalcNumHBD implementation said 0).
+        self.assertEqual(get_num_hydrogens(self.methane_mol), 4)
+        self.assertEqual(get_num_hydrogens(self.water_mol), 2)
 
-        result = get_num_hydrogens(self.water_mol)
-        self.assertGreaterEqual(result, 0)
+        # Implicit hydrogens (SMILES without AddHs) are counted too.
+        ethylene = Chem.MolFromSmiles("C=C")
+        self.assertEqual(get_num_hydrogens(ethylene), 4)
 
     def test_get_max_bond_order(self):
-        """Test get_max_bond_order function."""
-        max_order = get_max_bond_order(self.methane_mol)
-        self.assertGreaterEqual(max_order, 1)  # At least single bonds
+        """Bond order must come from bonds, not atom degrees."""
+        # Methane's max bond order is 1.0 (the old degree-based code said 4).
+        self.assertEqual(get_max_bond_order(self.methane_mol), 1.0)
+        self.assertEqual(get_max_bond_order(self.water_mol), 1.0)
 
-        max_order = get_max_bond_order(self.water_mol)
-        self.assertGreaterEqual(max_order, 1)  # At least single bonds
+        ethylene = Chem.MolFromSmiles("C=C")
+        self.assertEqual(get_max_bond_order(ethylene), 2.0)
+
+        # An atom-free molecule has no bonds.
+        self.assertEqual(get_max_bond_order(Chem.Mol()), 0.0)
+
+    def test_get_bond_orders_returns_orders_for_atom(self):
+        """Per-atom bond orders, not the atom degree."""
+        ethylene = Chem.MolFromSmiles("C=C")
+        self.assertEqual(get_bond_orders(ethylene, 0), [2.0])
+
+    def test_smiles_to_mol_invalid_smiles_returns_none(self):
+        """Invalid SMILES must return None instead of crashing in AddHs."""
+        from iqc.rdkittools import smiles_to_mol
+
+        self.assertIsNone(smiles_to_mol("not_a_smiles(("))
 
     def test_get_num_electrons(self):
         """Test get_num_electrons function."""

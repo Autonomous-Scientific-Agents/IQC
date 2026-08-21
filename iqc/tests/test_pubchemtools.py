@@ -3,6 +3,7 @@
 import unittest
 from unittest.mock import patch, MagicMock
 
+from iqc import pubchemtools
 from iqc.pubchemtools import (
     get_compound_from_cid,
     get_compounds_from_cids,
@@ -199,3 +200,44 @@ class TestPubChemTools(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFailureHandling(unittest.TestCase):
+    """Missing names return falsy values and failures are not cached."""
+
+    def setUp(self):
+        pubchemtools._COMPOUND_CACHE.clear()
+        pubchemtools._CID_FROM_SMILES_CACHE.clear()
+
+    @patch("iqc.pubchemtools.get_compound_from_cid")
+    def test_get_iupac_name_missing_is_empty_string(self, mock_get_compound):
+        """A truthy sentinel like 'Not available' defeated report.py's
+        `if not iupac_name` fallback loop and leaked into reports."""
+        mock_compound = MagicMock()
+        mock_compound.iupac_name = None
+        mock_get_compound.return_value = mock_compound
+
+        self.assertEqual(get_iupac_name("962"), "")
+
+        mock_get_compound.return_value = None
+        self.assertEqual(get_iupac_name("962"), "")
+
+    @patch("iqc.pubchemtools.Compound.from_cid")
+    def test_transient_compound_failure_is_not_cached(self, mock_from_cid):
+        """One network hiccup must not poison the CID for the process life."""
+        compound = MagicMock()
+        mock_from_cid.side_effect = [Exception("timeout"), compound]
+
+        self.assertIsNone(pubchemtools.get_compound_from_cid("962"))
+        self.assertIs(pubchemtools.get_compound_from_cid("962"), compound)
+        self.assertEqual(mock_from_cid.call_count, 2)
+
+    @patch("iqc.pubchemtools.get_compounds")
+    def test_transient_cid_lookup_failure_is_not_cached(self, mock_get_compounds):
+        good = MagicMock()
+        good.cid = 962
+        mock_get_compounds.side_effect = [Exception("timeout"), [good]]
+
+        self.assertEqual(pubchemtools.get_cid_from_smiles("O"), "")
+        self.assertEqual(pubchemtools.get_cid_from_smiles("O"), "962")
+        self.assertEqual(mock_get_compounds.call_count, 2)
