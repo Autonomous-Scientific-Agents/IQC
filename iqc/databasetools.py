@@ -300,17 +300,67 @@ def _blob_is_success(blob, task):
         return False
     if data.get("parsl_retries_exhausted"):
         return False
+    # Soft in-task failures (e.g. "Missing vibrational energies") are recorded
+    # in the plain "error" field by the asetools task runners without raising,
+    # so no ``{task}_error`` key is ever set for them.
+    if data.get("error"):
+        return False
     for k, v in data.items():
         if isinstance(k, str) and k.endswith("_error") and v:
             return False
     return True
 
 
+def _upgrade_error_row(conn, key, new_blob, task):
+    """Replace a stored error row with a new successful blob for the same key.
+
+    ``INSERT OR IGNORE`` keeps the first row written per unique key, so a
+    successful retry after a stored failure would otherwise be dropped and the
+    calculation re-attempted on every ``--skip-existing --retry-failed-only``
+    resubmit. Returns True if a row was upgraded.
+    """
+
+    if not _blob_is_success(new_blob, task):
+        return False
+    existing = _execute_with_busy_retry(
+        conn,
+        """
+        SELECT id, blob_data
+        FROM calculations
+        WHERE geometry_hash = ?
+          AND params_hash = ?
+          AND calculator = ?
+          AND model = ?
+          AND task = ?
+        """,
+        key,
+    ).fetchone()
+    if existing is None:
+        return False
+    existing_id, existing_blob = existing
+    if existing_blob == new_blob or _blob_is_success(existing_blob, task):
+        return False
+    _execute_with_busy_retry(
+        conn,
+        "UPDATE calculations SET blob_data = ? WHERE id = ?",
+        (new_blob, existing_id),
+    )
+    return True
+
+
 def _insert_rows(conn, rows):
     before = conn.total_changes
     conn.executemany(INSERT_CALCULATION_SQL, rows)
+    inserted = conn.total_changes - before
+    upgraded = 0
+    if inserted < len(rows):
+        # Some rows were ignored as duplicates; upgrade any stored error row
+        # for which this batch carries a successful result.
+        for row in rows:
+            if _upgrade_error_row(conn, row[:5], row[5], row[4]):
+                upgraded += 1
     conn.commit()
-    return conn.total_changes - before
+    return inserted, upgraded
 
 
 def insert_entry(json_line, db_path, debug=False):
@@ -330,7 +380,8 @@ def insert_entry(json_line, db_path, debug=False):
     row = _prepare_calculation_row(json_line, debug=debug)
     with _connect(db_path) as conn:
         _ensure_schema(conn)
-        return bool(_insert_rows(conn, [row]))
+        inserted, upgraded = _insert_rows(conn, [row])
+        return bool(inserted or upgraded)
 
 
 def insert_entries(json_lines, db_path, debug=False, batch_size=1000):
@@ -345,6 +396,7 @@ def insert_entries(json_lines, db_path, debug=False, batch_size=1000):
 
     processed = 0
     inserted = 0
+    upgraded = 0
     batch = []
 
     with _connect(db_path) as conn:
@@ -355,16 +407,21 @@ def insert_entries(json_lines, db_path, debug=False, batch_size=1000):
             batch.append(_prepare_calculation_row(json_line, debug=debug))
             processed += 1
             if len(batch) >= batch_size:
-                inserted += _insert_rows(conn, batch)
+                batch_inserted, batch_upgraded = _insert_rows(conn, batch)
+                inserted += batch_inserted
+                upgraded += batch_upgraded
                 batch.clear()
 
         if batch:
-            inserted += _insert_rows(conn, batch)
+            batch_inserted, batch_upgraded = _insert_rows(conn, batch)
+            inserted += batch_inserted
+            upgraded += batch_upgraded
 
     return {
         "processed": processed,
         "inserted": inserted,
-        "duplicates": processed - inserted,
+        "upgraded": upgraded,
+        "duplicates": processed - inserted - upgraded,
     }
 
 
@@ -394,6 +451,25 @@ def merge_databases(target_db_path, source_db_path):
             FROM source_db.calculations
             """
         )
+
+        # Rows ignored above because the target already holds the key: if the
+        # source row is a success and the target row an error, take the success.
+        conflicting = cursor.execute(
+            """
+            SELECT s.geometry_hash, s.params_hash, s.calculator, s.model,
+                   s.task, s.blob_data
+            FROM source_db.calculations AS s
+            JOIN calculations AS t
+              ON s.geometry_hash = t.geometry_hash
+             AND s.params_hash = t.params_hash
+             AND s.calculator = t.calculator
+             AND s.model = t.model
+             AND s.task = t.task
+            WHERE s.blob_data != t.blob_data
+            """
+        ).fetchall()
+        for row in conflicting:
+            _upgrade_error_row(conn, row[:5], row[5], row[4])
 
         conn.commit()
         cursor.execute("DETACH DATABASE source_db")

@@ -99,3 +99,23 @@ def test_cli_retry_failed_only_defaults_off_and_parses_true():
 
     args_retry = get_args(["--xyz", "water.xyz", "--retry-failed-only"])
     assert args_retry.retry_failed_only is True
+
+
+def test_build_index_plain_error_field_is_error(tmp_path):
+    """Soft in-task failures set only the plain 'error' key — no {task}_error."""
+    soft_fail = _record(
+        9, error="Missing vibrational energies for thermochemistry.\n"
+    )
+    ok_record = _record(10, error="")
+    jsonl_file = tmp_path / "results.jsonl"
+    jsonl_file.write_text(
+        "\n".join([json.dumps(soft_fail), json.dumps(ok_record)]),
+        encoding="utf-8",
+    )
+
+    index, summary = build_completed_calculation_index([jsonl_file])
+
+    assert index[calculation_key_from_record(soft_fail)] == "error"
+    assert index[calculation_key_from_record(ok_record)] == "ok"
+    assert summary["error"] == 1
+    assert summary["ok"] == 1
