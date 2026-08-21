@@ -1006,3 +1006,69 @@ def test_keep_artifacts_default_parameter_exists():
     """Pin the calculator's default so callers can rely on backward-compat."""
 
     assert ExaChemCalculator.default_parameters["keep_artifacts"] is False
+
+
+def _eom_payload():
+    """Payload shaped like a real *.eom_ccsd.json output."""
+    return {
+        "output": {
+            "SCF": {"final_energy": -75.8251},
+            "CCSD": {"final_energy": {"correlation": -0.2550, "total": -76.0801}},
+            "EOM-CCSD": {"roots": [0.3, 0.4]},
+        }
+    }
+
+
+def test_extract_energy_eom_ccsd_uses_ccsd_ground_state():
+    """EOM runs must report the CCSD ground-state total, not the bare SCF."""
+    for method in ("eom-ccsd", "eom_ccsd"):
+        energy = ExaChemCalculator._extract_energy(_eom_payload(), method)
+        assert energy == pytest.approx(-76.0801)
+
+
+def test_extract_energy_post_hf_method_never_falls_back_to_scf():
+    """A post-HF method with a missing energy block must raise, not return SCF."""
+    from iqc.exachem import CalculationFailed
+
+    scf_only = {"output": {"SCF": {"final_energy": -75.8251}}}
+    for method in ("ccsd", "ccsd(t)", "mp2", "eom-ccsd"):
+        with pytest.raises(CalculationFailed):
+            ExaChemCalculator._extract_energy(scf_only, method)
+    # SCF/HF still read the SCF energy directly.
+    assert ExaChemCalculator._extract_energy(scf_only, "scf") == pytest.approx(
+        -75.8251
+    )
+    assert ExaChemCalculator._extract_energy(scf_only, "hf") == pytest.approx(
+        -75.8251
+    )
+
+
+def test_extract_components_eom_ccsd_total_matches_ccsd():
+    components = ExaChemCalculator._extract_components(_eom_payload(), "eom-ccsd")
+    assert components["total_energy_eV"] == pytest.approx(-76.0801 * _HARTREE_TO_EV)
+    assert components["method"] == "eom_ccsd"
+
+
+def test_archive_failure_does_not_invalidate_result(tmp_path):
+    """A failed artifact archive must not raise out of calculate()."""
+    calc = ExaChemCalculator(directory=str(tmp_path))
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    calc.results = {
+        "energy": -1.0,
+        "artifact_manifest": [{"path": "x", "sha256": "y"}],
+        "run_dir": str(run_dir),
+        "artifact_archive": None,
+    }
+    params = {
+        "artifact_retention": {
+            "enabled": True,
+            # Unwritable destination: forces archive_run_dir to fail.
+            "destination_root": "/proc/does-not-exist/artifacts",
+        }
+    }
+
+    calc._maybe_archive_artifacts(params)
+
+    assert calc.results["energy"] == -1.0
+    assert calc.results["artifact_archive"] is None

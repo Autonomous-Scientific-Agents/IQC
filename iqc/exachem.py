@@ -16,6 +16,7 @@ support is method-dependent and not exposed through this thin wrapper.
 
 from __future__ import annotations
 
+import collections
 import copy
 import fnmatch
 import hashlib
@@ -553,12 +554,23 @@ class ExaChemCalculator(Calculator):
 
         destination_root = retention.get("destination_root")
         compress = bool(retention.get("compress", True))
-        record = archive_run_dir(
-            Path(run_dir),
-            manifest,
-            destination_root=Path(destination_root) if destination_root else None,
-            compress=compress,
-        )
+        # Archival is best-effort: it runs after the energy has already been
+        # computed, and an unwritable/unmounted/full destination must not turn
+        # a completed hours-long calculation into a task error.
+        try:
+            record = archive_run_dir(
+                Path(run_dir),
+                manifest,
+                destination_root=(
+                    Path(destination_root) if destination_root else None
+                ),
+                compress=compress,
+            )
+        except Exception as exc:
+            logging.warning(
+                "ExaChem artifact archival failed (result kept): %s", exc
+            )
+            return
         self.results["artifact_archive"] = record["archive_path"]
         self.results["artifact_archive_sha256"] = record["archive_sha256"]
         self.results["artifact_archive_size_bytes"] = record["archive_size_bytes"]
@@ -873,7 +885,9 @@ class ExaChemCalculator(Calculator):
             t_energies = cc_t.get("(T)Energies") or cc_t.get("[T]Energies")
             if t_energies and "total" in t_energies:
                 return float(t_energies["total"])
-        if method == "ccsd":
+        if method in ("ccsd", "eom-ccsd", "eom_ccsd"):
+            # For EOM-CCSD the calculator energy is the CCSD ground-state
+            # total; excited-state roots stay available in exachem_output.
             ccsd = output.get("CCSD", {}).get("final_energy", {})
             if isinstance(ccsd, dict) and "total" in ccsd:
                 return float(ccsd["total"])
@@ -882,9 +896,13 @@ class ExaChemCalculator(Calculator):
             if "final_energy" in mp2:
                 value = mp2["final_energy"]
                 return float(value["total"] if isinstance(value, dict) else value)
-        scf = output.get("SCF", {})
-        if "final_energy" in scf:
-            return float(scf["final_energy"])
+        # Only SCF/HF runs may report the bare SCF energy. Falling through for
+        # a post-HF method would silently return the uncorrelated energy as
+        # the calculation result (this happened for eom-ccsd runs).
+        if method in ("scf", "hf"):
+            scf = output.get("SCF", {})
+            if "final_energy" in scf:
+                return float(scf["final_energy"])
         raise CalculationFailed(
             f"ExaChem output did not contain a recognized energy for method "
             f"'{method}'. Available keys: {sorted(output)}"
@@ -978,7 +996,10 @@ class ExaChemCalculator(Calculator):
         # ---- Total energy (matches highest level requested) --------------
         if method in ("ccsd_t", "ccsd(t)", "ccsd-t") and t_total_ha is not None:
             total_energy_eV = _ha_to_ev(t_total_ha)
-        elif method == "ccsd" and ccsd_total_ha is not None:
+        elif (
+            method in ("ccsd", "eom-ccsd", "eom_ccsd")
+            and ccsd_total_ha is not None
+        ):
             total_energy_eV = _ha_to_ev(ccsd_total_ha)
         elif method == "mp2" and mp2_total_ha is not None:
             total_energy_eV = _ha_to_ev(mp2_total_ha)
@@ -999,6 +1020,8 @@ class ExaChemCalculator(Calculator):
         method_label = method
         if method in ("ccsd(t)", "ccsd-t"):
             method_label = "ccsd_t"
+        elif method == "eom-ccsd":
+            method_label = "eom_ccsd"
         elif method == "hf":
             method_label = "scf"
 
@@ -1061,12 +1084,14 @@ class ExaChemCalculator(Calculator):
 
     @staticmethod
     def _tail(path: Path, n: int) -> str:
+        # Bounded read: failure logs can be hundreds of MB, and this runs on
+        # every failing worker just to format the exception message.
         try:
             with open(path) as fh:
-                lines = fh.readlines()
+                lines = collections.deque(fh, maxlen=n)
         except OSError:
             return ""
-        return "".join(lines[-n:])
+        return "".join(lines)
 
     # Patterns (case-insensitive fnmatch) that classify per-file artifacts.
     # Order matters: first match wins so that an MO file named ``*.mo`` does
