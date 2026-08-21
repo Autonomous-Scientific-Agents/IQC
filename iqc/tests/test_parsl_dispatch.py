@@ -324,3 +324,33 @@ def test_driver_failure_row_is_indexed_by_skip_existing(tmp_path):
     index, summary = build_completed_calculation_index([out])
     assert summary["records"] == 1
     assert calculation_key_from_record(failure_row) in index
+
+
+def test_build_parsl_config_forwards_one_worker_per_node():
+    """--parsl-one-worker-per-node must reach make_aurora_config: silently
+    dropping it re-enables 12 workers/node, the exact oversubscription the
+    flag exists to prevent for ExaChem runs."""
+    args = argparse.Namespace(
+        parsl_single_alloc=False,
+        parsl_local=False,
+        parsl_venv_activate="source /fake/activate",
+        parsl_nodes=2,
+        parsl_queue="debug",
+        parsl_walltime="0:30:00",
+        parsl_account="ACCT",
+        parsl_retries=1,
+        parsl_one_worker_per_node=True,
+    )
+    captured = {}
+
+    def fake_make_aurora_config(**kwargs):
+        captured.update(kwargs)
+        return "config"
+
+    with mock.patch(
+        "iqc.parsl_config.make_aurora_config", fake_make_aurora_config
+    ):
+        config = pd._build_parsl_config(args)
+
+    assert config == "config"
+    assert captured["one_worker_per_node"] is True

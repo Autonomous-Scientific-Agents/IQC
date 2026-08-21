@@ -468,7 +468,13 @@ def submit_sweep(
         for chunk_path in chunk_paths:
             cp_str = str(chunk_path)
             existing = _registry_chunk_status(conn, cp_str)
-            if existing in {"queued", "running", "completed", "would_submit"}:
+            # would_submit rows come from a --dry-run rehearsal and carry no
+            # PBS job; only a dry run may treat them as already handled —
+            # otherwise the rehearsal permanently blocks the real submission.
+            skip_states = {"queued", "running", "completed"}
+            if dry_run:
+                skip_states.add("would_submit")
+            if existing in skip_states:
                 logger.info("Skipping %s — already recorded as %s.", chunk_path.name, existing)
                 continue
 

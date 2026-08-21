@@ -767,6 +767,7 @@ def main() -> int:
 
     raw_results: dict = {}
     task_ids: list[str] = []
+    cluster_error: Exception | None = None
     try:
         client = ClusterClient(
             checkpoint_dir=checkpoint_dir, checkpoint_timeout=120.0,
@@ -812,6 +813,9 @@ def main() -> int:
         finally:
             client.teardown()
     except Exception as e:  # noqa: BLE001
+        # Remember the failure: rows submitted but never collected must be
+        # persisted as failures below, and the run must exit nonzero.
+        cluster_error = e
         logging.error("Cluster client error: %s", e, exc_info=True)
     finally:
         el.stop()
@@ -821,10 +825,20 @@ def main() -> int:
     failed = 0
     skipped_existing = 0
     bad_inputs = 0
+    _NOT_COLLECTED = object()
     with open(jsonl_file, "w") as outfile:
         for tid in task_ids:
             row_idx = int(tid.split("-")[1])
-            result = raw_results.get(tid)
+            result = raw_results.get(tid, _NOT_COLLECTED)
+            if result is _NOT_COLLECTED:
+                # Submitted but never collected (client.start()/submit()/
+                # result() died): a real failure, not a bad input. Without
+                # this these rows counted as bad_inputs and the run exited 0
+                # with no failure rows written.
+                failed += 1
+                result = cluster_error or RuntimeError(
+                    "row was submitted but never collected from the cluster"
+                )
             if isinstance(result, BaseException):
                 failed += 1
                 failure_row = _synthesize_failure_row(
@@ -884,7 +898,7 @@ def main() -> int:
         insert_jsonl_to_db(jsonl_file, db_path)
 
     logging.info(f"Total time: {time.time() - start_time:.2f}s")
-    return 0 if failed == 0 else 2
+    return 0 if failed == 0 and cluster_error is None else 2
 
 
 def run_cli() -> int:
