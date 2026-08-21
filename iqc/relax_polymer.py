@@ -34,15 +34,17 @@ DENS_TOL  = 0.03           # ±3 %
 
 # ----------------------------------------------------------------------
 def build_calc(name, model):
+    # Delegate to iqc.asetools.get_calculator: the previous direct imports
+    # (ase.calculators.xtb, mace.MACEResponseCalculator, uma.calculator) do
+    # not exist in any released package, so every --ff choice crashed with
+    # ModuleNotFoundError before the first MD step.
+    from iqc.asetools import get_calculator
+
     if name == "xtb":
-        from ase.calculators.xtb import XTB
-        return XTB(method="GFN-FF", accuracy=0.3)
-    if name == "mace":
-        from mace.calculators import mace
-        return mace.MACEResponseCalculator(model)
-    if name == "uma":
-        from uma.calculator import UMA            # pip install uma-calculator
-        return UMA(model_checkpoint=model)
+        return get_calculator("xtb", method="GFN-FF", accuracy=0.3)
+    if name in ("mace", "uma"):
+        kwargs = {"model": model} if model else {}
+        return get_calculator(name, **kwargs)
     raise ValueError(f"Unknown ff '{name}'")
 
 def density_g_cm3(atoms):
@@ -98,10 +100,14 @@ def main():
             print("✅ density within tolerance.")
             break
         # Run NPT
+        # Barostat target is 1 atm in ASE pressure units (eV/A^3). The old
+        # expression passed the target *density* (~1.0) as the pressure —
+        # about 1.6 million atm — violently crushing the box; density
+        # convergence is handled by the surrounding loop, not the barostat.
         dyn2 = NPTBerendsen(atoms, TIMESTEP*units.fs,
                             temperature_K=TARGET_T,
                             taut=100*units.fs,
-                            pressure_au=args.density*1.01325/0.986923,
+                            pressure_au=1.01325*units.bar,
                             taup=1000*units.fs)
         dyn2.run(npt_steps)
         # Optional manual isotropic squeeze if still low

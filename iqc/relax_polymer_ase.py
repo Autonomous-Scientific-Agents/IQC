@@ -12,6 +12,8 @@ Dependencies:  ase >= 3.23, xtb-python (optional, for XTB calculator)
 
 import argparse
 import sys
+from pathlib import Path
+
 import numpy as np
 
 # ASE imports
@@ -168,13 +170,15 @@ class XTBForceOnly(Calculator):
 
     def get_forces(self, atoms):
         """Get forces ensuring no stress is calculated."""
-        if "forces" not in self.results:
+        # check_state: without it the first result was cached forever and an
+        # entire MD run integrated the forces of the initial geometry.
+        if "forces" not in self.results or self.check_state(atoms):
             self.calculate(atoms, ["forces"])
         return self.results["forces"]
 
     def get_potential_energy(self, atoms):
         """Get energy ensuring no stress is calculated."""
-        if "energy" not in self.results:
+        if "energy" not in self.results or self.check_state(atoms):
             self.calculate(atoms, ["energy"])
         return self.results["energy"]
 
@@ -311,27 +315,29 @@ def main():
     total_mass = atoms.get_masses().sum() / AVOGADRO  # g
 
     # ------------------------------------------------------------------
-    # Fix any overlapping atoms before starting MD
-    # For complex organic molecules, need larger minimum distances
-    fix_overlapping_atoms(atoms, min_distance=2.5)
+    # Fix true nuclear overlaps before starting MD. The default 0.8 Å only
+    # separates atoms that are unphysically fused; a larger cutoff (2.5 Å)
+    # treated every covalent bond (C-H 1.1 Å, C-C 1.5 Å) as an overlap and
+    # shredded the molecule's bonding geometry before MD even started.
+    fix_overlapping_atoms(atoms)
 
-    # Additional safety: check distances and expand box if needed
+    # Report (but do not "fix") remaining close contacts: rescaling the cell
+    # with scale_atoms=True would stretch every bond, not just the contacts.
     from ase.neighborlist import neighbor_list
 
     i, j, d = neighbor_list("ijd", atoms, 3.0)
     if len(i) > 0:
         min_dist = d.min()
-        if min_dist < 2.0:
+        if min_dist < 0.8:
             print(
-                f"Warning: Very close atoms detected (min distance: {min_dist:.2f} Å)"
+                f"Warning: Very close atoms remain (min distance: {min_dist:.2f} Å)"
             )
-            print("Expanding box further...")
-            # Expand cell more aggressively
-            atoms.set_cell(atoms.cell * 1.5, scale_atoms=True)
-            print(f"New cell dimensions: {atoms.cell.diagonal()}")
 
-    # Get the volume corresponding to desired density
-    volume_needed = total_mass / args.density  # Å³/g * g = Å³
+    # Get the volume corresponding to desired density.
+    # total_mass [g] / density [g/cm^3] = volume [cm^3]; convert to Å³ —
+    # comparing cm^3 against get_volume()'s Å³ made volume_ratio ~1e-24, so
+    # the density targeting always took the extreme-compression clamp.
+    volume_needed = total_mass / args.density * CM_TO_ANG**3  # Å³
     volume_current = atoms.get_volume()
 
     # Calculator: Choose XTB if available, otherwise LennardJones
@@ -414,7 +420,7 @@ def main():
         print(f"LJ initial scaling: {volume_current:.1f} → {atoms.get_volume():.1f} Å³")
 
     print(f"Final volume: {atoms.get_volume():.1f} Å³")
-    print(f"Final density: {total_mass / atoms.get_volume():.3f} g/cm³")
+    print(f"Final density: {density(atoms, total_mass):.3f} g/cm³")
 
     # ------------------------------------------------------------------
     # Stage 1: soft NVT equilibration
@@ -597,7 +603,7 @@ def main():
     print("\nFinal density = %.3f g/cm³" % final_rho)
 
     # Create output filename based on input
-    input_base = args.input_file.split(".")[0]
+    input_base = str(Path(args.input_file).with_suffix(""))
     output_file = f"{input_base}_equilibrated.pdb"
 
     write(output_file, atoms)

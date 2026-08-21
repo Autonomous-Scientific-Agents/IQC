@@ -86,13 +86,18 @@ def write_packmol_input(
 
 
 def run_packmol(inp: Path):
-    """Run PACKMOL, feeding it the input file as text."""
+    """Run PACKMOL, feeding it the input file on stdin (packmol < input.inp)."""
     print("▶  Running PACKMOL …")
-    result = subprocess.run(
-        ["packmol", str(inp)],
-        capture_output=True,
-        text=True,  #  ← expect string I/O
-    )
+    # PACKMOL reads its input from stdin; passing the file as an argument is
+    # ignored by classic builds, which then hang waiting on an interactive
+    # terminal (or exit on EOF in batch) without packing anything.
+    with open(inp) as inp_handle:
+        result = subprocess.run(
+            ["packmol"],
+            stdin=inp_handle,
+            capture_output=True,
+            text=True,  #  ← expect string I/O
+        )
     print(result.stdout)
     if result.returncode:
         raise RuntimeError(
