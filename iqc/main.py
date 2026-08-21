@@ -839,8 +839,13 @@ def _process_one_row(
                 **ir_params_filtered,
             )
         elif task == "ir-thermo":
-            ignore_imag = args.ignore_imag
             ir_thermo_run_params = {**thermo_params, **ir_params}
+            # CLI flag wins; otherwise honor the params-file setting (the
+            # --ignore-imag help documents both). The key is popped so the
+            # explicit_params filter below doesn't have to drop it.
+            ignore_imag = args.ignore_imag or bool(
+                ir_thermo_run_params.pop("ignore_imag_modes", False)
+            )
             output_dir = _get_work_dir()
             ir_thermo_run_params["vib_dir"] = output_dir
             trajectory_file = None
@@ -893,8 +898,13 @@ def _process_one_row(
                 **ir_thermo_params_filtered,
             )
         elif task == "thermo":
-            ignore_imag = args.ignore_imag
             thermo_run_params = dict(thermo_params)
+            # CLI flag wins; otherwise honor the params-file setting (the
+            # --ignore-imag help documents both). The key is popped so the
+            # explicit_params filter below doesn't have to drop it.
+            ignore_imag = args.ignore_imag or bool(
+                thermo_run_params.pop("ignore_imag_modes", False)
+            )
             output_dir = _get_work_dir()
             thermo_run_params["vib_dir"] = output_dir
             trajectory_file = None
@@ -1402,17 +1412,6 @@ def main():
                 f"Finished combining JSON files in {combine_end - combine_start:.2f} seconds"
             )
             logging.info(f"Combined results saved to {jsonl_file}")
-            try:
-                convert_jsonl_results_to_parquet(jsonl_file)
-            except ValueError as e:
-                logging.warning(f"Skipping parquet conversion: {e}")
-            except Exception as e:
-                logging.error(
-                    f"Failed to convert JSONL results to parquet: {e}",
-                    exc_info=True,
-                )
-                comm.Abort(1)
-            logging.info(f"Total time: {time.time() - start_time} seconds.")
 
         # Wait for rank 0 to finish creating the JSONL file
         comm.Barrier()
@@ -1423,6 +1422,9 @@ def main():
                 logging.error(f"JSONL file not found: {jsonl_file}")
                 comm.Abort(1)
 
+        # Persist to the database BEFORE the parquet conversion: conversion is
+        # a post-processing convenience, and a conversion failure must not
+        # cost the run its database import.
         if db_path and rank == 0:
 
             logging.info(f"Reading from JSONL file: {jsonl_file}")
@@ -1431,6 +1433,21 @@ def main():
 
         elif rank == 0:
             logging.info("No database specified.")
+
+        if rank == 0:
+            try:
+                convert_jsonl_results_to_parquet(jsonl_file)
+            except ValueError as e:
+                logging.warning(f"Skipping parquet conversion: {e}")
+            except Exception as e:
+                # The JSONL results are complete on disk; do not abort the
+                # world (which reported the whole run failed) over a
+                # post-processing step. iqc-jsonl2parquet can be rerun by hand.
+                logging.error(
+                    f"Failed to convert JSONL results to parquet: {e}",
+                    exc_info=True,
+                )
+            logging.info(f"Total time: {time.time() - start_time} seconds.")
 
         return 0
 

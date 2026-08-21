@@ -26,6 +26,9 @@ dependencies = [
     "xlrd",
     "pymatgen",
     "pubchempy",
+    # iqc.main imports yaml at module scope; without this a plain
+    # `pip install .` produced an entry point that died on ModuleNotFoundError.
+    "PyYAML",
 ]
 
 [project.optional-dependencies]
