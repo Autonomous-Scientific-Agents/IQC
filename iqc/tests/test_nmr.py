@@ -390,3 +390,70 @@ def test_cli_parses_smiles_option(monkeypatch):
     args = get_args()
     assert args.task == "single"
     assert args.smiles == "O"
+
+
+def test_build_gaussian_calculator_keeps_ase_command_default(tmp_path, monkeypatch):
+    """Without an explicit command, ASE's 'g16 < PREFIX.com > PREFIX.log'
+    template must be preserved; a bare 'g16' override drops the redirection
+    and Gaussian never reads its input."""
+    from iqc import nmr as nmr_module
+
+    captured = {}
+
+    class FakeGaussian:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "ase.calculators.gaussian.Gaussian", FakeGaussian, raising=True
+    )
+
+    settings = nmr_module.NMRSettings(backend="gaussian")
+    nmr_module.build_backend_calculator(
+        settings=settings,
+        purpose="nmr",
+        directory=tmp_path,
+        job_name="job",
+        nuclei=["1H"],
+    )
+    assert "command" not in captured
+
+    captured.clear()
+    settings = nmr_module.NMRSettings(
+        backend="gaussian", command="g16 < PREFIX.com > PREFIX.log"
+    )
+    nmr_module.build_backend_calculator(
+        settings=settings,
+        purpose="nmr",
+        directory=tmp_path,
+        job_name="job",
+        nuclei=["1H"],
+    )
+    assert captured["command"] == "g16 < PREFIX.com > PREFIX.log"
+
+
+def test_gaussian_calculator_receives_no_atom_indices(tmp_path, monkeypatch):
+    """atom_indices must never reach Gaussian(**kwargs): ASE would render it
+    as a route keyword and crash input generation for every conformer."""
+    from iqc import nmr as nmr_module
+
+    captured = {}
+
+    class FakeGaussian:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "ase.calculators.gaussian.Gaussian", FakeGaussian, raising=True
+    )
+
+    settings = nmr_module.NMRSettings(backend="gaussian")
+    nmr_module.build_backend_calculator(
+        settings=settings,
+        purpose="nmr",
+        directory=tmp_path,
+        job_name="job",
+        nuclei=["1H", "13C"],
+    )
+    assert "atom_indices" not in captured
+    assert captured.get("nmr") == "giao"

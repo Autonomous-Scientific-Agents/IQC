@@ -669,7 +669,6 @@ def build_backend_calculator(
 
         kwargs = {
             "label": str(directory / job_name),
-            "command": command,
             "method": _resolve_method(method, "gaussian"),
             "basis": _resolve_basis(basis, "gaussian"),
             "charge": settings.charge,
@@ -680,6 +679,13 @@ def build_backend_calculator(
             kwargs["scrf"] = scrf
         if purpose == "nmr":
             kwargs["nmr"] = "giao"
+        # Only override ASE's command template when the user supplied one.
+        # ASE's default is "g16 < PREFIX.com > PREFIX.log"; passing a bare
+        # "g16" here would drop the input/output redirection entirely, so
+        # Gaussian never reads the input and never writes the log the parser
+        # expects. A user-supplied command must contain PREFIX placeholders.
+        if settings.command:
+            kwargs["command"] = command
         kwargs.update(calculator_kwargs)
         return Gaussian(**kwargs)
 
@@ -1829,10 +1835,12 @@ def run_nmr_workflow(
                 )
                 continue
 
-            calculator_kwargs = dict(settings.calculator_kwargs)
-            calculator_kwargs["atom_indices"] = atom_indices
+            # NOTE: atom_indices is intentionally NOT forwarded to the
+            # backend calculators. No backend consumes it, and Gaussian would
+            # treat it as a route keyword and crash on input generation; the
+            # per-element nuclei selection is handled by each backend's own
+            # input blocks.
             local_settings = NMRSettings(**asdict(settings))
-            local_settings.calculator_kwargs = calculator_kwargs
 
             calculator = build_backend_calculator(
                 settings=local_settings,
