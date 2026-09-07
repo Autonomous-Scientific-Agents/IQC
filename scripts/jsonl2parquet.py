@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import json
 import gzip
+import os
 import sys
+import tempfile
 from collections import OrderedDict
 from pathlib import Path
 
@@ -68,32 +70,42 @@ def iter_jsonl_records(input_path: Path, warn: bool = True):
 
 
 def collect_field_names_and_schema(input_path: Path) -> tuple[list[str], pa.Schema]:
+    # Infer a schema per batch and unify permissively across the whole file.
+    # A single-example-per-field schema silently corrupted data: a field whose
+    # first non-null value was a JSON integer got an int64 schema, truncating
+    # every later float (-22.943... stored as -22), and a struct field typed
+    # from its first occurrence dropped keys present only in later rows.
+    # Permissive unification promotes int64+double -> double, unions struct
+    # keys, and resolves null-typed fields (e.g. warnings=[] in the first
+    # batch) against later batches that carry values.
     fields = OrderedDict()
-    example = {}
+    schemas = []
+    batch = []
+
+    def batch_schema(rows):
+        # from_pylist infers the schema from the first row's keys only, so
+        # normalize each row to the union of keys seen in this batch.
+        batch_fields = OrderedDict()
+        for row in rows:
+            for key in row:
+                batch_fields.setdefault(key, None)
+        return pa.Table.from_pylist(
+            normalize_rows(rows, list(batch_fields))
+        ).schema
+
     for data in iter_jsonl_records(input_path, warn=False):
-        for key, value in data.items():
+        for key in data:
             fields.setdefault(key, None)
-            if value is None:
-                continue
-            current = example.get(key)
-            # Prefer a non-empty list/dict over an empty one so pyarrow can
-            # type-infer the element. An empty list infers as list<null>,
-            # which then rejects any later non-empty list as "Invalid null
-            # value" (the bug behind the silently skipped UMA parquet
-            # conversions, where row 0 had warnings=[] but later rows had
-            # warnings=["Translational or rotational modes are too high"]).
-            if isinstance(value, (list, dict)) and len(value) == 0:
-                if key not in example:
-                    example[key] = value
-                continue
-            if (
-                key not in example
-                or (isinstance(current, (list, dict)) and len(current) == 0)
-            ):
-                example[key] = value
+        batch.append(data)
+        if len(batch) >= ROWS_PER_BATCH:
+            schemas.append(batch_schema(batch))
+            batch = []
+    if batch:
+        schemas.append(batch_schema(batch))
     field_names = list(fields)
-    schema_row = {field: example.get(field) for field in field_names}
-    schema = pa.Table.from_pylist([schema_row]).schema
+    if not schemas:
+        return field_names, None
+    schema = pa.unify_schemas(schemas, promote_options="permissive")
     # Defensive fallback: if every observation of a list-typed field was
     # empty (so it still infers as list<null>), coerce to list<string>.
     # Real IQC list-typed fields ("warnings", etc.) are list<str>.
@@ -136,27 +148,43 @@ def convert_jsonl_to_parquet(input_file: str, output_file: str = None) -> int:
         raise ValueError(f"No JSON records found in {input_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Stream into a temp file and rename on success so a failure mid-write
+    # (disk full, kill) never leaves a truncated parquet at the target path.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=output_path.name + ".", suffix=".tmp", dir=output_path.parent
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
     rows = []
     writer = None
     total_rows = 0
 
-    for data in iter_jsonl_records(input_path):
-        rows.append(data)
-        total_rows += 1
+    try:
+        for data in iter_jsonl_records(input_path):
+            rows.append(data)
+            total_rows += 1
 
-        if len(rows) >= ROWS_PER_BATCH:
-            writer = write_batch(rows, writer, output_path, field_names, schema)
-            rows = []
+            if len(rows) >= ROWS_PER_BATCH:
+                writer = write_batch(rows, writer, tmp_path, field_names, schema)
+                rows = []
 
-        if total_rows % 100_000 == 0:
-            print(f"Processed {total_rows:,} records...")
+            if total_rows % 100_000 == 0:
+                print(f"Processed {total_rows:,} records...")
 
-    # Last partial batch
-    if rows:
-        writer = write_batch(rows, writer, output_path, field_names, schema)
+        # Last partial batch
+        if rows:
+            writer = write_batch(rows, writer, tmp_path, field_names, schema)
 
-    if writer is not None:
-        writer.close()
+        if writer is not None:
+            writer.close()
+            writer = None
+            os.replace(tmp_path, output_path)
+    finally:
+        try:
+            if writer is not None:
+                writer.close()
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     print(f"Done. Total rows written: {total_rows:,}")
     return 0
@@ -165,7 +193,8 @@ def convert_jsonl_to_parquet(input_file: str, output_file: str = None) -> int:
 def write_batch(rows, writer, output_path: Path, field_names: list[str], schema=None):
     table = pa.Table.from_pylist(normalize_rows(rows, field_names), schema=schema)
 
-    if writer is None:
+    new_writer = writer is None
+    if new_writer:
         writer = pq.ParquetWriter(
             output_path,
             schema=table.schema,
@@ -173,7 +202,13 @@ def write_batch(rows, writer, output_path: Path, field_names: list[str], schema=
             use_dictionary=True,
         )
 
-    writer.write_table(table)
+    try:
+        writer.write_table(table)
+    except BaseException:
+        # The caller cannot close a newly created writer until we return it.
+        if new_writer:
+            writer.close()
+        raise
     return writer
 
 

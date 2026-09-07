@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +25,7 @@ def is_constant_column(column: pa.ChunkedArray) -> tuple[bool, Any]:
 
     Returns:
         (is_constant, constant_value) tuple
-        - is_constant: True if all non-null values are the same
+        - is_constant: True if all values are the same, including nulls
         - constant_value: The constant value, or None if all values are null
     """
     if len(column) == 0:
@@ -40,6 +42,11 @@ def is_constant_column(column: pa.ChunkedArray) -> tuple[bool, Any]:
     # If all values are null, it's constant
     if len(non_null_values) == 0:
         return True, None
+
+    # Nulls carry per-row information; moving [None, value] to metadata
+    # would incorrectly fill the missing value in every downstream reader.
+    if len(non_null_values) != len(values):
+        return False, None
 
     # Get unique non-null values
     # Handle complex types by converting to JSON string for comparison
@@ -104,7 +111,26 @@ def optimize_parquet(input_file: str, output_file: str = None):
 
     if not constant_columns:
         print("\nNo constant columns found. File is already optimized.")
-        return
+        if output_path == input_path:
+            return
+
+    if not columns_to_keep:
+        # Every column is constant (routine for single-row chunk files).
+        # Dropping them all would produce a 0-column table whose row count is
+        # lost on the parquet round-trip — destroying the data when the
+        # default in-place mode overwrites the input. Keep the first column
+        # in the data to anchor the rows.
+        anchor = table.column_names[0]
+        constant_columns.pop(anchor)
+        columns_to_keep = [anchor]
+        print(
+            f"\nAll columns are constant; keeping '{anchor}' in the data "
+            "to preserve the rows."
+        )
+        if not constant_columns:
+            print("Nothing left to move to metadata. File is already optimized.")
+            if output_path == input_path:
+                return
 
     print(f"\nFound {len(constant_columns)} constant column(s)")
     print(f"Keeping {len(columns_to_keep)} variable column(s)")
@@ -116,8 +142,19 @@ def optimize_parquet(input_file: str, output_file: str = None):
     # Get existing metadata if any
     existing_metadata = table.schema.metadata or {}
 
+    # Merge with constants stored by an earlier optimize pass — replacing the
+    # key wholesale would discard the previously moved column values.
+    previous_constants = {}
+    if b"constant_columns" in existing_metadata:
+        try:
+            previous_constants = json.loads(
+                existing_metadata[b"constant_columns"].decode("utf-8")
+            )
+        except (ValueError, UnicodeDecodeError):
+            previous_constants = {}
+
     # Add constant columns to metadata
-    constant_metadata = json.dumps(constant_columns)
+    constant_metadata = json.dumps({**previous_constants, **constant_columns})
     new_metadata = {
         **existing_metadata,
         b"constant_columns": constant_metadata.encode("utf-8"),
@@ -129,12 +166,24 @@ def optimize_parquet(input_file: str, output_file: str = None):
 
     print("\nWriting optimized file...")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(
-        new_table,
-        output_path,
-        compression="zstd",
-        use_dictionary=True,
+    # Write to a temp file and rename so a failure mid-write (disk full,
+    # Ctrl-C) cannot truncate the input when overwriting in place.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=output_path.name + ".", suffix=".tmp", dir=output_path.parent
     )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        pq.write_table(
+            new_table,
+            tmp_path,
+            compression="zstd",
+            use_dictionary=True,
+        )
+        os.replace(tmp_path, output_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
     # Compare file sizes
     new_size = output_path.stat().st_size
