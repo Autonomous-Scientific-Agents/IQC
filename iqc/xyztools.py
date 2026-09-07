@@ -42,6 +42,8 @@ def count_xyz_frames(
             first = fh.readline()
             if not first:  # EOF
                 break
+            if not first.strip():  # stray blank line between/after frames
+                continue
 
             n_atoms = int(first.strip())  # first line
             fh.readline()  # second (comment) line
@@ -93,6 +95,8 @@ def iter_xyz(path: Union[str, pathlib.Path]) -> Iterator[Tuple[int, str, List[st
             first = fh.readline()
             if not first:  # EOF
                 break
+            if not first.strip():  # stray blank line between/after frames
+                continue
 
             n_atoms = int(first.strip())  # fast int conversion
             comment = fh.readline()  # 2nd line (may be metadata)
@@ -189,9 +193,15 @@ class XYZReader:
                     if line_end == -1:
                         break
 
+                    count_line = mmapped_file[pos:line_end]
+                    if not count_line.strip():
+                        # Stray blank line between/after frames.
+                        pos = line_end + 1
+                        continue
+
                     try:
                         # Parse atom count
-                        num_atoms = int(mmapped_file[pos:line_end].decode().strip())
+                        num_atoms = int(count_line.decode().strip())
                     except (ValueError, UnicodeDecodeError):
                         # Without a valid count we cannot resynchronize on the
                         # next frame boundary; stop counting rather than
@@ -228,8 +238,14 @@ class XYZReader:
                     if line_end == -1:
                         break
 
+                    count_line = mmapped_file[pos:line_end]
+                    if not count_line.strip():
+                        # Stray blank line between/after frames.
+                        pos = line_end + 1
+                        continue
+
                     try:
-                        num_atoms = int(mmapped_file[pos:line_end].decode().strip())
+                        num_atoms = int(count_line.decode().strip())
                     except (ValueError, UnicodeDecodeError):
                         # See count_configurations: stop rather than misalign.
                         return atom_counts
@@ -267,6 +283,9 @@ class XYZReader:
                 line = f.readline()
                 if not line:
                     break
+                if not line.strip():
+                    # Stray blank line between/after frames.
+                    continue
 
                 try:
                     num_atoms = int(line.strip())
