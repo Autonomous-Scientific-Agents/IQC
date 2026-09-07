@@ -763,45 +763,51 @@ def main() -> int:
         num_slots,
         num_slots,
     )
-    el.start(wait_time=5)
-
     raw_results: dict = {}
-    task_ids: list[str] = []
+    task_ids = [f"row-{i:07d}" for i in range(number_of_xyz)]
+    cluster_error: Exception | None = None
     try:
+        el.start(wait_time=5)
         client = ClusterClient(
             checkpoint_dir=checkpoint_dir, checkpoint_timeout=120.0,
         )
-        client.start()
         try:
+            client.start()
             futures = {}
             for i in range(number_of_xyz):
                 pk = dict(process_kwargs_base)
                 pk["worker_id"] = i
                 pk["partials_dir"] = partials_dir
                 tid = f"row-{i:07d}"
-                task_ids.append(tid)
-                futures[tid] = client.submit(
-                    Task(
-                        task_id=tid,
-                        nnodes=1,
-                        ppn=1,
-                        executable=_row_callable,
-                        args=(i,),
-                        kwargs=dict(
-                            calc_name=calculator_name,
-                            calc_params=calc_params,
-                            side_cache_path=side_cache_path,
-                            nodes_per_mol=nodes_per_mol,
-                            ppn=ppn,
-                            checkpoint_dir=checkpoint_dir,
-                            process_kwargs=pk,
-                        ),
-                        executor_name="async_loky",
+                try:
+                    futures[tid] = client.submit(
+                        Task(
+                            task_id=tid,
+                            nnodes=1,
+                            ppn=1,
+                            executable=_row_callable,
+                            args=(i,),
+                            kwargs=dict(
+                                calc_name=calculator_name,
+                                calc_params=calc_params,
+                                side_cache_path=side_cache_path,
+                                nodes_per_mol=nodes_per_mol,
+                                ppn=ppn,
+                                checkpoint_dir=checkpoint_dir,
+                                process_kwargs=pk,
+                            ),
+                            executor_name="async_loky",
+                        )
                     )
-                )
+                except Exception as exc:
+                    # Preserve already submitted results before teardown;
+                    # the unsubmitted rows will receive the cluster error.
+                    cluster_error = exc
+                    logging.error("Cluster submission failed: %s", exc, exc_info=True)
+                    break
 
             logging.info(
-                "Submitted %d row(s) to cluster", number_of_xyz,
+                "Submitted %d row(s) to cluster", len(futures),
             )
 
             for tid, fut in futures.items():
@@ -812,19 +818,35 @@ def main() -> int:
         finally:
             client.teardown()
     except Exception as e:  # noqa: BLE001
+        # Remember the failure: rows submitted but never collected must be
+        # persisted as failures below, and the run must exit nonzero.
+        cluster_error = e
         logging.error("Cluster client error: %s", e, exc_info=True)
     finally:
-        el.stop()
+        try:
+            el.stop()
+        except Exception as exc:
+            cluster_error = cluster_error or exc
+            logging.error("Cluster shutdown failed: %s", exc, exc_info=True)
 
     jsonl_file = f"iqc_{task}_results_{run_id}.jsonl"
     completed = 0
     failed = 0
     skipped_existing = 0
     bad_inputs = 0
+    _NOT_COLLECTED = object()
     with open(jsonl_file, "w") as outfile:
         for tid in task_ids:
             row_idx = int(tid.split("-")[1])
-            result = raw_results.get(tid)
+            result = raw_results.get(tid, _NOT_COLLECTED)
+            if result is _NOT_COLLECTED:
+                # Submitted but never collected (client.start()/submit()/
+                # result() died): a real failure, not a bad input. Without
+                # this these rows counted as bad_inputs and the run exited 0
+                # with no failure rows written.
+                result = cluster_error or RuntimeError(
+                    "row was submitted but never collected from the cluster"
+                )
             if isinstance(result, BaseException):
                 failed += 1
                 failure_row = _synthesize_failure_row(
@@ -884,7 +906,7 @@ def main() -> int:
         insert_jsonl_to_db(jsonl_file, db_path)
 
     logging.info(f"Total time: {time.time() - start_time:.2f}s")
-    return 0 if failed == 0 else 2
+    return 0 if failed == 0 and cluster_error is None else 2
 
 
 def run_cli() -> int:

@@ -522,6 +522,7 @@ def _build_parsl_config(args):
         account=args.parsl_account,
         execute_dir=os.getcwd(),
         retries=args.parsl_retries,
+        one_worker_per_node=getattr(args, "parsl_one_worker_per_node", False),
     )
 
 

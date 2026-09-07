@@ -160,7 +160,10 @@ def _iter_record_timings(
                 logger.warning("could not read %s: %s", jsonl_path, e)
 
 
-_HEAVY_FORMULA_RE = re.compile(r"([A-GI-Z][a-z]?)(\d*)")
+# Match every element symbol; hydrogen is skipped in the loop below.
+# ([A-GI-Z] excluded H as a first letter, which also dropped He/Hf/Hg/Ho/Hs
+# and shifted those molecules into the wrong timing bucket.)
+_HEAVY_FORMULA_RE = re.compile(r"([A-Z][a-z]?)(\d*)")
 
 
 def _heavy_from_formula(formula: str) -> Optional[int]:

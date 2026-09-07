@@ -130,14 +130,48 @@ def test_submit_sweep_skips_already_recorded_chunks(tmp_path):
     chunks = so.chunk_inputs(src, chunk_size_hint=100, output_dir=tmp_path / "out")
     registry = tmp_path / "reg.sqlite"
 
-    # First pass records all as would_submit.
+    # A repeated dry run leaves existing would_submit rows alone.
     with mock.patch.object(so, "_qsub") as q, mock.patch.object(
         so, "_count_user_queued_jobs", return_value=0
     ):
         so.submit_sweep(chunks, registry_db=registry, dry_run=True)
-        # Second pass should leave existing rows alone (no qsub, no errors).
-        so.submit_sweep(chunks, registry_db=registry, dry_run=False)
+        so.submit_sweep(chunks, registry_db=registry, dry_run=True)
         q.assert_not_called()
+
+
+def test_submit_sweep_dry_run_does_not_block_real_submit(tmp_path):
+    """A --dry-run rehearsal must not poison the registry: the later real
+    submit has to qsub every chunk the rehearsal recorded as would_submit."""
+    src = _write_parquet(tmp_path / "in.parquet", num_rows=200, with_heavy=False)
+    chunks = so.chunk_inputs(src, chunk_size_hint=100, output_dir=tmp_path / "out")
+    registry = tmp_path / "reg.sqlite"
+
+    with mock.patch.object(
+        so, "_qsub", return_value="123.aurora"
+    ) as q, mock.patch.object(
+        so, "_count_user_queued_jobs", return_value=0
+    ), mock.patch.object(so, "_refresh_states"):
+        so.submit_sweep(
+            chunks,
+            registry_db=registry,
+            dry_run=True,
+            script_dir=tmp_path / "scripts",
+            log_dir=tmp_path / "logs",
+        )
+        q.assert_not_called()
+
+        so.submit_sweep(
+            chunks,
+            registry_db=registry,
+            dry_run=False,
+            script_dir=tmp_path / "scripts",
+            log_dir=tmp_path / "logs",
+        )
+        assert q.call_count == len(chunks)
+
+    snap = so.status(registry)
+    assert snap["counts"].get("queued", 0) == len(chunks)
+    assert snap["counts"].get("would_submit", 0) == 0
 
 
 def test_submit_sweep_records_qsub_failure_and_continues(tmp_path):
