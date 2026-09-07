@@ -93,6 +93,13 @@ class XTBForceOnly(Calculator):
         self._cached_results = {}
 
     def calculate(self, atoms=None, properties=["energy"], system_changes=all_changes):
+        if system_changes:
+            # Calculator.calculate updates self.atoms but does not clear
+            # results. Invalidate every property together so refreshing forces
+            # cannot make an old energy look current (or vice versa).
+            self.results = {}
+            self._cached_results = {}
+            self.xtb_calc.results = {}
         Calculator.calculate(self, atoms, properties, system_changes)
 
         # Force only energy and forces - never ask for stress
@@ -170,17 +177,11 @@ class XTBForceOnly(Calculator):
 
     def get_forces(self, atoms):
         """Get forces ensuring no stress is calculated."""
-        # check_state: without it the first result was cached forever and an
-        # entire MD run integrated the forces of the initial geometry.
-        if "forces" not in self.results or self.check_state(atoms):
-            self.calculate(atoms, ["forces"])
-        return self.results["forces"]
+        return self.get_property("forces", atoms)
 
-    def get_potential_energy(self, atoms):
+    def get_potential_energy(self, atoms, force_consistent=False):
         """Get energy ensuring no stress is calculated."""
-        if "energy" not in self.results or self.check_state(atoms):
-            self.calculate(atoms, ["energy"])
-        return self.results["energy"]
+        return self.get_property("energy", atoms)
 
 
 class XTBDirect(Calculator):

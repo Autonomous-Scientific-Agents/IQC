@@ -11,6 +11,51 @@ from iqc.relax_polymer_ase import fix_overlapping_atoms
 from iqc import packmoltools
 
 
+@pytest.mark.parametrize("first", ["energy", "forces"])
+def test_xtb_wrapper_refreshes_all_properties_on_movement(monkeypatch, first):
+    from ase import Atoms
+    from ase.calculators.calculator import Calculator, all_changes
+    from iqc import relax_polymer_ase as polymer
+
+    class FakeXTB(Calculator):
+        implemented_properties = ["energy", "forces"]
+
+        def calculate(self, atoms=None, properties=("energy",), system_changes=all_changes):
+            super().calculate(atoms, properties, system_changes)
+            self.results = {"energy": float((atoms.positions ** 2).sum()), "forces": -2 * atoms.positions.copy()}
+
+    monkeypatch.setattr(polymer, "HAS_XTB", True)
+    monkeypatch.setattr(polymer, "XTB", FakeXTB)
+    atoms = Atoms("H", positions=[[1, 0, 0]], calculator=polymer.XTBForceOnly())
+    atoms.get_potential_energy()
+    atoms.get_forces()
+    atoms.positions[0, 0] = 2
+    if first == "energy":
+        atoms.get_potential_energy()
+    else:
+        atoms.get_forces()
+    assert atoms.get_potential_energy() == pytest.approx(4)
+    assert np.allclose(atoms.get_forces(), [[-4, 0, 0]])
+
+
+def test_polymer_npt_takes_real_ase_step(tmp_path, monkeypatch):
+    from ase.build import bulk
+    from ase.calculators.emt import EMT
+    from iqc import relax_polymer as polymer
+
+    atoms = bulk("Cu", cubic=True)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(polymer.aio, "read", lambda _: atoms)
+    monkeypatch.setattr(polymer, "build_calc", lambda *args: EMT())
+    monkeypatch.setattr(polymer, "NVT_TIME", 0.001)
+    monkeypatch.setattr(polymer, "NPT_TIME", 0.001)
+    densities = iter([0.5, 1.0])
+    monkeypatch.setattr(polymer, "density_g_cm3", lambda _: next(densities))
+    monkeypatch.setattr("sys.argv", ["relax", "copper.xyz", "--ff", "xtb", "--scale", "1"])
+    polymer.main()
+    assert (tmp_path / "copper_relaxed.xyz").exists()
+
+
 def test_fix_overlapping_atoms_default_keeps_bonds_intact():
     """The default 0.8 A cutoff must not touch normal covalent bonds.
 

@@ -62,7 +62,11 @@ def main():
                    help="target density g cm⁻³")
     p.add_argument("--scale", type=float, default=1.3,
                    help="initial box inflation factor")
+    p.add_argument("--compressibility", type=float, default=4.5e-5,
+                   help="Berendsen compressibility in bar^-1 (default: 4.5e-5; adjust for your material)")
     args = p.parse_args()
+    if not math.isfinite(args.compressibility) or args.compressibility <= 0:
+        p.error("--compressibility must be finite and positive")
 
     atoms = aio.read(args.structure)
     atoms.set_pbc(True)
@@ -108,6 +112,7 @@ def main():
                             temperature_K=TARGET_T,
                             taut=100*units.fs,
                             pressure_au=1.01325*units.bar,
+                            compressibility_au=args.compressibility/units.bar,
                             taup=1000*units.fs)
         dyn2.run(npt_steps)
         # Optional manual isotropic squeeze if still low
@@ -124,4 +129,3 @@ def main():
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     main()
-
