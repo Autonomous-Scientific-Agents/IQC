@@ -49,6 +49,11 @@ def get_args(argv=None):
         description="""
     Command line arguments for IQC
     """,
+        # Prefix abbreviations (e.g. --smile for --smiles) would diverge from
+        # _explicit_option_names' raw-argv scan below: argparse would set
+        # args.smiles while the explicit-option detection missed it, silently
+        # rerouting the run to the default opt_xyz column — wrong structures.
+        allow_abbrev=False,
     )
 
     parser.add_argument(
@@ -391,7 +396,19 @@ def get_args(argv=None):
     explicit_options = _explicit_option_names(sys.argv[1:] if argv is None else argv)
     explicit_xyz = bool(explicit_options.intersection({"-x", "--xyz"}))
     explicit_smiles = "--smiles" in explicit_options
-    args.input_only = bool(args.input) and explicit_options <= {"-i", "--input"}
+    # Inspection mode: --input with nothing that changes what would be
+    # computed. Purely diagnostic options (logging, scratch location) must not
+    # silently convert "inspect this file" into a full default-task
+    # calculation over every row.
+    non_behavioral = {
+        "-l",
+        "--loglevel",
+        "-f",
+        "--logfile",
+        "--scratch",
+    }
+    behavioral_options = explicit_options - non_behavioral
+    args.input_only = bool(args.input) and behavioral_options <= {"-i", "--input"}
     if args.input and not args.input_only and not explicit_xyz and not explicit_smiles:
         args.xyz = "opt_xyz"
         args.input_xyz_column = True

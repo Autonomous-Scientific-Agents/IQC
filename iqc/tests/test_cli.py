@@ -1,3 +1,5 @@
+import pytest
+
 from iqc.cli import get_args
 
 
@@ -68,3 +70,24 @@ def test_artifact_root_honors_env_var(monkeypatch):
     finally:
         monkeypatch.delenv("IQC_ARTIFACT_ROOT", raising=False)
         importlib.reload(cli_module)
+
+
+def test_abbreviated_options_are_rejected():
+    """--smile must not parse: with abbreviations enabled, argparse set
+    args.smiles while the explicit-option scan missed it, silently rerouting
+    the run to the default opt_xyz column (wrong structures, no error)."""
+    with pytest.raises(SystemExit):
+        get_args(["-i", "data.parquet", "--smile", "smi_col", "-t", "opt"])
+
+
+def test_input_only_survives_diagnostic_options():
+    """Logging/scratch options must not turn inspection into a full run."""
+    args = get_args(["-l", "DEBUG", "-i", "results.parquet"])
+    assert args.input_only is True
+
+    args = get_args(["-i", "results.parquet", "--scratch", "/tmp/x"])
+    assert args.input_only is True
+
+    # Behavioral options still trigger a real calculation.
+    args = get_args(["-i", "results.parquet", "-t", "opt", "--xyz", "geo"])
+    assert args.input_only is False
