@@ -806,6 +806,9 @@ class NumericalForceCalculator:
             atoms.get_positions().tobytes(),
             atoms.numbers.tobytes(),
             atoms.cell.array.tobytes(),
+            atoms.pbc.tobytes(),
+            atoms.get_initial_charges().tobytes(),
+            atoms.get_initial_magnetic_moments().tobytes(),
         )
 
     def get_forces(self, atoms=None):

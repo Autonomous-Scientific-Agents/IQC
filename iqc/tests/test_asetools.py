@@ -1560,6 +1560,30 @@ def test_numerical_force_calculator_caches_repeated_stencils(water_atoms):
     assert CountingEnergyCalculator.calls > calls_after_first
 
 
+@pytest.mark.parametrize("state", ["pbc", "charges", "magmoms"])
+def test_numerical_force_cache_invalidates_electronic_and_periodic_state(state):
+    from iqc.asetools import NumericalForceCalculator
+
+    class StateEnergy(Calculator):
+        implemented_properties = ["energy"]
+
+        def calculate(self, atoms=None, properties=("energy",), system_changes=all_changes):
+            super().calculate(atoms, properties, system_changes)
+            factor = 1 + atoms.pbc.sum() + atoms.get_initial_charges().sum() + atoms.get_initial_magnetic_moments().sum()
+            self.results["energy"] = float(factor * (atoms.positions ** 2).sum())
+
+    atoms = Atoms("H", positions=[[1, 0, 0]], cell=[5, 5, 5])
+    calc = NumericalForceCalculator(StateEnergy())
+    first = calc.get_forces(atoms)
+    if state == "pbc":
+        atoms.set_pbc(True)
+    elif state == "charges":
+        atoms.set_initial_charges([1])
+    else:
+        atoms.set_initial_magnetic_moments([1])
+    assert not np.allclose(calc.get_forces(atoms), first)
+
+
 def test_run_vibrations_optimize_false_attaches_calculator(tmp_path):
     """With optimize=False, the passed calculator must reach ASE Vibrations.
 
