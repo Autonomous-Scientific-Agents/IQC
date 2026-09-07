@@ -168,6 +168,18 @@ def _synthesize_failure_row(
             atoms = get_atoms_from_xyz(xyz_file)
         else:
             atoms = get_atoms_from_xyz(xyz_file, index=xyz_index)
+        from iqc.electronic_state import set_electronic_state
+
+        input_params = yaml.safe_load(params_str) or {}
+        mult = getattr(args, "multiplicity", None)
+        charge = getattr(args, "charge", None)
+        if task == "nmr":
+            nmr_params = input_params.get("nmr_params", {})
+            mult = mult if mult is not None else nmr_params.get("multiplicity")
+            charge = charge if charge is not None else nmr_params.get("charge")
+        set_electronic_state(
+            atoms, mult, charge, input_params.get("calculator_params", {})
+        )
         initial_xyz = atoms2xyz(atoms)
     except Exception as load_err:  # noqa: BLE001 — best-effort hash material
         logging.warning(

@@ -166,6 +166,8 @@ def _record_status(record):
     # Soft in-task failures (e.g. "Missing vibrational energies") are recorded
     # in the plain "error" field by the asetools task runners without raising,
     # so no ``{task}_error`` key is ever set for them.
+    if record.get("nonphysical") or record.get("opt_converged") is False:
+        return "error"
     if record.get("error"):
         return "error"
     # Fallback: scan for any *_error key with truthy value (defensive against
@@ -627,6 +629,25 @@ def _process_one_row(
         )
         return None
 
+    from iqc.electronic_state import set_electronic_state
+
+    # Preserve explicit overrides in the XYZ identity before skip/retry lookup.
+    # Invalid states are surfaced in the task result by calculator preparation.
+    ase_multiplicity = getattr(args, "multiplicity", None)
+    ase_charge = getattr(args, "charge", None)
+    if task == "nmr":
+        if ase_multiplicity is None:
+            ase_multiplicity = nmr_params.get("multiplicity")
+        if ase_charge is None:
+            ase_charge = nmr_params.get("charge")
+    state_error = ""
+    try:
+        ase_charge, ase_multiplicity = set_electronic_state(
+            atoms, ase_multiplicity, ase_charge, calc_params
+        )
+    except ValueError as exc:
+        state_error = str(exc)
+
     # --- Initial result metadata --------------------------------------------
     # NOTE: ExaChem-specific energy components and method metadata
     # (scf_energy_eV, mp2_correlation_eV, ccsd_correlation_eV,
@@ -658,12 +679,12 @@ def _process_one_row(
         "task": task,
         "calculator": calculator_name,
         "model": model_name,
-        "initial_xyz": atoms2xyz(atoms),
+        "initial_xyz": atoms2xyz(atoms) if not state_error else "",
         "params": params_str,
     }
 
     # --- Skip-existing -------------------------------------------------------
-    if args.skip_existing:
+    if args.skip_existing and not state_error:
         current_key = calculation_key(
             results["initial_xyz"],
             results["params"],
@@ -709,20 +730,10 @@ def _process_one_row(
             return direct_work_dir
         return rank_output_dir_factory()
 
-    # --- Resolve charge / multiplicity --------------------------------------
-    ase_multiplicity = (
-        args.multiplicity
-        if getattr(args, "multiplicity", None) is not None
-        else atoms.info.get("multiplicity")
-    )
-    ase_charge = (
-        args.charge
-        if getattr(args, "charge", None) is not None
-        else int(atoms.info.get("charge", 0))
-    )
-
     # --- Dispatch task -------------------------------------------------------
     try:
+        if state_error:
+            raise ValueError(state_error)
         if task == "single":
             atoms, task_results = run_single_point(
                 atoms=atoms,

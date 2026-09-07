@@ -264,7 +264,8 @@ H -0.240000 0.930000 0.000000
     assert optimized.atoms.get_chemical_formula() == "H2O"
 
 
-def test_run_nmr_workflow_writes_outputs(tmp_path, monkeypatch):
+@pytest.mark.parametrize("incomplete_second", [False, True])
+def test_run_nmr_workflow_writes_outputs(tmp_path, monkeypatch, incomplete_second):
     atoms = Atoms(
         "CH4",
         positions=[
@@ -295,6 +296,8 @@ def test_run_nmr_workflow_writes_outputs(tmp_path, monkeypatch):
             }
             for i in range(1, 5)
         )
+        if incomplete_second and fake_parse_output.calls == 2:
+            rows.pop()
         return rows, {"energy_eV": None}
 
     monkeypatch.setattr(
@@ -319,8 +322,11 @@ def test_run_nmr_workflow_writes_outputs(tmp_path, monkeypatch):
 
     assert final_atoms.get_chemical_formula() == "CH4"
     assert results["error"] == ""
-    assert results["nmr_num_conformers_used"] == 2
-    assert len(results["nmr_atom_results"]) == 10
+    assert results["nmr_num_conformers_used"] == (1 if incomplete_second else 2)
+    assert len(results["nmr_atom_results"]) == (5 if incomplete_second else 10)
+    if incomplete_second:
+        assert any("Incomplete" in warning for warning in results["warnings"])
+        assert all(row["boltzmann_weight"] == 1.0 for row in results["nmr_atom_results"])
     assert Path(results["nmr_spectrum_plot"]).exists()
     assert Path(results["nmr_interactive_html"]).exists()
     assert Path(results["nmr_atom_results_csv"]).exists()
@@ -457,3 +463,40 @@ def test_gaussian_calculator_receives_no_atom_indices(tmp_path, monkeypatch):
     )
     assert "atom_indices" not in captured
     assert captured.get("nmr") == "giao"
+
+
+@pytest.mark.parametrize("temperature", [0, -1, float("nan"), float("inf")])
+def test_nonphysical_nmr_temperature_is_rejected(temperature):
+    from iqc.nmr import _compute_boltzmann_weights
+
+    with pytest.raises(ValueError, match="finite and positive"):
+        build_nmr_settings(temperature=temperature)
+    with pytest.raises(ValueError, match="finite and positive"):
+        _compute_boltzmann_weights([], temperature)
+
+
+def test_nmr_weights_never_mix_force_field_and_electronic_energies():
+    from iqc.nmr import _compute_boltzmann_weights
+
+    candidates = [
+        ConformerCandidate(
+            0, Atoms("H2"), initial_energy_eV=0.1, optimization_energy_eV=-30
+        ),
+        ConformerCandidate(1, Atoms("H2"), initial_energy_eV=0.1),
+    ]
+    assert _compute_boltzmann_weights(candidates, 298.15) == pytest.approx([0.5, 0.5])
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [],
+        [{"atom_index": 0, "element": "H", "isotropic_shielding_ppm": float("nan")}],
+        [{"atom_index": 0, "element": "H", "isotropic_shielding_ppm": 30}] * 2,
+    ],
+)
+def test_invalid_shielding_output_cannot_enter_average(rows):
+    from iqc.nmr import _validate_shielding_rows
+
+    with pytest.raises(ValueError):
+        _validate_shielding_rows(Atoms("H2"), rows, {"H": "1H"})

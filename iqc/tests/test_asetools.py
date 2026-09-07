@@ -170,7 +170,7 @@ def test_apply_spin_charge_xtb_convention():
         pass
 
     FakeXTB.__name__ = "XTB"
-    atoms = Atoms("OH", positions=[[0, 0, 0], [0, 0, 1]])
+    atoms = Atoms("O2", positions=[[0, 0, 0], [0, 0, 1.2]])
     mult = apply_spin_charge(atoms, FakeXTB(), multiplicity=2, charge=-1)
     assert mult == 2
     assert int(round(atoms.get_initial_charges().sum())) == -1
@@ -197,9 +197,9 @@ def test_apply_spin_charge_mace_polar_convention():
         _iqc_spin_charge_convention = "mace_polar"
 
     atoms = Atoms("O2", positions=[[0, 0, 0], [0, 0, 1.2]])
-    apply_spin_charge(atoms, FakeMACEPolar(), multiplicity=3, charge=-1)
+    apply_spin_charge(atoms, FakeMACEPolar(), multiplicity=3, charge=-2)
 
-    assert atoms.info["charge"] == -1
+    assert atoms.info["charge"] == -2
     assert atoms.info["spin"] == 1.0
     assert atoms.info["external_field"] == [0.0, 0.0, 0.0]
 
@@ -212,7 +212,7 @@ def test_apply_spin_charge_orca_convention():
             self.parameters = {}
 
     calc = ORCA()
-    atoms = Atoms("OH", positions=[[0, 0, 0], [0, 0, 1]])
+    atoms = Atoms("O2", positions=[[0, 0, 0], [0, 0, 1.2]])
     apply_spin_charge(atoms, calc, multiplicity=2, charge=-1)
 
     assert calc.parameters["charge"] == -1
@@ -399,7 +399,7 @@ def test_apply_spin_charge_emt_warns(caplog):
 
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        apply_spin_charge(atoms, EMT(), multiplicity=3, charge=-1)
+        apply_spin_charge(atoms, EMT(), multiplicity=3, charge=-2)
     assert any("does not support" in r.message for r in caplog.records)
 
 
