@@ -1520,3 +1520,138 @@ def test_run_ir_falls_back_to_single_calculator(tmp_path, monkeypatch):
     assert calls["forces"] > 0
     assert calls["dipole"] > 0
     assert results["error"] == ""
+
+
+def test_numerical_force_calculator_caches_repeated_stencils(water_atoms):
+    """Repeated get_forces() at the same geometry must reuse the FD stencil.
+
+    ASE optimizers call get_forces several times per step; without caching an
+    energy-only backend pays the full 6*N single-point stencil each time.
+    """
+    from iqc.asetools import NumericalForceCalculator
+
+    class CountingEnergyCalculator(Calculator):
+        implemented_properties = ["energy"]
+        calls = 0
+
+        def calculate(
+            self, atoms=None, properties=("energy",), system_changes=all_changes
+        ):
+            super().calculate(atoms, properties, system_changes)
+            CountingEnergyCalculator.calls += 1
+            self.results["energy"] = float(
+                (self.atoms.get_positions() ** 2).sum()
+            )
+
+    atoms = water_atoms.copy()
+    wrapper = NumericalForceCalculator(CountingEnergyCalculator())
+
+    first = wrapper.get_forces(atoms)
+    calls_after_first = CountingEnergyCalculator.calls
+    second = wrapper.get_forces(atoms)
+
+    assert CountingEnergyCalculator.calls == calls_after_first
+    assert np.allclose(first, second)
+
+    # A new geometry must invalidate the cache.
+    moved = atoms.copy()
+    moved.positions[0] += 0.1
+    wrapper.get_forces(moved)
+    assert CountingEnergyCalculator.calls > calls_after_first
+
+
+@pytest.mark.parametrize("state", ["pbc", "charges", "magmoms"])
+def test_numerical_force_cache_invalidates_electronic_and_periodic_state(state):
+    from iqc.asetools import NumericalForceCalculator
+
+    class StateEnergy(Calculator):
+        implemented_properties = ["energy"]
+
+        def calculate(self, atoms=None, properties=("energy",), system_changes=all_changes):
+            super().calculate(atoms, properties, system_changes)
+            factor = 1 + atoms.pbc.sum() + atoms.get_initial_charges().sum() + atoms.get_initial_magnetic_moments().sum()
+            self.results["energy"] = float(factor * (atoms.positions ** 2).sum())
+
+    atoms = Atoms("H", positions=[[1, 0, 0]], cell=[5, 5, 5])
+    calc = NumericalForceCalculator(StateEnergy())
+    first = calc.get_forces(atoms)
+    if state == "pbc":
+        atoms.set_pbc(True)
+    elif state == "charges":
+        atoms.set_initial_charges([1])
+    else:
+        atoms.set_initial_magnetic_moments([1])
+    assert not np.allclose(calc.get_forces(atoms), first)
+
+
+def test_run_vibrations_optimize_false_attaches_calculator(tmp_path):
+    """With optimize=False, the passed calculator must reach ASE Vibrations.
+
+    Previously atoms.calc stayed None (crash: 'NoneType' object has no
+    attribute 'get_forces') or a stale calculator computed the Hessian.
+    """
+    h2 = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]])
+    _, results = run_vibrations(
+        h2, calculator=EMT(), optimize=False, vib_dir=tmp_path / "vib"
+    )
+
+    assert results["error"] == ""
+    assert results.get("vib_energies"), results
+    assert h2.calc is not None
+
+
+def test_run_single_point_orca_without_engrad_runs_scf_once(water_atoms):
+    """ORCA advertises forces even without ENGRAD; probing them must not
+    trigger a second full SCF."""
+
+    class ORCA(Calculator):
+        implemented_properties = ["energy", "forces"]
+        calculate_calls = 0
+
+        def __init__(self):
+            super().__init__()
+            self.parameters["orcasimpleinput"] = "HF def2-SVP"
+
+        def calculate(
+            self, atoms=None, properties=("energy",), system_changes=all_changes
+        ):
+            super().calculate(atoms, properties, system_changes)
+            ORCA.calculate_calls += 1
+            self.results["energy"] = -1.23
+            if "forces" in properties:
+                raise PropertyNotPresent("forces")
+
+    atoms, results = run_single_point(
+        atoms=water_atoms.copy(), calculator=ORCA(), unique_name="water"
+    )
+
+    assert results["error"] == ""
+    assert results["energy_eV"] == pytest.approx(-1.23)
+    assert results["forces"] == []
+    assert ORCA.calculate_calls == 1
+    assert any("ENGRAD" in item for item in results["warnings"])
+
+
+def test_mace_dispersion_downgrade_is_recorded(monkeypatch):
+    """A dispersion-init failure may retry without dispersion, but the row
+    label must record the changed level of theory."""
+    from iqc import asetools as asetools_module
+
+    class FakeMace(Calculator):
+        implemented_properties = ["energy", "forces"]
+
+    def fake_mace_mp(**kwargs):
+        if kwargs.get("dispersion"):
+            raise RuntimeError("Please install torch-dftd")
+        return FakeMace()
+
+    fake_module = types.SimpleNamespace(mace_mp=fake_mace_mp)
+    monkeypatch.setitem(sys.modules, "mace", types.SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "mace.calculators", fake_module)
+    monkeypatch.setattr(
+        asetools_module, "_patch_e3nn_mace_compatibility", lambda: None
+    )
+
+    calculator = asetools_module.get_calculator("mace")
+
+    assert calculator.model_name == "large-no-dispersion"

@@ -383,6 +383,14 @@ def _ensure_orca_engrad_for_forces(calculator):
     return True
 
 
+def _orca_requests_engrad(calculator):
+    """Return True when the ORCA input already asks for the gradient."""
+
+    parameters = getattr(calculator, "parameters", None) or {}
+    simpleinput = str(parameters.get("orcasimpleinput") or "")
+    return bool(re.search(r"(?i)(^|\s)engrad($|\s)", simpleinput))
+
+
 def _safe_path_component(value):
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())
     return safe.strip("._") or "calc"
@@ -766,6 +774,11 @@ class NumericalForceCalculator:
         self.force_consistent = bool(force_consistent)
         self.results: dict = {}
         self.atoms = None
+        # (geometry key, forces) of the last finite-difference evaluation.
+        # ASE optimizers call get_forces() several times per step at the same
+        # geometry; without this cache every call re-runs the full 6*N-single-
+        # point stencil (measured ~3x the necessary single points per step).
+        self._fd_forces_cache = None
         # Expose the inner calculator's IQC hints + parameter dict.
         self.parameters = getattr(calc, "parameters", {})
         self._iqc_calculator_family = getattr(calc, "_iqc_calculator_family", None)
@@ -787,15 +800,31 @@ class NumericalForceCalculator:
         target = atoms if atoms is not None else self.atoms
         return self.calc.get_potential_energy(target)
 
+    @staticmethod
+    def _geometry_key(atoms):
+        return (
+            atoms.get_positions().tobytes(),
+            atoms.numbers.tobytes(),
+            atoms.cell.array.tobytes(),
+            atoms.pbc.tobytes(),
+            atoms.get_initial_charges().tobytes(),
+            atoms.get_initial_magnetic_moments().tobytes(),
+        )
+
     def get_forces(self, atoms=None):
         from ase.calculators.fd import calculate_numerical_forces
 
         target = atoms if atoms is not None else self.atoms
+        key = self._geometry_key(target)
+        if self._fd_forces_cache is not None and self._fd_forces_cache[0] == key:
+            return self._fd_forces_cache[1].copy()
         work = target.copy()
         work.calc = self.calc
-        return calculate_numerical_forces(
+        forces = calculate_numerical_forces(
             work, eps=self.eps_disp, force_consistent=self.force_consistent
         )
+        self._fd_forces_cache = (key, forces)
+        return forces.copy()
 
     def get_property(self, name, atoms=None, allow_calculation=True):
         target = atoms if atoms is not None else self.atoms
@@ -827,6 +856,7 @@ class NumericalForceCalculator:
 
     def reset(self):
         self.results = {}
+        self._fd_forces_cache = None
         if hasattr(self.calc, "reset"):
             self.calc.reset()
 
@@ -899,14 +929,25 @@ def get_calculator(name="mace", **kwargs):
                 calculator.model_name = mace_kwargs["model"]
                 logging.info(f"Using MACE calculator with arguments: {mace_kwargs}")
             except Exception as e:
-                # Try without dispersion if the first attempt failed
+                # Retrying without dispersion changes the level of theory
+                # (energies lose the D3 contribution), so it must never be
+                # silent: skip the retry when dispersion was already off, and
+                # record the downgrade in model_name so persisted rows are
+                # distinguishable from dispersion-on results.
+                if not mace_kwargs.get("dispersion"):
+                    raise
                 logging.warning(
                     f"Failed to initialize MACE with dispersion={mace_kwargs.get('dispersion')}: {str(e)}. Trying with dispersion=False."
                 )
                 mace_kwargs["dispersion"] = False
                 calculator = mace_mp(**mace_kwargs)
-                calculator.model_name = mace_kwargs["model"]
-                logging.info(f"Using MACE calculator with arguments: {mace_kwargs}")
+                calculator.model_name = f"{mace_kwargs['model']}-no-dispersion"
+                logging.warning(
+                    "MACE initialized WITHOUT dispersion after the dispersion "
+                    "setup failed; energies exclude the D3 correction and rows "
+                    "are labeled model=%s.",
+                    calculator.model_name,
+                )
         except ImportError as e:
             raise RuntimeError(
                 "MACE not found. Install with 'pip install mace' (or `iqc[mace]`)."
@@ -2643,6 +2684,16 @@ def run_single_point(
             )
             results["warnings"].append(warning)
             logging.warning(warning)
+        elif _is_orca_calculator(calc) and not _orca_requests_engrad(calc):
+            # ORCA advertises "forces" in implemented_properties even when the
+            # input has no ENGRAD, so atoms.get_forces() would re-run the
+            # entire SCF a second time only to raise PropertyNotImplementedError.
+            warning = (
+                "Forces were not requested from ORCA (no ENGRAD in "
+                "orcasimpleinput); single-point energy was saved."
+            )
+            results["warnings"].append(warning)
+            logging.warning(warning)
         else:
             forces = atoms.get_forces()
             results["forces"] = forces.tolist()
@@ -2959,7 +3010,16 @@ def run_vibrations(
         if vib_dir:
             os.makedirs(vib_dir, exist_ok=True)
             vib_name = os.path.join(vib_dir, vib_name)
+        # Attach the resolved calculator: ASE's Vibrations captures atoms.calc,
+        # which with optimize=False is otherwise None (crash) or a stale
+        # calculator from an earlier run (silently wrong Hessian). run_ir does
+        # the same before building its Infrared object.
+        atoms.calc = calc
         vib = Vibrations(atoms, name=vib_name, indices=indices, delta=delta)
+        # Drop any leftover displacement cache: ASE reuses same-named cache
+        # files, so an interrupted earlier run would contribute forces from a
+        # different geometry or calculator (run_ir already cleans first).
+        vib.clean()
         vib.run()
         vib_data = vib.get_vibrations()  # Get the VibrationsData object
         results["vib_time"] = time.time() - start_time
