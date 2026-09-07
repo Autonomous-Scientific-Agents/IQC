@@ -32,8 +32,9 @@ def get_compound_from_cid(cid: str) -> Optional[Compound]:
         _COMPOUND_CACHE[cache_key] = compound
         return compound
     except Exception as e:
+        # Transient failure (network hiccup, throttling): do not cache it,
+        # so the next occurrence of this CID retries.
         logging.warning(f"Error fetching compound for CID {cid}: {e}")
-        _COMPOUND_CACHE[cache_key] = None
         return None
 
 
@@ -68,7 +69,10 @@ def get_iupac_name(cid: str) -> str:
     compound = get_compound_from_cid(cid)
     if compound and hasattr(compound, "iupac_name") and compound.iupac_name:
         return compound.iupac_name
-    return "Not available"
+    # Return the documented falsy empty string: callers (report.py) use
+    # `if not iupac_name` to try alternate CIDs, and a truthy sentinel like
+    # "Not available" both defeated that fallback and leaked into reports.
+    return ""
 
 
 def get_iupac_names(cids: Sequence[str]) -> List[str]:
@@ -121,8 +125,8 @@ def get_cid_from_inchi(inchi: str) -> str:
         _CID_FROM_INCHI_CACHE[cache_key] = result
         return result
     except Exception as e:
+        # Transient failure: return empty without caching so later calls retry.
         logging.warning(f"Error getting CID from InChI: {e}")
-        _CID_FROM_INCHI_CACHE[cache_key] = ""
         return ""
 
 
@@ -157,8 +161,8 @@ def get_cids_from_inchi(inchi: str) -> List[str]:
         _CID_FROM_INCHI_CACHE[cache_key] = result
         return result
     except Exception as e:
+        # Transient failure: return empty without caching so later calls retry.
         logging.warning(f"Error getting CIDs from InChI: {e}")
-        _CID_FROM_INCHI_CACHE[cache_key] = []
         return []
 
 
@@ -193,8 +197,8 @@ def get_cid_from_smiles(smiles: str) -> str:
         _CID_FROM_SMILES_CACHE[cache_key] = result
         return result
     except Exception as e:
+        # Transient failure: return empty without caching so later calls retry.
         logging.warning(f"Error getting CID from SMILES: {e}")
-        _CID_FROM_SMILES_CACHE[cache_key] = ""
         return ""
 
 
@@ -229,8 +233,8 @@ def get_cids_from_smiles(smiles: str) -> List[str]:
         _CID_FROM_SMILES_CACHE[cache_key] = result
         return result
     except Exception as e:
+        # Transient failure: return empty without caching so later calls retry.
         logging.warning(f"Error getting CIDs from SMILES: {e}")
-        _CID_FROM_SMILES_CACHE[cache_key] = []
         return []
 
 

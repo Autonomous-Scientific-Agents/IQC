@@ -140,9 +140,12 @@ def rdkit_descriptors(block):
 def pubchem_lookup(smiles):
     if smiles is None or requests is None:
         return {}
+    # safe="" so stereo-bond slashes (e.g. C/C=C/C) are percent-encoded;
+    # quote's default safe='/' corrupted the REST path for such SMILES and
+    # the lookup silently returned nothing.
     url = (
         "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/"
-        f"{requests.utils.quote(smiles)}/property/IUPACName,InChIKey/JSON"
+        f"{requests.utils.quote(smiles, safe='')}/property/IUPACName,InChIKey/JSON"
     )
     try:
         r = requests.get(url, timeout=10)

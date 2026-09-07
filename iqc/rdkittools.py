@@ -311,6 +311,11 @@ def get_num_heavy_atoms(mol: Chem.Mol) -> int:
 
 def get_num_hydrogens(mol: Chem.Mol) -> int:
     """Get the number of hydrogens in a molecule.
+
+    Counts hydrogens present as explicit graph atoms (molecules built from
+    XYZ) plus implicit/property hydrogens on heavy atoms (molecules built
+    from SMILES without AddHs).
+
     Parameters
     ----------
     mol : Chem.Mol
@@ -319,7 +324,11 @@ def get_num_hydrogens(mol: Chem.Mol) -> int:
     -------
     int
     """
-    return Chem.rdMolDescriptors.CalcNumHBD(mol)
+    explicit = sum(1 for atom in mol.GetAtoms() if atom.GetAtomicNum() == 1)
+    implicit = sum(
+        atom.GetTotalNumHs() for atom in mol.GetAtoms() if atom.GetAtomicNum() != 1
+    )
+    return explicit + implicit
 
 
 def get_bond_order(mol: Chem.Mol, atom1: int, atom2: int) -> int:
@@ -340,7 +349,7 @@ def get_bond_order(mol: Chem.Mol, atom1: int, atom2: int) -> int:
 
 
 def get_bond_orders(mol: Chem.Mol, atom: int):
-    """Get the bond orders of a molecule for a given atom.
+    """Get the bond orders of the bonds involving a given atom.
     Parameters
     ----------
     mol : Chem.Mol
@@ -349,9 +358,11 @@ def get_bond_orders(mol: Chem.Mol, atom: int):
         The atom to get the bond orders of.
     Returns
     -------
-    int
+    list[float]
     """
-    return mol.GetAtomWithIdx(atom).GetDegree()
+    return [
+        bond.GetBondTypeAsDouble() for bond in mol.GetAtomWithIdx(atom).GetBonds()
+    ]
 
 
 def get_max_bond_order(mol: Chem.Mol):
@@ -362,13 +373,13 @@ def get_max_bond_order(mol: Chem.Mol):
         The molecule to get the maximum bond order of.
     Returns
     -------
-    int
+    float
     """
-    max_bond_order = 0
-    for atom in mol.GetAtoms():
-        if atom.GetDegree() > max_bond_order:
-            max_bond_order = atom.GetDegree()
-    return max_bond_order
+    # Previously this returned the maximum atom degree (number of neighbors),
+    # which reports e.g. 4 for methane and 3 for ethylene instead of 1 and 2.
+    return max(
+        (bond.GetBondTypeAsDouble() for bond in mol.GetBonds()), default=0.0
+    )
 
 
 def get_num_electrons(mol: Chem.Mol):
@@ -425,12 +436,17 @@ def smiles_to_mol(smiles: str) -> Chem.Mol:
     Chem.Mol
     """
     mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        print(f"Error: could not parse SMILES string: {smiles!r}")
+        return None
     # Add hydrogens
     mol = Chem.AddHs(mol)
 
     # Generate 3D coordinates
     try:
-        AllChem.EmbedMolecule(mol, randomSeed=42)
+        if AllChem.EmbedMolecule(mol, randomSeed=42) != 0:
+            print(f"Error: 3D embedding failed for SMILES: {smiles!r}")
+            return None
         # Optimize the molecule
         AllChem.MMFFOptimizeMolecule(mol)
     except Exception as e:

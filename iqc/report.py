@@ -1073,6 +1073,15 @@ def main():
     # Parse arguments
     args = parser.parse_args()
 
+    # Configure logging BEFORE the first logging call below: the config-block
+    # logging.info/error calls would implicitly install a default handler,
+    # turning a later basicConfig into a no-op and silently ignoring
+    # --loglevel.
+    log_level = getattr(logging, args.loglevel.upper())
+    logging.basicConfig(
+        level=log_level, format="IQC %(levelname)s: %(asctime)s - %(message)s"
+    )
+
     # Parse property lists from config file if provided, otherwise use command line
     include_properties = None
     exclude_properties = None
@@ -1156,12 +1165,6 @@ def main():
         logging.info(
             f"Overriding exclude_properties from command line: {exclude_properties}"
         )
-
-    # Set up logging
-    log_level = getattr(logging, args.loglevel.upper())
-    logging.basicConfig(
-        level=log_level, format="IQC %(levelname)s: %(asctime)s - %(message)s"
-    )
 
     if disable_pubchem:
         logging.info("PubChem lookups are disabled")
