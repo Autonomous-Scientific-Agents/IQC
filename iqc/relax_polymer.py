@@ -89,8 +89,8 @@ def main():
     opt.run(fmax=FMAX)
 
     # ----------- NVT (soft shake) -----------
-    MaxwellBoltzmannDistribution(atoms, 10*units.kB)
-    dyn1 = Langevin(atoms, TIMESTEP*units.fs, TARGET_T*units.kB,
+    MaxwellBoltzmannDistribution(atoms, temperature_K=10)
+    dyn1 = Langevin(atoms, TIMESTEP*units.fs, temperature_K=TARGET_T,
                     friction=0.02)
     dyn1.run(int(NVT_TIME*1000/TIMESTEP))
 
