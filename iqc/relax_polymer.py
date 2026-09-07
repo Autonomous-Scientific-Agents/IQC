@@ -34,15 +34,17 @@ DENS_TOL  = 0.03           # ±3 %
 
 # ----------------------------------------------------------------------
 def build_calc(name, model):
+    # Delegate to iqc.asetools.get_calculator: the previous direct imports
+    # (ase.calculators.xtb, mace.MACEResponseCalculator, uma.calculator) do
+    # not exist in any released package, so every --ff choice crashed with
+    # ModuleNotFoundError before the first MD step.
+    from iqc.asetools import get_calculator
+
     if name == "xtb":
-        from ase.calculators.xtb import XTB
-        return XTB(method="GFN-FF", accuracy=0.3)
-    if name == "mace":
-        from mace.calculators import mace
-        return mace.MACEResponseCalculator(model)
-    if name == "uma":
-        from uma.calculator import UMA            # pip install uma-calculator
-        return UMA(model_checkpoint=model)
+        return get_calculator("xtb", method="GFN-FF", accuracy=0.3)
+    if name in ("mace", "uma"):
+        kwargs = {"model": model} if model else {}
+        return get_calculator(name, **kwargs)
     raise ValueError(f"Unknown ff '{name}'")
 
 def density_g_cm3(atoms):
@@ -60,7 +62,11 @@ def main():
                    help="target density g cm⁻³")
     p.add_argument("--scale", type=float, default=1.3,
                    help="initial box inflation factor")
+    p.add_argument("--compressibility", type=float, default=4.5e-5,
+                   help="Berendsen compressibility in bar^-1 (default: 4.5e-5; adjust for your material)")
     args = p.parse_args()
+    if not math.isfinite(args.compressibility) or args.compressibility <= 0:
+        p.error("--compressibility must be finite and positive")
 
     atoms = aio.read(args.structure)
     atoms.set_pbc(True)
@@ -83,8 +89,8 @@ def main():
     opt.run(fmax=FMAX)
 
     # ----------- NVT (soft shake) -----------
-    MaxwellBoltzmannDistribution(atoms, 10*units.kB)
-    dyn1 = Langevin(atoms, TIMESTEP*units.fs, TARGET_T*units.kB,
+    MaxwellBoltzmannDistribution(atoms, temperature_K=10)
+    dyn1 = Langevin(atoms, TIMESTEP*units.fs, temperature_K=TARGET_T,
                     friction=0.02)
     dyn1.run(int(NVT_TIME*1000/TIMESTEP))
 
@@ -98,10 +104,15 @@ def main():
             print("✅ density within tolerance.")
             break
         # Run NPT
+        # Barostat target is 1 atm in ASE pressure units (eV/A^3). The old
+        # expression passed the target *density* (~1.0) as the pressure —
+        # about 1.6 million atm — violently crushing the box; density
+        # convergence is handled by the surrounding loop, not the barostat.
         dyn2 = NPTBerendsen(atoms, TIMESTEP*units.fs,
                             temperature_K=TARGET_T,
                             taut=100*units.fs,
-                            pressure_au=args.density*1.01325/0.986923,
+                            pressure_au=1.01325*units.bar,
+                            compressibility_au=args.compressibility/units.bar,
                             taup=1000*units.fs)
         dyn2.run(npt_steps)
         # Optional manual isotropic squeeze if still low
@@ -118,4 +129,3 @@ def main():
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     main()
-
