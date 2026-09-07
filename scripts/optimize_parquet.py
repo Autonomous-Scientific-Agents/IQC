@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +25,7 @@ def is_constant_column(column: pa.ChunkedArray) -> tuple[bool, Any]:
 
     Returns:
         (is_constant, constant_value) tuple
-        - is_constant: True if all non-null values are the same
+        - is_constant: True if all values are the same, including nulls
         - constant_value: The constant value, or None if all values are null
     """
     if len(column) == 0:
@@ -41,6 +42,11 @@ def is_constant_column(column: pa.ChunkedArray) -> tuple[bool, Any]:
     # If all values are null, it's constant
     if len(non_null_values) == 0:
         return True, None
+
+    # Nulls carry per-row information; moving [None, value] to metadata
+    # would incorrectly fill the missing value in every downstream reader.
+    if len(non_null_values) != len(values):
+        return False, None
 
     # Get unique non-null values
     # Handle complex types by converting to JSON string for comparison
@@ -105,7 +111,8 @@ def optimize_parquet(input_file: str, output_file: str = None):
 
     if not constant_columns:
         print("\nNo constant columns found. File is already optimized.")
-        return
+        if output_path == input_path:
+            return
 
     if not columns_to_keep:
         # Every column is constant (routine for single-row chunk files).
@@ -122,7 +129,8 @@ def optimize_parquet(input_file: str, output_file: str = None):
         )
         if not constant_columns:
             print("Nothing left to move to metadata. File is already optimized.")
-            return
+            if output_path == input_path:
+                return
 
     print(f"\nFound {len(constant_columns)} constant column(s)")
     print(f"Keeping {len(columns_to_keep)} variable column(s)")
@@ -160,7 +168,11 @@ def optimize_parquet(input_file: str, output_file: str = None):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     # Write to a temp file and rename so a failure mid-write (disk full,
     # Ctrl-C) cannot truncate the input when overwriting in place.
-    tmp_path = output_path.with_name(output_path.name + ".tmp")
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=output_path.name + ".", suffix=".tmp", dir=output_path.parent
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
     try:
         pq.write_table(
             new_table,

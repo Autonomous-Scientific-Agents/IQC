@@ -1,6 +1,8 @@
 """Smoke tests for parquet utility scripts."""
 
 from pathlib import Path
+import json
+import pytest
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -12,6 +14,75 @@ from scripts import (
     reduce_parquet,
     sort_opt_xyz_parquet,
 )
+
+
+@pytest.mark.parametrize("converter", ["jsonl", "optimize"])
+def test_atomic_writers_preserve_existing_tmp_file(tmp_path, converter):
+    output = tmp_path / "out.parquet"
+    neighbor = tmp_path / "out.parquet.tmp"
+    neighbor.write_bytes(b"unrelated data")
+    if converter == "jsonl":
+        source = tmp_path / "in.jsonl"
+        source.write_text('{"id": 1}\n')
+        jsonl2parquet.convert_jsonl_to_parquet(str(source), str(output))
+    else:
+        source = tmp_path / "in.parquet"
+        pq.write_table(pa.table({"id": [1, 2], "fixed": [3, 3]}), source)
+        optimize_parquet.optimize_parquet(str(source), str(output))
+    assert neighbor.read_bytes() == b"unrelated data"
+    assert pq.read_table(output).num_rows > 0
+
+
+def test_jsonl_writer_closes_on_first_batch_failure(tmp_path, monkeypatch):
+    source = tmp_path / "in.jsonl"
+    source.write_text('{"id": 1}\n')
+    output = tmp_path / "out.parquet"
+    output.write_bytes(b"previous output")
+    instances = []
+
+    class BrokenWriter:
+        def __init__(self, *args, **kwargs):
+            self.closed = False
+            instances.append(self)
+
+        def write_table(self, table):
+            raise OSError("disk full")
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(jsonl2parquet.pq, "ParquetWriter", BrokenWriter)
+    with pytest.raises(OSError, match="disk full"):
+        jsonl2parquet.convert_jsonl_to_parquet(str(source), str(output))
+    assert instances[0].closed
+    assert output.read_bytes() == b"previous output"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["in.jsonl", "out.parquet"]
+
+
+def test_optimize_keeps_null_pattern(tmp_path):
+    source = tmp_path / "nullable.parquet"
+    pq.write_table(pa.table({"id": [1, 2], "energy": [None, -1.0]}), source)
+    optimize_parquet.optimize_parquet(str(source))
+    assert pq.read_table(source)["energy"].to_pylist() == [None, -1.0]
+
+
+def test_optimize_single_column_writes_explicit_output(tmp_path):
+    source, output = tmp_path / "in.parquet", tmp_path / "out.parquet"
+    pq.write_table(pa.table({"id": [1]}), source)
+    optimize_parquet.optimize_parquet(str(source), str(output))
+    assert pq.read_table(output).to_pydict() == {"id": [1]}
+
+
+def test_jsonl_schema_promotes_across_batches(tmp_path, monkeypatch):
+    monkeypatch.setattr(jsonl2parquet, "ROWS_PER_BATCH", 1)
+    source, output = tmp_path / "in.jsonl", tmp_path / "out.parquet"
+    source.write_text('\n'.join(json.dumps(row) for row in [
+        {"energy": -1, "meta": {"a": 1}, "warnings": []},
+        {"energy": -1.25, "meta": {"b": 2}, "warnings": ["warning"]},
+    ]))
+    jsonl2parquet.convert_jsonl_to_parquet(str(source), str(output))
+    rows = pq.read_table(output).to_pylist()
+    assert rows[1] == {"energy": -1.25, "meta": {"a": None, "b": 2}, "warnings": ["warning"]}
 
 
 def write_sample_parquet(path: Path) -> pa.Table:

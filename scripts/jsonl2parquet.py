@@ -6,6 +6,7 @@ import json
 import gzip
 import os
 import sys
+import tempfile
 from collections import OrderedDict
 from pathlib import Path
 
@@ -149,7 +150,11 @@ def convert_jsonl_to_parquet(input_file: str, output_file: str = None) -> int:
 
     # Stream into a temp file and rename on success so a failure mid-write
     # (disk full, kill) never leaves a truncated parquet at the target path.
-    tmp_path = output_path.with_name(output_path.name + ".tmp")
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=output_path.name + ".", suffix=".tmp", dir=output_path.parent
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
     rows = []
     writer = None
     total_rows = 0
@@ -175,10 +180,11 @@ def convert_jsonl_to_parquet(input_file: str, output_file: str = None) -> int:
             writer = None
             os.replace(tmp_path, output_path)
     finally:
-        if writer is not None:
-            writer.close()
-        if tmp_path.exists():
-            tmp_path.unlink()
+        try:
+            if writer is not None:
+                writer.close()
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     print(f"Done. Total rows written: {total_rows:,}")
     return 0
@@ -187,7 +193,8 @@ def convert_jsonl_to_parquet(input_file: str, output_file: str = None) -> int:
 def write_batch(rows, writer, output_path: Path, field_names: list[str], schema=None):
     table = pa.Table.from_pylist(normalize_rows(rows, field_names), schema=schema)
 
-    if writer is None:
+    new_writer = writer is None
+    if new_writer:
         writer = pq.ParquetWriter(
             output_path,
             schema=table.schema,
@@ -195,7 +202,13 @@ def write_batch(rows, writer, output_path: Path, field_names: list[str], schema=
             use_dictionary=True,
         )
 
-    writer.write_table(table)
+    try:
+        writer.write_table(table)
+    except BaseException:
+        # The caller cannot close a newly created writer until we return it.
+        if new_writer:
+            writer.close()
+        raise
     return writer
 
 
