@@ -24,7 +24,7 @@ _KNOWN_TASKS = ("scf", "mp2", "ccsd", "t", "energy", "opt", "relax", "nmr")
 
 
 def _record_error(record: dict) -> str | None:
-    """Return the first ``*_error`` value found in a record, else None."""
+    """Return the first error value found in a record, else None."""
     # Prefer the task-specific error if ``task`` is present.
     task = record.get("task")
     if isinstance(task, str):
@@ -32,6 +32,11 @@ def _record_error(record: dict) -> str | None:
         val = record.get(key)
         if isinstance(val, str) and val.strip():
             return val
+    # Soft in-task failures are recorded in the plain "error" field by the
+    # asetools task runners without raising, so no ``{task}_error`` key exists.
+    val = record.get("error")
+    if isinstance(val, str) and val.strip():
+        return val
     # Fall back to any *_error field (defensive — handles aliasing or sub-task errors).
     for key, value in record.items():
         if key.endswith("_error") and isinstance(value, str) and value.strip():

@@ -204,3 +204,20 @@ def test_malformed_jsonl_lines_are_skipped(tmp_path):
         )
     summary = status_query.summarize([f])
     assert summary["counts"] == {"ok": 1, "error": 1, "total": 2}
+
+
+def test_plain_error_field_counts_as_error(tmp_path):
+    """asetools soft failures live in 'error' with no {task}_error key."""
+    f = tmp_path / "soft.jsonl"
+    _write_jsonl(
+        f,
+        [
+            {"task": "thermo", "calculator": "mace", "error": "Missing vibs.\n"},
+            {"task": "thermo", "calculator": "mace", "error": ""},
+        ],
+    )
+
+    summary = status_query.summarize([f])
+
+    assert summary["counts"] == {"ok": 1, "error": 1, "total": 2}
+    assert "Missing vibs." in list(summary["by_error_kind"])[0]

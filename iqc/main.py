@@ -163,6 +163,11 @@ def _record_status(record):
         err_val = record.get(err_key)
         if err_val:
             return "error"
+    # Soft in-task failures (e.g. "Missing vibrational energies") are recorded
+    # in the plain "error" field by the asetools task runners without raising,
+    # so no ``{task}_error`` key is ever set for them.
+    if record.get("error"):
+        return "error"
     # Fallback: scan for any *_error key with truthy value (defensive against
     # records written before a task field was finalized).
     for key, value in record.items():
@@ -294,9 +299,11 @@ def insert_jsonl_to_db(jsonl_file, db_path):
     with open(jsonl_file, "r") as f:
         summary = insert_entries(f, db_path)
     logging.info(
-        "Database import complete: %s processed, %s inserted, %s duplicates skipped.",
+        "Database import complete: %s processed, %s inserted, %s upgraded "
+        "from earlier failures, %s duplicates skipped.",
         summary["processed"],
         summary["inserted"],
+        summary["upgraded"],
         summary["duplicates"],
     )
 

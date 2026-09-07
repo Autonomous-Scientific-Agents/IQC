@@ -136,8 +136,78 @@ def test_insert_entries_batches_and_reports_duplicates(tmp_path):
 
     summary = insert_entries(lines, db_path, batch_size=2)
 
-    assert summary == {"processed": 6, "inserted": 5, "duplicates": 1}
+    assert summary == {"processed": 6, "inserted": 5, "upgraded": 0, "duplicates": 1}
     assert len(database_to_dataframe(db_path)) == 5
+
+
+def test_successful_retry_replaces_stored_failure(tmp_path):
+    db_path = tmp_path / "calculations.db"
+    failed = calculation_record(3, single_error="SCF diverged")
+    ok = calculation_record(3)
+
+    insert_entry(json.dumps(failed), db_path)
+    assert not calculation_exists(
+        db_path,
+        ok["initial_xyz"],
+        ok["params"],
+        ok["calculator"],
+        ok["model"],
+        ok["task"],
+        include_errors=False,
+    )
+
+    # The retry succeeded: it must replace the stored failure, not be dropped.
+    assert insert_entry(json.dumps(ok), db_path) is True
+    assert calculation_exists(
+        db_path,
+        ok["initial_xyz"],
+        ok["params"],
+        ok["calculator"],
+        ok["model"],
+        ok["task"],
+        include_errors=False,
+    )
+    data = database_to_data(db_path)
+    assert len(data) == 1
+    assert "single_error" not in data.columns or not data.loc[0, "single_error"]
+
+
+def test_error_row_does_not_replace_stored_success(tmp_path):
+    db_path = tmp_path / "calculations.db"
+    ok = calculation_record(4)
+    failed = calculation_record(4, single_error="SCF diverged")
+
+    insert_entry(json.dumps(ok), db_path)
+    assert insert_entry(json.dumps(failed), db_path) is False
+
+    data = database_to_data(db_path)
+    assert len(data) == 1
+    assert "single_error" not in data.columns
+
+
+def test_insert_entries_counts_upgraded_rows(tmp_path):
+    db_path = tmp_path / "calculations.db"
+    insert_entry(json.dumps(calculation_record(0, single_error="boom")), db_path)
+    lines = [json.dumps(calculation_record(index)) for index in range(3)]
+
+    summary = insert_entries(lines, db_path, batch_size=2)
+
+    assert summary == {"processed": 3, "inserted": 2, "upgraded": 1, "duplicates": 0}
+    assert len(database_to_dataframe(db_path)) == 3
+
+
+def test_merge_databases_upgrades_failed_target_rows(tmp_path):
+    source_db = tmp_path / "source.db"
+    target_db = tmp_path / "target.db"
+
+    insert_entry(json.dumps(calculation_record(5, single_error="boom")), target_db)
+    insert_entry(json.dumps(calculation_record(5)), source_db)
+
+    merge_databases(target_db, source_db)
+
+    data = database_to_data(target_db)
+    assert len(data) == 1
+    assert "single_error" not in data.columns
 
 
 def test_insert_entry_raises_for_invalid_records(tmp_path):
@@ -188,3 +258,33 @@ def test_merge_databases_handles_source_paths_with_quotes(tmp_path):
 
 def test_hash_string_accepts_structured_params():
     assert hash_string({"b": 2, "a": 1}) == hash_string({"a": 1, "b": 2})
+
+
+def test_plain_error_field_marks_row_failed(tmp_path):
+    """Rows whose only failure marker is the plain 'error' key must not count
+    as successes for include_errors=False, and a retry must upgrade them."""
+    db_path = tmp_path / "calculations.db"
+    soft_fail = calculation_record(6, error="Optimization failed to converge.\n")
+    ok = calculation_record(6, error="")
+
+    insert_entry(json.dumps(soft_fail), db_path)
+    assert not calculation_exists(
+        db_path,
+        ok["initial_xyz"],
+        ok["params"],
+        ok["calculator"],
+        ok["model"],
+        ok["task"],
+        include_errors=False,
+    )
+
+    assert insert_entry(json.dumps(ok), db_path) is True
+    assert calculation_exists(
+        db_path,
+        ok["initial_xyz"],
+        ok["params"],
+        ok["calculator"],
+        ok["model"],
+        ok["task"],
+        include_errors=False,
+    )
