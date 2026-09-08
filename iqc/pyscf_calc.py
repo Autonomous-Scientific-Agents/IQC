@@ -38,6 +38,7 @@ from ase.calculators.calculator import (
     CalculationFailed,
     all_changes,
 )
+from iqc.electronic_state import integer_state, validate_electronic_state
 
 _HARTREE_TO_EV = units.Hartree
 _HARTREE_PER_BOHR_TO_EV_PER_ANG = units.Hartree / units.Bohr
@@ -91,13 +92,17 @@ class PySCFCalculator(Calculator):
         spin (int|None): 2S = n_alpha - n_beta (number of unpaired electrons).
             Derived from ``multiplicity`` when None.
         conv_tol (float): SCF energy convergence. Default 1e-9.
-        max_cycle (int): SCF max iterations. Default 200.
+        max_cycle (int): Iteration limit for each SCF/CCSD attempt. Default 200.
+        scf_recovery (bool): Try one Newton SCF restart if ordinary SCF does
+            not converge. Preserves the method, basis, charge and tolerance.
+            Default True. Unconverged SCF/CCSD results always raise.
         density_fit (bool): Use density fitting (RI) for the SCF. Default False.
         frozen (int|None): Frozen core orbitals for correlated methods.
         verbose (int): PySCF verbosity. Default 0.
     """
 
     implemented_properties = ["energy", "free_energy", "forces", "dipole"]
+    discard_results_on_any_change = True
 
     default_parameters: Dict[str, Any] = {
         "method": "dft",
@@ -108,6 +113,7 @@ class PySCFCalculator(Calculator):
         "spin": None,
         "conv_tol": 1e-9,
         "max_cycle": 200,
+        "scf_recovery": True,
         "density_fit": False,
         "frozen": None,
         "verbose": 0,
@@ -132,7 +138,16 @@ class PySCFCalculator(Calculator):
         )
         self._iqc_calculator_family = "pyscf"
         self._iqc_spin_charge_convention = "pyscf"
-        # Human-facing label used by the orchestrator's result metadata.
+        self._update_method_metadata()
+
+    def set(self, **kwargs):
+        changed = super().set(**kwargs)
+        if self.parameters is not None:
+            self._update_method_metadata()
+        return changed
+
+    def _update_method_metadata(self):
+        # Refresh labels and capabilities when an ASE caller changes method.
         method = _normalize_method(self.parameters["method"])
         if method == "dft":
             self.model_name = f"pyscf/{self.parameters['xc']}/{self.parameters['basis']}"
@@ -157,8 +172,13 @@ class PySCFCalculator(Calculator):
 
         spin = params.get("spin")
         if spin is None:
-            mult = params.get("multiplicity")
-            spin = 0 if mult is None else int(mult) - 1
+            _, mult = validate_electronic_state(
+                atoms, params["charge"], params.get("multiplicity")
+            )
+            spin = mult - 1
+        else:
+            spin = integer_state(spin, "spin")
+            validate_electronic_state(atoms, params["charge"], abs(spin) + 1)
 
         mol = gto.Mole()
         mol.atom = [
@@ -179,7 +199,10 @@ class PySCFCalculator(Calculator):
 
         params = self.parameters
         method = _normalize_method(params["method"])
-        unrestricted = spin != 0
+        requested = str(params["method"]).lower().replace(" ", "")
+        unrestricted = spin != 0 or requested in {"uhf", "uks"}
+        if spin != 0 and requested in {"rhf", "rks"}:
+            raise ValueError(f"{requested} requires a closed-shell state; use UHF/UKS")
 
         if method == "dft":
             mf = dft.UKS(mol) if unrestricted else dft.RKS(mol)
@@ -203,6 +226,7 @@ class PySCFCalculator(Calculator):
         system_changes: Iterable[str] = all_changes,
     ) -> None:
         Calculator.calculate(self, atoms, properties, system_changes)
+        self.results = {}
         if self.atoms is None:
             raise CalculationFailed("PySCFCalculator: no atoms attached")
 
@@ -214,16 +238,38 @@ class PySCFCalculator(Calculator):
             else:
                 self._run_correlated(mol, spin, method)
         except CalculationFailed:
+            self.results = {}
             raise
         except Exception as exc:  # pragma: no cover - surfaced to ASE
+            self.results = {}
             raise CalculationFailed(f"PySCF {method} calculation failed: {exc}") from exc
+
+    def _converge_scf(self, mf):
+        """Try the requested SCF, then one Newton solve of the same equations."""
+        energy = mf.kernel()
+        recovered = False
+        if not mf.converged or not np.isfinite(energy):
+            if self.parameters.get("scf_recovery", True):
+                logging.warning("PySCF SCF did not converge; trying one Newton restart")
+                density = mf.make_rdm1()
+                mf = mf.newton()
+                mf.conv_tol = float(self.parameters["conv_tol"])
+                mf.max_cycle = int(self.parameters["max_cycle"])
+                energy = mf.kernel(dm0=density)
+                recovered = True
+            if not mf.converged or not np.isfinite(energy):
+                raise CalculationFailed("PySCF SCF did not converge to a finite energy")
+        self.results.update(
+            scf_converged=True,
+            scf_recovery_used=recovered,
+            scf_recovery_attempts=int(recovered),
+        )
+        return mf, energy
 
     def _run_scf(self, mol, spin, properties):
         t0 = time.time()
         mf = self._make_scf(mol, spin)
-        e_hartree = mf.kernel()
-        if not mf.converged:
-            logging.warning("PySCF SCF did not converge (method=%s)", self.parameters["method"])
+        mf, e_hartree = self._converge_scf(mf)
         self.results["energy"] = e_hartree * _HARTREE_TO_EV
         self.results["free_energy"] = self.results["energy"]
         self.results["scf_energy_eV"] = e_hartree * _HARTREE_TO_EV
@@ -261,9 +307,7 @@ class PySCFCalculator(Calculator):
             mf.conv_tol = float(params["conv_tol"])
             mf.max_cycle = int(params["max_cycle"])
             mf.verbose = int(params["verbose"])
-        e_scf = mf.kernel()
-        if not mf.converged:
-            logging.warning("PySCF HF reference did not converge")
+        mf, e_scf = self._converge_scf(mf)
         scf_time = time.time() - t0
         self.results["scf_energy_eV"] = e_scf * _HARTREE_TO_EV
         self.results["scf_time_s"] = scf_time
@@ -274,6 +318,8 @@ class PySCFCalculator(Calculator):
             t1 = time.time()
             mp2 = mp.MP2(mf, frozen=frozen) if frozen else mp.MP2(mf)
             e_corr, _ = mp2.kernel()
+            if not np.isfinite(e_corr):
+                raise CalculationFailed("PySCF MP2 correlation energy is non-finite")
             self.results["mp2_correlation_eV"] = e_corr * _HARTREE_TO_EV
             self.results["mp2_time_s"] = time.time() - t1
             total_hartree += e_corr
@@ -281,9 +327,12 @@ class PySCFCalculator(Calculator):
             t1 = time.time()
             mycc = cc.CCSD(mf, frozen=frozen) if frozen else cc.CCSD(mf)
             mycc.conv_tol = float(params["conv_tol"])
+            mycc.max_cycle = int(params["max_cycle"])
             mycc.kernel()
-            if not mycc.converged:
-                logging.warning("PySCF CCSD did not converge")
+            if not mycc.converged or not np.isfinite(mycc.e_corr):
+                raise CalculationFailed(
+                    "PySCF CCSD did not converge to a finite energy"
+                )
             e_ccsd_corr = mycc.e_corr
             self.results["ccsd_correlation_eV"] = e_ccsd_corr * _HARTREE_TO_EV
             self.results["ccsd_time_s"] = time.time() - t1
@@ -291,6 +340,8 @@ class PySCFCalculator(Calculator):
             if method == "ccsd(t)":
                 t2 = time.time()
                 e_t = mycc.ccsd_t()
+                if not np.isfinite(e_t):
+                    raise CalculationFailed("PySCF triples correction is non-finite")
                 self.results["t_correction_eV"] = e_t * _HARTREE_TO_EV
                 self.results["t_time_s"] = time.time() - t2
                 total_hartree += e_t

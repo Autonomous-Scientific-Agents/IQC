@@ -303,6 +303,8 @@ def _blob_is_success(blob, task):
     # Soft in-task failures (e.g. "Missing vibrational energies") are recorded
     # in the plain "error" field by the asetools task runners without raising,
     # so no ``{task}_error`` key is ever set for them.
+    if data.get("nonphysical") or data.get("opt_converged") is False:
+        return False
     if data.get("error"):
         return False
     for k, v in data.items():

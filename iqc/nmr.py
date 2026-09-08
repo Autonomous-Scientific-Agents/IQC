@@ -308,8 +308,8 @@ def build_nmr_settings(**params) -> NMRSettings:
         )
     if settings.num_conformers < 1:
         raise ValueError("num_conformers must be at least 1.")
-    if settings.temperature <= 0:
-        raise ValueError("temperature must be positive.")
+    if not np.isfinite(settings.temperature) or settings.temperature <= 0:
+        raise ValueError("temperature must be finite and positive.")
     if settings.multiplicity < 1:
         raise ValueError("multiplicity must be at least 1.")
     if settings.plot_range is not None:
@@ -939,42 +939,56 @@ def parse_nmr_output(
     raise ValueError(f"Unsupported backend '{backend}'.")
 
 
+def _boltzmann_energy_series(conformers):
+    # Never subtract a force-field energy from an electronic total energy.
+    # Select one complete energy series shared by every retained conformer.
+    for field in ("optimization_energy_eV", "initial_energy_eV"):
+        values = np.array([getattr(c, field) for c in conformers], dtype=float)
+        if len(values) and np.isfinite(values).all():
+            return field, values
+    return "equal", None
+
+
 def _compute_boltzmann_weights(
     conformers: Sequence[ConformerCandidate],
     temperature: float,
 ) -> np.ndarray:
-    energies = np.array(
-        [
-            (
-                candidate.optimization_energy_eV
-                if candidate.optimization_energy_eV is not None
-                else (
-                    candidate.initial_energy_eV
-                    if candidate.initial_energy_eV is not None
-                    else np.nan
-                )
-            )
-            for candidate in conformers
-        ],
-        dtype=float,
-    )
-    finite_mask = np.isfinite(energies)
-    if not finite_mask.any():
+    if not np.isfinite(temperature) or temperature <= 0:
+        raise ValueError("temperature must be finite and positive.")
+    _, energies = _boltzmann_energy_series(conformers)
+    if energies is None:
+        logging.warning("No complete conformer energy series; using equal NMR weights")
         return np.ones(len(conformers), dtype=float) / max(len(conformers), 1)
-
-    finite_energies = energies[finite_mask]
-    rel = finite_energies - finite_energies.min()
+    rel = energies - energies.min()
     beta = 1.0 / (K_BOLTZMANN_EV_PER_K * temperature)
     weights = np.exp(-beta * rel)
     weights /= weights.sum()
 
-    all_weights = np.zeros(len(conformers), dtype=float)
-    all_weights[finite_mask] = weights
-    if (~finite_mask).any():
-        remainder = 1.0 - all_weights.sum()
-        if remainder > 0:
-            all_weights[~finite_mask] = remainder / (~finite_mask).sum()
-    return all_weights
+    return weights
+
+
+def _validate_shielding_rows(atoms, rows, element_to_nucleus):
+    """Reject truncated output before it can dilute a weighted spectrum."""
+    expected = {
+        i: _normalize_element(symbol)
+        for i, symbol in enumerate(atoms.get_chemical_symbols())
+        if _normalize_element(symbol) in element_to_nucleus
+    }
+    seen = set()
+    for row in rows:
+        element = _normalize_element(str(row["element"]))
+        if element not in element_to_nucleus:
+            continue
+        index = int(row["atom_index"])
+        if (
+            index in seen
+            or expected.get(index) != element
+            or not np.isfinite(float(row["isotropic_shielding_ppm"]))
+        ):
+            raise ValueError("Invalid or duplicate NMR shielding row")
+        seen.add(index)
+    if seen != set(expected):
+        raise ValueError("Incomplete NMR shieldings for the requested nuclei")
 
 
 def _lorentzian(x: np.ndarray, center: float, linewidth: float) -> np.ndarray:
@@ -1751,7 +1765,14 @@ def run_nmr_workflow(
 ) -> Tuple[Atoms, Dict[str, object]]:
     """Run a backend-aware NMR workflow and generate plots and tabulated outputs."""
 
-    settings = build_nmr_settings(**params)
+    from iqc.electronic_state import set_electronic_state
+
+    charge, multiplicity = set_electronic_state(
+        atoms, params.get("multiplicity"), params.get("charge")
+    )
+    settings = build_nmr_settings(
+        **{**params, "charge": charge, "multiplicity": multiplicity}
+    )
     if not unique_name:
         unique_name = "nmr"
 
@@ -1808,8 +1829,9 @@ def run_nmr_workflow(
                 candidate = optimize_conformer(candidate, settings, unique_name)
                 if candidate.optimization_converged is False:
                     results["warnings"].append(
-                        f"Geometry optimization did not fully converge for conformer {candidate.conformer_id}; using the latest available geometry."
+                        f"Geometry optimization did not converge for conformer {candidate.conformer_id}; excluding it."
                     )
+                    continue
             else:
                 write(candidate.output_dir / "input.xyz", candidate.atoms, format="xyz")
         except Exception as exc:
@@ -1855,9 +1877,13 @@ def run_nmr_workflow(
                 backend=settings.backend,
             )
             shielding_rows, meta = parse_nmr_output(settings.backend, output_path)
+            _validate_shielding_rows(
+                candidate.atoms, shielding_rows, element_to_nucleus
+            )
             if (
                 meta.get("energy_eV") is not None
                 and candidate.optimization_energy_eV is None
+                and not settings.optimize_geometry
             ):
                 candidate.optimization_energy_eV = float(meta["energy_eV"])
         except Exception as exc:
@@ -1909,6 +1935,21 @@ def run_nmr_workflow(
         return atoms, results
 
     weights = _compute_boltzmann_weights(successful_conformers, settings.temperature)
+    weight_source, weight_energies = _boltzmann_energy_series(successful_conformers)
+    results["nmr_weight_energy_source"] = weight_source
+    results["nmr_weight_energies_eV"] = (
+        None if weight_energies is None else weight_energies.tolist()
+    )
+    if weight_source == "equal":
+        results["warnings"].append(
+            "No complete conformer energy series; using equal NMR weights."
+        )
+    elif weight_source == "initial_energy_eV" and any(
+        c.optimization_energy_eV is not None for c in successful_conformers
+    ):
+        results["warnings"].append(
+            "Incomplete electronic energy series; using initial energies for every NMR weight."
+        )
     weight_map = {
         candidate.conformer_id: float(weight)
         for candidate, weight in zip(successful_conformers, weights)

@@ -21,6 +21,7 @@ from ase.visualize import view
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdmolops
 import io
+from iqc.electronic_state import integer_state, set_electronic_state, validate_electronic_state
 
 # Optional dependencies with informative messages
 XTB = None
@@ -851,7 +852,12 @@ class NumericalForceCalculator:
         # Surface energy-component / timing metadata from the inner calculator
         # (e.g. scf/ccsd/(t) breakdown) so the orchestrator can persist it.
         for key, value in inner.items():
-            if key.endswith("_eV") or key.endswith("_s"):
+            if (
+                key.endswith("_eV")
+                or key.endswith("_s")
+                or key.startswith("scf_recovery")
+                or key == "scf_converged"
+            ):
                 self.results[key] = value
 
     def reset(self):
@@ -1394,6 +1400,7 @@ def get_atoms_from_smiles(smiles: str, seed=0xF00D):
     rdmol = get_rdmol_from_smiles(smiles, optimize=True, seed=seed)
     atoms = get_atoms_from_xyz(get_xyz_from_rdmol(rdmol))
     atoms.info["smiles_input"] = smiles
+    atoms.info["charge"] = int(Chem.GetFormalCharge(rdmol))
     if rdmol.HasProp("_IQCCanonicalSmiles"):
         atoms.info["canonical_smiles"] = rdmol.GetProp("_IQCCanonicalSmiles")
     if rdmol.HasProp("_IQCForceField"):
@@ -1786,7 +1793,16 @@ def atoms2xyz(atoms):
         num_atoms = len(atoms)
 
         # Create the header (number of atoms and a blank/comment line)
-        xyz_str = f"{num_atoms}\n\n"
+        # Keep legacy neutral/default-spin XYZ keys stable. Non-default
+        # electronic states must survive serialization and have distinct keys.
+        charge = atoms.info.get("charge", 0)
+        mult = atoms.info.get("multiplicity")
+        comment = ""
+        default_mult = 1 + int(sum(atoms.numbers)) % 2
+        if charge != 0 or (mult is not None and mult != default_mult):
+            charge, mult = validate_electronic_state(atoms, charge, mult)
+            comment = f"charge={charge} multiplicity={mult}"
+        xyz_str = f"{num_atoms}\n{comment}\n"
 
         # Add atom positions and symbols
         for symbol, position in zip(
@@ -1842,13 +1858,7 @@ def get_multiplicity(atoms, multiplicity=None, charge=0):
     (singlet), after applying the total molecular charge. Pass an explicit
     `multiplicity` to override (e.g. 3 for triplet O2).
     """
-    if multiplicity is None:
-        electron_count = get_total_electrons(atoms) - int(charge)
-        return 2 if electron_count % 2 else 1
-    multiplicity = int(multiplicity)
-    if multiplicity < 1:
-        raise ValueError(f"multiplicity must be >= 1, got {multiplicity}")
-    return multiplicity
+    return validate_electronic_state(atoms, charge, multiplicity)[1]
 
 
 def get_spin(atoms, multiplicity=None, charge=0):
@@ -1869,7 +1879,7 @@ def get_spin(atoms, multiplicity=None, charge=0):
     return (get_multiplicity(atoms, multiplicity, charge=charge) - 1) / 2.0
 
 
-def apply_spin_charge(atoms, calculator, multiplicity=None, charge=0):
+def apply_spin_charge(atoms, calculator, multiplicity=None, charge=None):
     """Apply spin state and charge to `atoms` using the calculator's convention.
 
     User-facing convention is **multiplicity** 2S+1 (singlet=1, doublet=2,
@@ -1896,8 +1906,22 @@ def apply_spin_charge(atoms, calculator, multiplicity=None, charge=0):
     Returns:
         int: Resolved multiplicity that was applied (after defaulting).
     """
-    charge = int(charge)
-    multiplicity = get_multiplicity(atoms, multiplicity, charge=charge)
+    backend = (
+        calculator.calc
+        if isinstance(calculator, NumericalForceCalculator)
+        else calculator
+    )
+    parameters = getattr(backend, "parameters", {}) or {}
+    charge, multiplicity = set_electronic_state(atoms, multiplicity, charge, parameters)
+    # ASE does not detect parameter or atoms.info changes in check_state.
+    # Reused worker calculators must not return the previous charge/spin energy.
+    state = (charge, multiplicity)
+    if getattr(calculator, "_iqc_electronic_state", None) != state:
+        if hasattr(calculator, "reset"):
+            calculator.reset()
+        calculator._iqc_electronic_state = state
+    if isinstance(calculator, NumericalForceCalculator):
+        calculator = calculator.calc
     unpaired = multiplicity - 1
     calc_class = type(calculator).__name__
     spin_charge_convention = getattr(calculator, "_iqc_spin_charge_convention", "")
@@ -1930,10 +1954,8 @@ def apply_spin_charge(atoms, calculator, multiplicity=None, charge=0):
         if parameters is not None:
             parameters["charge"] = charge
             parameters["multiplicity"] = multiplicity
-            if parameters.get("scf_type") is None:
-                parameters["scf_type"] = (
-                    "restricted" if multiplicity == 1 else "unrestricted"
-                )
+            # Leave automatic scf_type=None unresolved; ExaChem resolves it
+            # per call. Persisting the first molecule's choice poisons reuse.
     elif spin_charge_convention == "pyscf":
         # PySCF reads charge and spin (2S = unpaired electrons) from its
         # calculator parameters when it builds the gto.Mole per call.
@@ -2076,6 +2098,9 @@ def _store_calculator_observables(results, calc, prefix=""):
     calc_results = getattr(calc, "results", None)
     if not isinstance(calc_results, dict):
         return results
+    for key in ("scf_converged", "scf_recovery_used", "scf_recovery_attempts"):
+        if key in calc_results:
+            results[prefix + key] = calc_results[key]
 
     # ExaChem-specific energy components and method metadata. These are
     # written by ``ExaChemCalculator._extract_components`` and surfaced here
@@ -2208,7 +2233,7 @@ def validate_physical_results(results, atoms=None):
     centrally — because messages are de-duplicated and the flag is recomputed.
 
     Thresholds are overridable via environment variables:
-      ``IQC_MAX_ENERGY_PER_ATOM_EV`` (default 1e4),
+      ``IQC_MAX_ABSOLUTE_ENERGY_PER_ATOM_EV`` (default 1e9),
       ``IQC_MAX_ZPE_PER_ATOM_EV`` (default 1.0),
       ``IQC_MAX_FREQ_CM`` (default 8000).
 
@@ -2225,7 +2250,7 @@ def validate_physical_results(results, atoms=None):
         n_atoms = len(atoms)
     n_atoms = int(n_atoms) if n_atoms else 1
 
-    max_e = float(os.environ.get("IQC_MAX_ENERGY_PER_ATOM_EV", 1e4)) * n_atoms
+    max_e = float(os.environ.get("IQC_MAX_ABSOLUTE_ENERGY_PER_ATOM_EV", 1e9)) * n_atoms
     max_zpe = float(os.environ.get("IQC_MAX_ZPE_PER_ATOM_EV", 1.0)) * n_atoms
     max_freq = float(os.environ.get("IQC_MAX_FREQ_CM", 8000.0))
 
@@ -2392,84 +2417,132 @@ def _run_staged_optimization(
     """Optimize ``atoms``, with an energy-divergence guard and staged restarts.
 
     Runs ``optimizer`` first. A per-step observer aborts the run the moment the
-    energy becomes non-finite or exceeds a per-atom magnitude bound (default
-    ``IQC_MAX_ENERGY_PER_ATOM_EV`` × natoms), so a diverging trajectory no
-    longer grinds to ``max_steps`` and emits a 1e56 eV energy. If ``recover`` is
-    set and the run does not converge to a finite geometry, it restarts from the
-    current positions with the next optimizer in ``recover_optimizers`` (up to
-    ``max_recovery_attempts`` extra tries).
+    energy/forces become non-finite or the energy change from the starting
+    geometry exceeds ``IQC_MAX_ENERGY_PER_ATOM_EV`` × natoms (default 1e4 eV
+    per atom). Numerical exceptions restore the last validated geometry. With
+    ``recover=True``, nonconvergence or exceptions trigger the next optimizer
+    in ``recover_optimizers`` (up to ``max_recovery_attempts`` extra tries).
 
     Returns ``(converged, total_steps, optimizer_used, recovery_used, attempts)``.
     """
-    n_atoms = max(len(atoms), 1)
-    energy_bound = float(os.environ.get("IQC_MAX_ENERGY_PER_ATOM_EV", 1e4)) * n_atoms
+    energy_bound = float(os.environ.get("IQC_MAX_ENERGY_PER_ATOM_EV", 1e4)) * max(
+        len(atoms), 1
+    )
+    reference_energy = float(atoms.get_potential_energy())
+    last_valid = atoms.get_positions().copy()
+    history = []
+    atoms.info["_iqc_optimization_attempts"] = history
 
-    def _attempt(opt_name):
-        dyn = _make_optimizer(opt_name, atoms, trajectory=trajectory, maxstep=maxstep)
-
-        def _guard():
-            try:
-                energy = atoms.get_potential_energy()
-            except Exception:
-                return
-            if not np.isfinite(energy) or abs(energy) > energy_bound:
-                raise _OptimizerDiverged(
-                    f"energy {energy:.3e} eV diverged (|E| > {energy_bound:.3e})"
-                )
-
-        dyn.attach(_guard, interval=1)
-        try:
-            converged = bool(dyn.run(fmax=fmax, steps=max_steps))
-        except _OptimizerDiverged as exc:
-            logging.warning("Optimizer '%s' diverged and was aborted: %s", opt_name, exc)
-            converged = False
-        return converged, dyn.get_number_of_steps()
+    def guard():
+        nonlocal last_valid
+        _validate_geometry(atoms)
+        energy = float(atoms.get_potential_energy())
+        forces = np.asarray(atoms.get_forces())
+        if (
+            not np.isfinite(energy)
+            or not np.isfinite(reference_energy)
+            or abs(energy - reference_energy) > energy_bound
+            or forces.shape != (len(atoms), 3)
+            or not np.isfinite(forces).all()
+        ):
+            raise _OptimizerDiverged(
+                "Non-finite forces/energy or excessive energy change"
+            )
+        last_valid = atoms.get_positions().copy()
 
     sequence = [optimizer] + (list(recover_optimizers or ()) if recover else [])
+    if isinstance(recover_optimizers, str):
+        sequence = [optimizer] + ([recover_optimizers] if recover else [])
+    max_recovery_attempts = max(0, int(max_recovery_attempts))
     total_steps = 0
+    converged = False
     attempts = 0
     used = optimizer
-    converged = False
-    for i, opt_name in enumerate(sequence):
-        if i > 0:
-            if attempts >= max_recovery_attempts:
-                break
-            attempts += 1
-            logging.info(
-                "Optimization recovery attempt %d: restarting with '%s'",
-                attempts,
-                opt_name,
-            )
-        converged, steps = _attempt(opt_name)
-        total_steps += steps
+    for i, opt_name in enumerate(sequence[: max_recovery_attempts + 1]):
+        attempts = i
         used = opt_name
+        dyn = _make_optimizer(opt_name, atoms, trajectory=trajectory, maxstep=maxstep)
+        dyn.attach(guard, interval=1)
+        error = ""
         try:
-            energy = atoms.get_potential_energy()
-            finite = bool(np.isfinite(energy)) and abs(energy) <= energy_bound
-        except Exception:
-            finite = False
-        if (converged and finite) or not recover:
+            guard()
+            converged = bool(dyn.run(fmax=fmax, steps=max_steps))
+            guard()
+        except Exception as exc:
+            converged = False
+            error = str(exc)
+            atoms.set_positions(last_valid)
+            if hasattr(atoms.calc, "reset"):
+                atoms.calc.reset()
+            logging.warning(
+                "Optimizer %s failed; restored last valid geometry: %s", opt_name, exc
+            )
+        steps = dyn.get_number_of_steps()
+        total_steps += steps
+        history.append(
+            {
+                "optimizer": opt_name,
+                "steps": steps,
+                "converged": converged,
+                "error": error,
+            }
+        )
+        if converged or not recover:
             break
     return converged, total_steps, used, attempts > 0, attempts
 
 
-def _imaginary_mode_vectors(frequencies, vib_modes, nrot, max_vib_imag):
-    """Return the (N,3) displacement vectors for imaginary vibrational modes.
+def _vibrational_mode_indices(frequencies, nrot):
+    """Exclude the smallest-magnitude rigid modes, not negative eigenvalues."""
+    frequencies = np.asarray(frequencies, dtype=complex)
+    external = np.argsort(np.abs(frequencies), kind="stable")[: 3 + nrot]
+    selected = np.setdiff1d(np.arange(len(frequencies)), external)
+    return external, selected
 
-    ``frequencies`` is the complex frequency array from ASE; ``vib_modes`` are
-    the corresponding modes (shape ``(3N, N, 3)``). The first ``3 + nrot``
-    entries are translations/rotations and are skipped, mirroring the imaginary
-    count elsewhere in this module.
-    """
-    vectors = []
+
+def _imaginary_mode_vectors(frequencies, vib_modes, nrot, max_vib_imag):
     if vib_modes is None or len(vib_modes) == 0:
-        return vectors
-    body_freqs = frequencies[3 + nrot:]
-    body_modes = vib_modes[3 + nrot:]
-    for freq, mode in zip(body_freqs, body_modes):
-        if abs(getattr(freq, "imag", 0.0)) > max_vib_imag:
-            vectors.append(np.asarray(mode, dtype=float))
-    return vectors
+        return []
+    _, selected = _vibrational_mode_indices(frequencies, nrot)
+    return [
+        np.asarray(vib_modes[i], dtype=float)
+        for i in selected
+        if abs(complex(frequencies[i]).imag) > max_vib_imag
+    ]
+
+
+def _record_vibrational_analysis(
+    atoms, results, frequencies, modes, max_trans_rot, max_vib_imag
+):
+    frequencies = np.asarray(frequencies, dtype=complex)
+    if not np.isfinite(frequencies).all():
+        raise ValueError("Vibrational frequencies contain NaN/Inf")
+    complete = len(frequencies) == 3 * len(atoms)
+    results["vibration_complete"] = complete
+    nrot = 0 if len(atoms) == 1 else (2 if is_linear_by_inertia(atoms) else 3)
+    if complete:
+        external, selected = _vibrational_mode_indices(frequencies, nrot)
+    else:
+        # Partial Hessians have no complete rigid-body subspace to remove.
+        external, selected = np.array([], dtype=int), np.arange(len(frequencies))
+    if np.any(np.abs(frequencies[external]) > max_trans_rot):
+        results["warnings"].append("Translational or rotational modes are too high")
+    imaginary = [i for i in selected if abs(frequencies[i].imag) > max_vib_imag]
+    results["number_of_imaginary"] = len(imaginary)
+    results["vibrational_frequencies_cm^-1"] = [
+        (
+            -float(abs(frequencies[i].imag))
+            if frequencies[i].imag
+            else float(frequencies[i].real)
+        )
+        for i in selected
+    ]
+    energies = results.get("vib_energies", [])
+    if len(energies) == len(frequencies):
+        results["thermo_vib_energies"] = [energies[i] for i in selected]
+    if modes is None or len(modes) == 0:
+        return []
+    return [np.asarray(modes[i], dtype=float) for i in imaginary]
 
 
 def _recover_imaginary(
@@ -2480,8 +2553,8 @@ def _recover_imaginary(
 
     ``recompute_fn(new_atoms) -> (new_atoms, new_results)`` re-optimizes and
     recomputes the Hessian (via run_vibrations or run_ir). A trial is accepted
-    only if it errors out less and has strictly fewer imaginary modes; on
-    acceptance ``atoms`` is moved to the improved geometry and the new result
+    only if it succeeds, passes validation, and has strictly fewer imaginary
+    modes. On acceptance ``atoms`` is moved to the improved geometry and the new result
     (tagged ``imag_recovery_used``/``imag_recovery_before``/``after``) is
     returned. Never raises — on any failure the original ``results`` is kept.
     """
@@ -2489,39 +2562,53 @@ def _recover_imaginary(
     if n_before <= 0 or not mode_vectors:
         return results
     best = results
-    for attempt in range(1, max_attempts + 1):
-        disp = np.zeros((len(atoms), 3))
-        for vec in mode_vectors:
-            norm = np.linalg.norm(vec)
-            if norm > 0:
-                disp += vec / norm
-        if not np.any(disp):
-            break
+    for attempt in range(max(0, int(max_attempts))):
+        vector = np.asarray(
+            mode_vectors[(attempt // 2) % len(mode_vectors)], dtype=float
+        )
+        norm = np.linalg.norm(vector)
+        if not np.isfinite(norm) or norm == 0 or vector.shape != (len(atoms), 3):
+            continue
+        sign = 1 if attempt % 2 == 0 else -1
         trial = atoms.copy()
-        trial.set_positions(trial.get_positions() + displacement * disp)
-        logging.info(
-            "Imaginary-mode recovery attempt %d/%d for %s (currently %d imaginary)",
-            attempt, max_attempts, unique_name,
-            int(best.get("number_of_imaginary", 0) or 0),
+        trial.set_positions(
+            trial.positions + sign * float(displacement) * vector / norm
         )
         try:
             trial, rec = recompute_fn(trial)
-        except Exception as exc:  # never let recovery crash the parent task
+            if (
+                trial is None
+                or not rec
+                or rec.get("error")
+                or rec.get("nonphysical")
+                or rec.get("opt_converged") is False
+            ):
+                continue
+            _validate_geometry(trial)
+            if not np.array_equal(trial.numbers, atoms.numbers):
+                continue
+            n_new = int(rec.get("number_of_imaginary", n_before))
+        except Exception as exc:
             logging.warning("Imaginary-mode recovery attempt failed: %s", exc)
-            break
-        if not rec or rec.get("error"):
-            break
-        n_new = int(rec.get("number_of_imaginary", n_before) or 0)
-        if n_new < int(best.get("number_of_imaginary", 0) or 0):
-            rec["imag_recovery_used"] = True
-            rec["imag_recovery_before"] = n_before
-            rec["imag_recovery_after"] = n_new
-            best = rec
-            atoms.set_positions(trial.get_positions())
+            continue
+        if n_new < int(best.get("number_of_imaginary", n_before)):
+            improved = {**best, **rec}
+            # A recovery geometry is not a new input calculation/cache key.
+            for key, value in results.items():
+                if key.startswith("initial_") or key == "unique_name":
+                    improved[key] = value
+            improved.update(
+                imag_recovery_used=True,
+                imag_recovery_before=n_before,
+                imag_recovery_after=n_new,
+                imag_recovery_attempts=attempt + 1,
+            )
+            best = improved
+            atoms.set_positions(trial.positions)
+            if atoms.calc is not None and hasattr(atoms.calc, "reset"):
+                atoms.calc.reset()
             if n_new == 0:
                 break
-        else:
-            break
     return best
 
 
@@ -2530,7 +2617,7 @@ def _prepare_calculation(
     calculator=None,
     unique_name="",
     multiplicity=None,
-    charge=0,
+    charge=None,
     apply_numerical_forces=True,
 ):
     """
@@ -2543,7 +2630,8 @@ def _prepare_calculation(
         unique_name (str): Unique name for the molecule
         multiplicity (int, optional): Spin multiplicity 2S+1. Defaults from
             electron-count parity (1 for even, 2 for odd).
-        charge (int): Total molecular charge. Defaults to 0.
+        charge (int, optional): Total molecular charge. Uses input metadata or
+            calculator settings when omitted, then defaults to 0.
 
     Returns:
         tuple: (calculator, initial_data, results_dict)
@@ -2571,6 +2659,7 @@ def _prepare_calculation(
     multiplicity = apply_spin_charge(
         atoms, calc, multiplicity=multiplicity, charge=charge
     )
+    charge = atoms.info["charge"]
 
     # Energy-only calculators (ExaChem, PySCF CCSD(T)) get finite-difference
     # forces so the force-driven optimizer / Hessian can use them (no-op for
@@ -2602,6 +2691,8 @@ def _prepare_calculation(
     atoms.calc = calc
     try:
         initial_energy = atoms.get_potential_energy()
+        if not np.isfinite(initial_energy):
+            raise ValueError("Initial potential energy is non-finite")
     except Exception as e:
         context = _orca_failure_context(calc)
         message = f"Failed to get initial potential energy with {str(calc)}: {e}{context}"
@@ -2613,8 +2704,8 @@ def _prepare_calculation(
     # Prepare results dictionary
     results = {
         "number_of_atoms": len(atoms),
-        "number_of_electrons": get_total_electrons(atoms),
-        "spin": get_spin(atoms, multiplicity),
+        "number_of_electrons": get_total_electrons(atoms) - charge,
+        "spin": get_spin(atoms, multiplicity, charge=charge),
         "multiplicity": multiplicity,
         "charge": charge,
         "formula": atoms.get_chemical_formula(mode="hill"),
@@ -2639,7 +2730,7 @@ def run_single_point(
     calculator=None,
     unique_name="",
     multiplicity=None,
-    charge=0,
+    charge=None,
 ):
     """
     Run a single point energy calculation for an ASE Atoms object.
@@ -2734,7 +2825,7 @@ def run_optimization(
     save_geometry=False,
     output_dir=None,
     multiplicity=None,
-    charge=0,
+    charge=None,
     optimizer="bfgs",
     maxstep=None,
     recover=False,
@@ -2875,12 +2966,18 @@ def run_optimization(
                 if output_dir:
                     os.makedirs(output_dir, exist_ok=True)
                     geometry_file = os.path.join(output_dir, geometry_file)
-                write(geometry_file, atoms, format="xyz")
+                with open(geometry_file, "w") as handle:
+                    handle.write(atoms2xyz(atoms))
                 results["optimized_geometry_file"] = geometry_file
                 logging.info(f"Optimized geometry saved to {geometry_file}")
             except Exception as e:
                 logging.warning(f"Failed to save optimized geometry: {e}")
 
+    results["opt_attempts"] = list(atoms.info.get("_iqc_optimization_attempts", []))
+    if not results["opt_converged"] and not results["error"]:
+        results["error"] = (
+            "Optimization failed to converge within the configured attempts."
+        )
     validate_physical_results(results, atoms=atoms)
     logging.info(f"Geometry optimization for {unique_name} completed")
     return atoms, results
@@ -2923,7 +3020,7 @@ def run_vibrations(
     trajectory=None,
     save_geometry=False,
     multiplicity=None,
-    charge=0,
+    charge=None,
     imag_recovery=False,
     imag_displacement=0.3,
     max_imag_attempts=1,
@@ -2971,6 +3068,14 @@ def run_vibrations(
         results["error"] += error
         logging.error(error)
         return None, results
+
+    try:
+        multiplicity = apply_spin_charge(atoms, calc, multiplicity, charge)
+        charge = atoms.info["charge"]
+        results.update(charge=charge, multiplicity=multiplicity)
+    except ValueError as exc:
+        results["error"] = str(exc)
+        return atoms, results
 
     # Energy-only calculators (ExaChem, PySCF CCSD(T)) get finite-difference
     # forces so the Hessian (and any non-optimizing path) can use them.
@@ -3067,22 +3172,8 @@ def run_vibrations(
             warning = f"Could not export Jmol vibrational modes: {e}"
             logging.warning(warning)
             results["warnings"].append(warning)
-        nrot = 3
-        if is_linear_by_inertia(atoms):
-            nrot = 2
-        # Check translational and rotational modes
-        if np.any(np.abs(frequencies[: 3 + nrot]) > max_trans_rot):
-            logging.warning(
-                f"Translational or rotational modes are too high: {frequencies[:3+nrot]}"
-            )
-            results["warnings"].append("Translational or rotational modes are too high")
-        img_freqs = [f for f in frequencies[3 + nrot :] if abs(f.imag) > max_vib_imag]
-        results["number_of_imaginary"] = len(img_freqs)
-        results["vibrational_frequencies_cm^-1"] = [
-            f.real for f in frequencies[3 + nrot :]
-        ]
-        imag_vectors = _imaginary_mode_vectors(
-            frequencies, vib_modes, nrot, max_vib_imag
+        imag_vectors = _record_vibrational_analysis(
+            atoms, results, frequencies, vib_modes, max_trans_rot, max_vib_imag
         )
 
         logging.debug(
@@ -3164,6 +3255,24 @@ def _add_thermo_results_from_vibrations(
             results["error"] += "Missing vibrational energies for thermochemistry.\n"
             return None, results
 
+        if results.get("vibration_complete") is False:
+            raise ValueError(
+                "Ideal-gas thermochemistry requires a complete molecular Hessian"
+            )
+        selected = results.get("thermo_vib_energies")
+        if selected is not None:
+            vib_energies = selected
+        else:
+            geometry = get_geometry_type(atoms)
+            count = (
+                0
+                if geometry == "monatomic"
+                else 3 * len(atoms) - (5 if geometry == "linear" else 6)
+            )
+            if len(vib_energies) < count:
+                raise ValueError("Too few modes for molecular thermochemistry")
+            vib_energies = sorted(vib_energies, key=abs)[-count:] if count else []
+
         if not ignore_imag_modes:
             n_imag = results.get("number_of_imaginary", 0)
             if n_imag > 0:
@@ -3192,8 +3301,14 @@ def _add_thermo_results_from_vibrations(
             geometry=get_geometry_type(thermo_atoms),
             atoms=thermo_atoms,
             potentialenergy=potentialenergy,
-            spin=get_spin(thermo_atoms, results.get("multiplicity", multiplicity)),
-            symmetrynumber=results.get("opt_sym_number", 1),
+            spin=get_spin(
+                thermo_atoms,
+                results.get("multiplicity", multiplicity),
+                charge=results.get("charge", atoms.info.get("charge", 0)),
+            ),
+            symmetrynumber=results.get("opt_sym_number")
+            or results.get("initial_sym_number")
+            or 1,
             ignore_imag_modes=ignore_imag_modes,
         )
         results["thermo_time"] = time.time() - start_time
@@ -3235,7 +3350,7 @@ def run_ir(
     max_trans_rot=100,
     max_vib_imag=50,
     multiplicity=None,
-    charge=0,
+    charge=None,
     imag_recovery=False,
     imag_displacement=0.3,
     max_imag_attempts=1,
@@ -3303,15 +3418,13 @@ def run_ir(
             else:
                 fallback = atoms.calc
             opt_calc = vib_calc = dip_calc = fallback
-        else:
-            for role_calc in (opt_calc, vib_calc, dip_calc):
-                if role_calc is not None:
-                    apply_spin_charge(
-                        atoms,
-                        role_calc,
-                        multiplicity=multiplicity,
-                        charge=charge,
-                    )
+        for role_calc in (opt_calc, vib_calc, dip_calc):
+            if role_calc is not None:
+                multiplicity = apply_spin_charge(
+                    atoms, role_calc, multiplicity=multiplicity, charge=charge
+                )
+                charge = atoms.info["charge"]
+        results.update(charge=charge, multiplicity=multiplicity)
     except Exception as e:
         error = f"Error in calculator preparation: {e}"
         results["error"] += error
@@ -3460,22 +3573,8 @@ def run_ir(
         results["vib_modes"] = (
             vib_modes.tolist() if hasattr(vib_modes, "tolist") else vib_modes
         )
-        nrot = 2 if is_linear_by_inertia(atoms) else 3
-        if np.any(np.abs(mode_frequencies[: 3 + nrot]) > max_trans_rot):
-            logging.warning(
-                "Translational or rotational modes are too high: "
-                f"{mode_frequencies[:3+nrot]}"
-            )
-            results["warnings"].append("Translational or rotational modes are too high")
-        img_freqs = [
-            f for f in mode_frequencies[3 + nrot :] if abs(f.imag) > max_vib_imag
-        ]
-        results["number_of_imaginary"] = len(img_freqs)
-        results["vibrational_frequencies_cm^-1"] = [
-            f.real for f in mode_frequencies[3 + nrot :]
-        ]
-        imag_vectors = _imaginary_mode_vectors(
-            mode_frequencies, vib_modes, nrot, max_vib_imag
+        imag_vectors = _record_vibrational_analysis(
+            atoms, results, mode_frequencies, vib_modes, max_trans_rot, max_vib_imag
         )
 
         freq_intensity = ir.get_spectrum(
@@ -3599,7 +3698,7 @@ def run_ir_thermo(
     max_trans_rot=100,
     max_vib_imag=50,
     multiplicity=None,
-    charge=0,
+    charge=None,
     **params,
 ):
     """Run IR and thermochemistry from one optimized Hessian calculation."""
@@ -3668,7 +3767,7 @@ def run_thermo(
     trajectory=None,
     save_geometry=False,
     multiplicity=None,
-    charge=0,
+    charge=None,
     optimization_calculator=None,
     vibration_calculator=None,
     energy_calculator=None,
@@ -3707,20 +3806,38 @@ def run_thermo(
         tuple: (thermo, results)
     """
 
-    # Geometry + Hessian require forces; pick the first force-capable role.
-    geom_calc = vibration_calculator or optimization_calculator or calculator
-
+    geom_calc = optimization_calculator or vibration_calculator or calculator
+    vib_calc = vibration_calculator or geom_calc
+    run_params = dict(params)
+    optimize = run_params.pop("optimize", True)
+    opt_results = {}
+    if optimize and geom_calc is not vib_calc:
+        atoms, opt_results = run_optimization(
+            atoms,
+            calculator=geom_calc,
+            unique_name=unique_name,
+            fmax=run_params.get("fmax", 0.01),
+            trajectory=trajectory,
+            save_geometry=save_geometry,
+            multiplicity=multiplicity,
+            charge=charge,
+            **_optimization_extra_params(run_params),
+        )
+        if opt_results.get("error"):
+            return None, opt_results
+        optimize = False
     atoms, results = run_vibrations(
         atoms,
-        calculator=geom_calc,
-        optimize=True,
+        calculator=vib_calc,
+        optimize=optimize,
         unique_name=unique_name,
         trajectory=trajectory,
         save_geometry=save_geometry,
         multiplicity=multiplicity,
         charge=charge,
-        **params,
+        **run_params,
     )
+    results = {**opt_results, **results}
     if results["error"]:
         logging.error(
             "Vibrational analysis failed, cannot proceed with thermochemistry.\n"
@@ -3729,7 +3846,7 @@ def run_thermo(
 
     # Composite scheme: substitute the electronic energy from a higher level.
     potentialenergy = None
-    if energy_calculator is not None and energy_calculator is not geom_calc:
+    if energy_calculator is not None and energy_calculator is not vib_calc:
         try:
             apply_spin_charge(
                 atoms, energy_calculator, multiplicity=multiplicity, charge=charge
@@ -3767,7 +3884,7 @@ def run_thermo(
 
 
 _XYZ_COMMENT_KV_RE = re.compile(
-    r"(?:^|[\s,;])(multiplicity|mult|uhf|charge|chrg|q)\s*[=:]\s*(-?\d+)",
+    r"(?:^|[\s,;])(multiplicity|mult|uhf|charge|chrg|q)\s*[=:]\s*([^\s,;]+)",
     re.IGNORECASE,
 )
 
@@ -3792,7 +3909,7 @@ def parse_multiplicity_charge_from_comment(comment):
     charge = None
     for key, value in _XYZ_COMMENT_KV_RE.findall(comment):
         key = key.lower()
-        n = int(value)
+        n = integer_state(value, key)
         if key in ("multiplicity", "mult"):
             mult = n
         elif key == "uhf":
@@ -3844,15 +3961,12 @@ def get_atoms_from_xyz(xyz, parallel=False, index=-1):
         logging.error(f"Invalid input type for ase.io.read: {type(xyz)}")
         return None
 
-    try:
-        comment = _extract_xyz_comment(xyz_text, index)
-        mult, charge = parse_multiplicity_charge_from_comment(comment)
-        if mult is not None:
-            atoms.info["multiplicity"] = mult
-        if charge is not None:
-            atoms.info["charge"] = charge
-    except Exception as e:
-        logging.debug(f"Could not parse multiplicity/charge from XYZ comment: {e}")
+    comment = _extract_xyz_comment(xyz_text, index)
+    mult, charge = parse_multiplicity_charge_from_comment(comment)
+    if mult is not None:
+        atoms.info["multiplicity"] = mult
+    if charge is not None:
+        atoms.info["charge"] = charge
 
     logging.debug(f"Successfully read atoms from {xyz}")
     return atoms
@@ -3900,6 +4014,8 @@ def is_linear_by_inertia(atoms, tol=1e-3):
     Returns:
     bool : True if molecule is linear, False otherwise.
     """
+    if len(atoms) < 2:
+        return False
     moments = sorted(atoms.get_moments_of_inertia())  # ascending order
     if moments[0] > tol:
         return False  # First moment should be (near) zero

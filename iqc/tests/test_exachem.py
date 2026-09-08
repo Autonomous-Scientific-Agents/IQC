@@ -202,10 +202,14 @@ def test_extract_energy_ccsd_t_prefers_t_over_bracket_t():
 
 def test_apply_spin_charge_exachem_writes_parameters(water):
     calc = ExaChemCalculator(method="scf")
-    apply_spin_charge(water, calc, multiplicity=3, charge=-1)
-    assert calc.parameters["charge"] == -1
+    apply_spin_charge(water, calc, multiplicity=3, charge=-2)
+    assert calc.parameters["charge"] == -2
     assert calc.parameters["multiplicity"] == 3
-    assert calc.parameters["scf_type"] == "unrestricted"
+    assert calc.parameters["scf_type"] is None
+    assert (
+        calc._build_input_json(water, calc.parameters, "scf")["SCF"]["scf_type"]
+        == "unrestricted"
+    )
 
 
 def test_apply_spin_charge_exachem_respects_explicit_scf_type():

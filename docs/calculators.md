@@ -2,6 +2,9 @@
 
 IQC can use ASE calculators through `--calculator`.
 
+See [electronic states and calculation recovery](calculation_recovery.md) for
+charge/spin validation, SCF restarts, optimizer recovery and strict thermochemistry.
+
 Supported calculator names:
 
 - `mace`: MACE Materials Project foundation model

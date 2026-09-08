@@ -353,6 +353,7 @@ class ExaChemCalculator(Calculator):
     """
 
     implemented_properties = ["energy"]
+    discard_results_on_any_change = True
 
     default_parameters: Dict[str, Any] = {
         "method": "scf",
@@ -575,7 +576,6 @@ class ExaChemCalculator(Calculator):
         self.results["artifact_archive_sha256"] = record["archive_sha256"]
         self.results["artifact_archive_size_bytes"] = record["archive_size_bytes"]
 
-
     def _prepare_run_dir(self, keep_files: bool) -> Path:
         """Return a fresh unique run directory under ``self.directory``.
 
@@ -757,11 +757,11 @@ class ExaChemCalculator(Calculator):
         params: Dict[str, Any],
         method: str,
     ) -> Dict[str, Any]:
-        n_electrons = sum(atoms.get_atomic_numbers()) - int(params.get("charge", 0))
-        mult = params.get("multiplicity")
-        if mult is None:
-            mult = 1 if n_electrons % 2 == 0 else 2
-        mult = int(mult)
+        from iqc.electronic_state import validate_electronic_state
+
+        _, mult = validate_electronic_state(
+            atoms, params.get("charge", 0), params.get("multiplicity")
+        )
         scf_type = params.get("scf_type") or cls._default_scf_type(mult)
 
         # ExaChem rejects inputs that enable more than one TASK at a time.

@@ -37,6 +37,10 @@ def _record_error(record: dict) -> str | None:
     val = record.get("error")
     if isinstance(val, str) and val.strip():
         return val
+    if record.get("nonphysical"):
+        return "Nonphysical calculation result"
+    if record.get("opt_converged") is False:
+        return "Optimization did not converge"
     # Fall back to any *_error field (defensive — handles aliasing or sub-task errors).
     for key, value in record.items():
         if key.endswith("_error") and isinstance(value, str) and value.strip():
