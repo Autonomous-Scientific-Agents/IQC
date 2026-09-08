@@ -1003,6 +1003,15 @@ def _process_one_row(
     results["_unique_name"] = unique_name
     results["_record_stamp"] = record_stamp
     results["_work_dir_used"] = work_dir_used[0]
+    # Stable per-input identity WITHOUT the run-id suffix. ``unique_name`` is
+    # ``f"{base_name}_{xyz_index}_{worker_id}_{record_stamp}"`` — two runs of the
+    # same input differ only in that suffix. Persisting ``base_name`` as a real
+    # column lets bookkeeping tools dedup / compute the done-set by an exact
+    # column join instead of regex-stripping the suffix off ``unique_name`` in
+    # every consumer (the "identity by string parsing" failure mode). Unlike
+    # ``_unique_name`` (a private key the dispatchers pop before writing), this
+    # is meant to survive into the JSONL/parquet output.
+    results["unique_name_base"] = base_name
     return results
 
 

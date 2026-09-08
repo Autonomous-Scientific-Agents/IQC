@@ -62,9 +62,15 @@ parsl = [
 mcp = [
     "mcp",
 ]
+bookkeeping = [
+    # DuckDB powers the sweep done/remaining query layer (iqc.sweep_bookkeeping).
+    # Optional so the core install and non-sweep users don't pull it in.
+    "duckdb",
+]
 test = [
     "pytest>=7.0",
     "pytest-mock",
+    "duckdb",
 ]
 dev = [
     "black",
@@ -98,6 +104,7 @@ iqc-el = "iqc.ensemble_launcher_dispatch:run_cli"
 iqc-mcp = "iqc.mcp_server:main"
 iqc-sweep = "iqc.cli_sweep:main"
 iqc-status = "iqc.status_query:main"
+iqc-sweep-book = "iqc.sweep_bookkeeping:main"
 iqc-jsonl2parquet = "scripts.jsonl2parquet:run_cli"
 iqc-chunk-parquet = "scripts.chunk_parquet:run_cli"
 iqc-optimize-parquet = "scripts.optimize_parquet:run_cli"
