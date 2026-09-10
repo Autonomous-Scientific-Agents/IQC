@@ -96,6 +96,20 @@ def get_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--uid-column",
+        "--uid_column",
+        dest="uid_column",
+        type=str,
+        default=None,
+        help=(
+            "Column in a tabular --input holding a stable per-row identity. It "
+            "is stored on each result as 'unique_name_base' so sweep "
+            "bookkeeping (done/remaining) can join input rows to results by an "
+            "exact key that survives rechunking, instead of parsing run-id "
+            "suffixes. Defaults to the 'unique_name' column when present."
+        ),
+    )
+    parser.add_argument(
         "--sort-order",
         "--sort_order",
         dest="sort_order",

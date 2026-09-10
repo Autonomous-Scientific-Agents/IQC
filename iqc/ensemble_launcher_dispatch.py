@@ -36,6 +36,7 @@ import logging
 import os
 import sys
 import time
+from concurrent.futures import as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -55,6 +56,7 @@ from iqc.main import (
     build_completed_calculation_index,
     convert_jsonl_results_to_parquet,
     get_structure_input_mode,
+    resolve_uid_column,
     validate_input_args,
 )
 
@@ -372,6 +374,22 @@ def _add_el_args(parser: argparse.ArgumentParser) -> None:
             "hostname as the only node; per-slot hostfile is omitted."
         ),
     )
+    group.add_argument(
+        "--el-keep-partials",
+        action="store_true",
+        help=(
+            "Also write a per-molecule partial JSONL under results_partials/ "
+            "as each row finishes (in addition to the incremental per-job "
+            "output). OFF by default: the head now appends every result to the "
+            "combined per-job JSONL the moment its future resolves, so a "
+            "walltime kill loses at most the in-flight rows and per-mol "
+            "partials are redundant for that case. Re-enable only for "
+            "teardown-hang-prone high-rank configs (e.g. el-nodes-per-mol>=8), "
+            "where a worker's ClusterClient.teardown() can block past walltime "
+            "and the row's future never resolves, so the head never sees it. "
+            "Costs one inode per molecule."
+        ),
+    )
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -406,12 +424,16 @@ def _build_xyz_input_set(args, logger: logging.Logger):
         logger.info(f"Using SMILES input: {args.smiles}")
         return xyz_files, input_mode, number_of_xyz, number_of_files
 
+    uid_col, uid_req = resolve_uid_column(args)
+
     if input_mode == "data_xyz":
         xyz_files = read_xyz_column_records(
             args.input,
             args.xyz,
             sort_column=args.sort,
             sort_order=args.sort_order,
+            uid_column=uid_col,
+            uid_required=uid_req,
         )
         number_of_xyz = len(xyz_files)
         number_of_files = number_of_xyz
@@ -429,6 +451,8 @@ def _build_xyz_input_set(args, logger: logging.Logger):
             args.smiles,
             sort_column=args.sort,
             sort_order=args.sort_order,
+            uid_column=uid_col,
+            uid_required=uid_req,
         )
         number_of_xyz = len(xyz_files)
         number_of_files = number_of_xyz
@@ -694,6 +718,7 @@ def main() -> int:
         "nmr_params": nmr_params,
         "input_mode": input_mode,
         "number_of_files": number_of_files,
+        "number_of_xyz": number_of_xyz,
         "worker_id": 0,
         "n_workers": number_of_xyz,
         "rank_output_dir_factory": rank_output_dir_factory,
@@ -707,7 +732,15 @@ def main() -> int:
     from ensemble_launcher.orchestrator import ClusterClient
 
     cpus_per_node = int(args.el_cpus_per_node)
-    partials_dir = str(Path.cwd() / "results_partials")
+    # Per-mol partials are OFF unless explicitly requested (see --el-keep-partials).
+    # Durability now comes from the head appending each result to the per-job
+    # JSONL as its future resolves, which drops the file count from ~10^5
+    # (per-mol) to ~10^2 (per-job) without losing walltime-killed work.
+    partials_dir = (
+        str(Path.cwd() / "results_partials")
+        if getattr(args, "el_keep_partials", False)
+        else None
+    )
 
     checkpoint_dir = os.path.join(head_output_dir, "el_checkpoint")
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -774,9 +807,62 @@ def main() -> int:
         num_slots,
         num_slots,
     )
-    raw_results: dict = {}
     task_ids = [f"row-{i:07d}" for i in range(number_of_xyz)]
     cluster_error: Exception | None = None
+    jsonl_file = f"iqc_{task}_results_{run_id}.jsonl"
+
+    # Counters + "which rows are already accounted for" set. ``handled`` covers
+    # every terminal outcome (written to file or intentionally not: skipped /
+    # bad-input), so the post-teardown sweep below can tell submitted-but-never-
+    # collected rows apart from ones we already dealt with.
+    completed = 0
+    failed = 0
+    skipped_existing = 0
+    bad_inputs = 0
+    handled: set[str] = set()
+
+    def _persist_row(outfile, tid: str, result) -> None:
+        """Classify one row outcome, append it if it produces a record, count it.
+
+        Single writer (the head) → no concurrency on ``outfile``. Flushed per
+        row so a walltime SIGTERM loses at most the record being written, which
+        readers drop as an unparseable trailing line.
+        """
+
+        nonlocal completed, failed, skipped_existing, bad_inputs
+        row_idx = int(tid.split("-")[1])
+        if isinstance(result, BaseException):
+            failed += 1
+            record = _synthesize_failure_row(
+                row_idx,
+                result,
+                args=args,
+                params_str=params_str,
+                task=task,
+                calculator_name=calculator_name,
+                xyz_files=xyz_files,
+                input_mode=input_mode,
+                number_of_files=number_of_files,
+            )
+            outfile.write(json.dumps(record, cls=ComplexEncoder))
+            outfile.write("\n")
+        elif result is SKIPPED_EXISTING:
+            skipped_existing += 1
+        elif result is None:
+            bad_inputs += 1
+        elif not isinstance(result, dict):
+            failed += 1
+            logging.error("row %s returned unexpected type %s", tid, type(result))
+        else:
+            result.pop("_unique_name", None)
+            result.pop("_record_stamp", None)
+            result.pop("_work_dir_used", None)
+            outfile.write(json.dumps(result, cls=ComplexEncoder))
+            outfile.write("\n")
+            completed += 1
+        outfile.flush()
+        handled.add(tid)
+
     try:
         el.start(wait_time=5)
         client = ClusterClient(
@@ -788,7 +874,8 @@ def main() -> int:
             for i in range(number_of_xyz):
                 pk = dict(process_kwargs_base)
                 pk["worker_id"] = i
-                pk["partials_dir"] = partials_dir
+                if partials_dir:
+                    pk["partials_dir"] = partials_dir
                 tid = f"row-{i:07d}"
                 try:
                     futures[tid] = client.submit(
@@ -821,17 +908,34 @@ def main() -> int:
                 "Submitted %d row(s) to cluster", len(futures),
             )
 
-            for tid, fut in futures.items():
+            # Write each result the moment its future resolves (completion
+            # order, not submission order), from the head process only. The
+            # combined per-job JSONL is therefore durable row-by-row: a
+            # walltime kill loses at most the rows still in flight, which is
+            # what per-mol partials used to protect against.
+            fut_to_tid = {fut: tid for tid, fut in futures.items()}
+            with open(jsonl_file, "w", buffering=1) as outfile:
                 try:
-                    raw_results[tid] = fut.result()
+                    for fut in as_completed(fut_to_tid):
+                        tid = fut_to_tid[fut]
+                        try:
+                            result = fut.result()
+                        except Exception as e:  # noqa: BLE001
+                            result = e
+                        _persist_row(outfile, tid, result)
                 except Exception as e:  # noqa: BLE001
-                    raw_results[tid] = e
+                    # as_completed / a future raised at the cluster level: stop
+                    # collecting; the sweep below persists whatever is missing.
+                    cluster_error = cluster_error or e
+                    logging.error(
+                        "Cluster client error during collection: %s", e, exc_info=True
+                    )
         finally:
             client.teardown()
     except Exception as e:  # noqa: BLE001
         # Remember the failure: rows submitted but never collected must be
         # persisted as failures below, and the run must exit nonzero.
-        cluster_error = e
+        cluster_error = cluster_error or e
         logging.error("Cluster client error: %s", e, exc_info=True)
     finally:
         try:
@@ -840,56 +944,18 @@ def main() -> int:
             cluster_error = cluster_error or exc
             logging.error("Cluster shutdown failed: %s", exc, exc_info=True)
 
-    jsonl_file = f"iqc_{task}_results_{run_id}.jsonl"
-    completed = 0
-    failed = 0
-    skipped_existing = 0
-    bad_inputs = 0
-    _NOT_COLLECTED = object()
-    with open(jsonl_file, "w") as outfile:
-        for tid in task_ids:
-            row_idx = int(tid.split("-")[1])
-            result = raw_results.get(tid, _NOT_COLLECTED)
-            if result is _NOT_COLLECTED:
-                # Submitted but never collected (client.start()/submit()/
-                # result() died): a real failure, not a bad input. Without
-                # this these rows counted as bad_inputs and the run exited 0
-                # with no failure rows written.
-                result = cluster_error or RuntimeError(
-                    "row was submitted but never collected from the cluster"
-                )
-            if isinstance(result, BaseException):
-                failed += 1
-                failure_row = _synthesize_failure_row(
-                    row_idx,
-                    result,
-                    args=args,
-                    params_str=params_str,
-                    task=task,
-                    calculator_name=calculator_name,
-                    xyz_files=xyz_files,
-                    input_mode=input_mode,
-                    number_of_files=number_of_files,
-                )
-                outfile.write(json.dumps(failure_row, cls=ComplexEncoder))
-                outfile.write("\n")
-                continue
-            if result is SKIPPED_EXISTING:
-                skipped_existing += 1
-                continue
-            if result is None:
-                bad_inputs += 1
-                continue
-            if not isinstance(result, dict):
-                failed += 1
-                logging.error("row %s returned unexpected type %s", tid, type(result))
-                continue
-            result.pop("_unique_name", None)
-            result.pop("_record_stamp", None)
-            result.pop("_work_dir_used", None)
-            outfile.write(json.dumps(result, cls=ComplexEncoder))
-            outfile.write("\n")
-            completed += 1
+    # Sweep for rows never accounted for (submit failed, client.start() died,
+    # or collection was interrupted): append a failure row for each so the run
+    # exits nonzero and no input silently vanishes. On the happy path every tid
+    # is already in ``handled`` and this opens/writes nothing.
+    missing = [tid for tid in task_ids if tid not in handled]
+    if missing:
+        not_collected = cluster_error or RuntimeError(
+            "row was submitted but never collected from the cluster"
+        )
+        with open(jsonl_file, "a", buffering=1) as outfile:
+            for tid in missing:
+                _persist_row(outfile, tid, not_collected)
 
     logging.info(
         "Ensemble Launcher dispatch complete: %s completed, %s skipped-existing, "
