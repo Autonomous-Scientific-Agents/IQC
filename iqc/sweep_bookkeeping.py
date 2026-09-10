@@ -42,6 +42,13 @@ _RUNID_SUFFIX_RE = r"_[0-9]+_[0-9]+_[0-9]{8}_[0-9]{6}$"
 
 DEFAULT_ENERGY_COLUMN = "total_energy_eV"
 
+# IQC energy columns end in ``_eV`` (total_energy_eV, energy_eV, scf_energy_eV,
+# opt_total_energy_eV, initial_*_eV, ...). We use the presence of *any* such
+# column to tell "the requested energy column is misspelled" (other energy
+# columns exist, just not that one) from "this is a failure-only source" (no
+# energy columns at all).
+_ENERGY_COLUMN_SUFFIX = "_eV"
+
 
 def _require_duckdb():
     """Import duckdb lazily with an actionable error if it is missing."""
@@ -188,16 +195,22 @@ def _classify_source(schema: dict[str, str], energy_column: str) -> tuple[bool, 
     (opened before the first completion) has neither. These contribute *no done
     UIDs* (so their inputs stay eligible for retry) rather than erroring.
 
-    A caller that *explicitly* requested a non-default ``energy_column`` that is
-    absent is treated as a misspelling and still raises. Genuine
-    unreadable/corrupt files raise earlier, in :func:`_describe`.
+    The requested ``energy_column`` being absent is a *misspelling* — and still
+    raises — only when the source contains some other energy column (a ``*_eV``
+    column): the data clearly has energies, just not under that name. A source
+    with no energy columns at all is failure-only and is tolerated for *any*
+    requested column name (default or a valid non-default like ``energy_eV``).
+    Genuine unreadable/corrupt files raise earlier, in :func:`_describe`.
     """
     has_identity = "unique_name_base" in schema or "unique_name" in schema
     has_energy = energy_column in schema
-    if not has_energy and energy_column != DEFAULT_ENERGY_COLUMN:
+    if not has_energy and any(
+        c.endswith(_ENERGY_COLUMN_SUFFIX) for c in schema
+    ):
+        present = sorted(c for c in schema if c.endswith(_ENERGY_COLUMN_SUFFIX))
         raise ValueError(
-            f"energy column {energy_column!r} not found; available columns "
-            f"include: {sorted(schema)[:12]}..."
+            f"energy column {energy_column!r} not found; available energy "
+            f"columns: {present}"
         )
     return has_identity, has_energy
 

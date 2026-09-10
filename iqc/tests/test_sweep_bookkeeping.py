@@ -347,6 +347,37 @@ def test_backend_error_row_with_identity_no_energy(tmp_path):
     assert bk.remaining(str(tmp_path / "input.parquet"), glob) == ["M_conf0"]
 
 
+def test_failure_only_tolerates_nondefault_energy_column(tmp_path):
+    """A valid non-default --energy-column (e.g. energy_eV) must not crash on a
+    failure-only / empty source — it just has no energy columns yet."""
+    pytest.importorskip("duckdb")
+    by_job = tmp_path / "by_job"
+    by_job.mkdir()
+    _write_parquet(
+        by_job / "fail.parquet",
+        [{"unique_name_base": "bad", "single_error": "boom"}],
+    )
+    (by_job / "empty.jsonl").write_text("")
+    _write_parquet(tmp_path / "input.parquet",
+                   [{"unique_name": u} for u in ["bad", "other"]])
+
+    for glob in (str(by_job / "*.parquet"), str(by_job / "*.jsonl")):
+        assert bk.done_uids(glob, energy_column="energy_eV") == set()
+        assert bk.remaining(str(tmp_path / "input.parquet"), glob,
+                            energy_column="energy_eV") == ["bad", "other"]
+        assert bk.summary(glob, energy_column="energy_eV")["done_uids"] == 0
+
+
+def test_misspelled_energy_column_raises_when_energies_present(tmp_path):
+    """When the source *does* have energy columns, a wrong --energy-column name
+    is a misspelling and still raises (distinct from a failure-only source)."""
+    pytest.importorskip("duckdb")
+    p = tmp_path / "ok.parquet"
+    _write_parquet(p, [{"unique_name_base": "m", "total_energy_eV": -1.0}])
+    with pytest.raises(ValueError, match="not found"):
+        bk.done_uids(str(p), energy_column="enrgy_eV")
+
+
 def test_empty_jsonl_file_is_no_done(tmp_path):
     """A JSONL file opened before the first completion (empty) is not an error."""
     pytest.importorskip("duckdb")
