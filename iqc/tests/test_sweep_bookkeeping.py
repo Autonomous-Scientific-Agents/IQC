@@ -271,8 +271,112 @@ def test_base_only_schema_does_not_reference_unique_name(tmp_path):
 
 
 def test_done_uids_bad_energy_column(tmp_path):
+    """An explicitly requested, misspelled energy column still raises (distinct
+    from a failure-only source that merely lacks the default energy column)."""
     pytest.importorskip("duckdb")
     p = tmp_path / "j.parquet"
     _write_parquet(p, [{"unique_name": "X_conf0", "total_energy_eV": -1.0}])
     with pytest.raises(ValueError, match="not found"):
         bk.done_uids(str(p), energy_column="no_such_col")
+
+
+def test_corrupt_parquet_still_raises(tmp_path):
+    """A genuinely unreadable file is not silently treated as 'no done'."""
+    pytest.importorskip("duckdb")
+    p = tmp_path / "corrupt.parquet"
+    p.write_text("this is not a parquet file")
+    with pytest.raises(Exception):
+        bk.done_uids(str(p))
+
+
+# --- failure-only / interrupted sources (P2 follow-up) --------------------- #
+
+
+def test_worker_failure_row_source_is_no_done(tmp_path):
+    """A real EL _synthesize_failure_row (no identity, no energy columns) must
+    contribute no done UIDs, leaving its input eligible for retry."""
+    pytest.importorskip("duckdb")
+    import types
+
+    from iqc.ensemble_launcher_dispatch import _synthesize_failure_row
+
+    xyz = tmp_path / "water.xyz"
+    xyz.write_text("3\nwater\nO 0 0 0\nH 0.76 0.59 0\nH -0.76 0.59 0\n")
+    args = types.SimpleNamespace(
+        input=None, xyz=str(xyz), smiles=None, sort=None, sort_order="up",
+        multiplicity=None, charge=None,
+    )
+    row = _synthesize_failure_row(
+        0, RuntimeError("backend crashed"),
+        args=args, params_str="", task="single", calculator_name="exachem",
+        xyz_files=[str(xyz)], input_mode="xyz", number_of_files=1,
+    )
+    assert "unique_name" not in row and "unique_name_base" not in row
+    assert "total_energy_eV" not in row
+
+    by_job = tmp_path / "by_job"
+    by_job.mkdir()
+    _write_parquet(by_job / "iqc_single_results_run.parquet", [row])
+    glob = str(by_job / "*.parquet")
+    assert bk.done_uids(glob) == set()
+    # summary reports the row; no identity column -> distinct/done are 0.
+    assert bk.summary(glob) == {"total_rows": 1, "distinct_uids": 0,
+                                "done_uids": 0, "not_done_uids": 0}
+
+    _write_parquet(tmp_path / "input.parquet", [{"unique_name": u} for u in ["m0", "m1"]])
+    assert bk.remaining(str(tmp_path / "input.parquet"), glob) == ["m0", "m1"]
+
+
+def test_backend_error_row_with_identity_no_energy(tmp_path):
+    """A _process_one_row result whose task raised before an energy: it has
+    unique_name_base + {task}_error but no energy column. Not done; retryable."""
+    pytest.importorskip("duckdb")
+    by_job = tmp_path / "by_job"
+    by_job.mkdir()
+    _write_parquet(
+        by_job / "job.parquet",
+        [{"unique_name": "M_conf0_0_0_20260101_000000",
+          "unique_name_base": "M_conf0", "task": "single",
+          "single_error": "SCF did not converge"}],
+    )
+    glob = str(by_job / "*.parquet")
+    assert bk.done_uids(glob) == set()
+    assert bk.summary(glob) == {"total_rows": 1, "distinct_uids": 1,
+                                "done_uids": 0, "not_done_uids": 1}
+    _write_parquet(tmp_path / "input.parquet", [{"unique_name": "M_conf0"}])
+    assert bk.remaining(str(tmp_path / "input.parquet"), glob) == ["M_conf0"]
+
+
+def test_empty_jsonl_file_is_no_done(tmp_path):
+    """A JSONL file opened before the first completion (empty) is not an error."""
+    pytest.importorskip("duckdb")
+    by_job = tmp_path / "by_job"
+    by_job.mkdir()
+    (by_job / "iqc_single_results_run.jsonl").write_text("")
+    glob = str(by_job / "*.jsonl")
+    assert bk.done_uids(glob) == set()
+    assert bk.summary(glob)["done_uids"] == 0
+    _write_parquet(tmp_path / "input.parquet", [{"unique_name": "z0"}])
+    assert bk.remaining(str(tmp_path / "input.parquet"), glob) == ["z0"]
+
+
+def test_mixed_success_and_failure_only_files(tmp_path):
+    """A glob mixing a successful file and a failure-only file: done = the
+    successes; the failure-only inputs remain."""
+    pytest.importorskip("duckdb")
+    by_job = tmp_path / "by_job"
+    by_job.mkdir()
+    _write_parquet(
+        by_job / "ok.parquet",
+        [{"unique_name_base": "good", "total_energy_eV": -1.0}],
+    )
+    _write_parquet(
+        by_job / "fail.parquet",
+        [{"unique_name_base": "bad", "single_error": "boom"}],  # no energy col here
+    )
+    glob = str(by_job / "*.parquet")
+    # union_by_name fills total_energy_eV=NULL for the failure row.
+    assert bk.done_uids(glob) == {"good"}
+    _write_parquet(tmp_path / "input.parquet",
+                   [{"unique_name": u} for u in ["good", "bad"]])
+    assert bk.remaining(str(tmp_path / "input.parquet"), glob) == ["bad"]

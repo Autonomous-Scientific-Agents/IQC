@@ -178,6 +178,30 @@ def _success_predicate(schema: dict[str, str], energy_column: str) -> str:
     return " AND ".join(parts)
 
 
+def _classify_source(schema: dict[str, str], energy_column: str) -> tuple[bool, bool]:
+    """Return ``(has_identity, has_energy)`` for a result schema.
+
+    A source made up only of failed/interrupted rows legitimately lacks the
+    energy and/or identity columns — a backend that raises before writing an
+    energy leaves ``unique_name_base`` + ``{task}_error`` and no energy; an EL
+    ``_synthesize_failure_row`` has neither identity column; an empty JSONL
+    (opened before the first completion) has neither. These contribute *no done
+    UIDs* (so their inputs stay eligible for retry) rather than erroring.
+
+    A caller that *explicitly* requested a non-default ``energy_column`` that is
+    absent is treated as a misspelling and still raises. Genuine
+    unreadable/corrupt files raise earlier, in :func:`_describe`.
+    """
+    has_identity = "unique_name_base" in schema or "unique_name" in schema
+    has_energy = energy_column in schema
+    if not has_energy and energy_column != DEFAULT_ENERGY_COLUMN:
+        raise ValueError(
+            f"energy column {energy_column!r} not found; available columns "
+            f"include: {sorted(schema)[:12]}..."
+        )
+    return has_identity, has_energy
+
+
 def _empty_summary() -> dict:
     return {"total_rows": 0, "distinct_uids": 0, "done_uids": 0, "not_done_uids": 0}
 
@@ -191,8 +215,9 @@ def done_uids(
 
     One authoritative definition of "done" shared by every tool (fixes the
     historical drift where a null-energy row counted as done in one index but
-    not another). An empty result glob (fresh sweep) yields an empty set rather
-    than an error.
+    not another). A result set with no successful rows — an empty glob (fresh
+    sweep) or only failed/interrupted output — yields an empty set rather than
+    an error.
     """
     duckdb = _require_duckdb()
     con = _connect(duckdb)
@@ -201,6 +226,9 @@ def done_uids(
         return set()
     scan = _scan_sql(files)
     schema = _describe(con, scan)
+    has_identity, has_energy = _classify_source(schema, energy_column)
+    if not (has_identity and has_energy):
+        return set()
     base = _base_expr(schema)
     success = _success_predicate(schema, energy_column)
     rows = con.execute(
@@ -221,8 +249,9 @@ def remaining(
     ``input_parquet`` supplies the authoritative work list; ``uid_column`` is
     its stable identity column (``unique_name`` for the sweep). Result rows are
     keyed by their stored base identity so the join is exact — no suffix parsing
-    on the common path. Before the first result file exists, every input UID is
-    returned.
+    on the common path. When the result set has no successful rows — no file yet
+    (fresh sweep) or only failed/interrupted output — every input UID is
+    returned so nothing is dropped from the retry list.
     """
     duckdb = _require_duckdb()
     con = _connect(duckdb)
@@ -232,14 +261,19 @@ def remaining(
         f"SELECT DISTINCT {uid} AS uid "
         f"FROM read_parquet('{input_lit}', union_by_name=true)"
     )
+
+    def _all_inputs() -> list[str]:
+        rows = con.execute(f"SELECT uid FROM ({input_scan}) ORDER BY uid").fetchall()
+        return [r[0] for r in rows]
+
     files = _glob_files(con, results_glob)
     if not files:
-        rows = con.execute(
-            f"SELECT uid FROM ({input_scan}) ORDER BY uid"
-        ).fetchall()
-        return [r[0] for r in rows]
+        return _all_inputs()
     scan = _scan_sql(files)
     schema = _describe(con, scan)
+    has_identity, has_energy = _classify_source(schema, energy_column)
+    if not (has_identity and has_energy):
+        return _all_inputs()
     base = _base_expr(schema)
     success = _success_predicate(schema, energy_column)
     rows = con.execute(
@@ -262,7 +296,9 @@ def summary(
 ) -> dict:
     """Return {total_rows, distinct_uids, done_uids, not_done_uids}.
 
-    Zero counts for an empty result glob (fresh sweep), rather than an error.
+    Zero counts for an empty result glob (fresh sweep). A failure-only source
+    still reports its row/identity counts (where an identity column exists) with
+    ``done_uids`` = 0, rather than erroring.
     """
     duckdb = _require_duckdb()
     con = _connect(duckdb)
@@ -271,16 +307,21 @@ def summary(
         return _empty_summary()
     scan = _scan_sql(files)
     schema = _describe(con, scan)
-    base = _base_expr(schema)
-    success = _success_predicate(schema, energy_column)
+    has_identity, has_energy = _classify_source(schema, energy_column)
+    if has_identity:
+        base = _base_expr(schema)
+        distinct_expr = f"COUNT(DISTINCT {base})"
+        done_expr = (
+            f"COUNT(DISTINCT CASE WHEN {_success_predicate(schema, energy_column)} "
+            f"THEN {base} END)"
+            if has_energy
+            else "0"
+        )
+    else:
+        distinct_expr = "0"
+        done_expr = "0"
     row = con.execute(
-        f"""
-        SELECT
-            COUNT(*) AS total_rows,
-            COUNT(DISTINCT {base}) AS distinct_uids,
-            COUNT(DISTINCT CASE WHEN {success} THEN {base} END) AS done_uids
-        FROM ({scan})
-        """
+        f"SELECT COUNT(*), {distinct_expr}, {done_expr} FROM ({scan})"
     ).fetchone()
     return {
         "total_rows": row[0],

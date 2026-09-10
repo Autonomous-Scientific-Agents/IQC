@@ -41,9 +41,13 @@ Read-only DuckDB over the per-job parquet/JSONL glob:
   drift. A non-null energy alone is not "done" — IQC keeps a final energy on an
   exhausted optimization / later-stage failure, and those must stay eligible for
   retry. JSONL results left by a walltime-killed job (before the epilogue
-  parquet conversion) are read with truncated-last-line tolerance, and an empty
-  result glob (fresh sweep) yields empty done / all-remaining rather than an
-  error. Many concurrent readers are safe by construction.
+  parquet conversion) are read with truncated-last-line tolerance. Sources with
+  no successful rows — an empty result glob (fresh sweep), an empty JSONL, or
+  output made up only of failure rows (which legitimately lack the energy
+  and/or identity columns) — yield empty done / all-remaining instead of an
+  error, so their inputs stay eligible for retry; genuinely corrupt/unreadable
+  files and misspelled explicit column names still error. Many concurrent
+  readers are safe by construction.
 - `claim_chunk` / `complete_chunk` / `fail_chunk` — whole-chunk claiming via
   atomic `os.rename` (todo → claimed/`<user>` → done, or back to todo on
   failure, auto re-eligible). Exactly one user wins a contested chunk.
