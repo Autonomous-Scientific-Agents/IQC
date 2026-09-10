@@ -9,6 +9,7 @@ on:
     branches:
       - main
       - dev
+  workflow_dispatch:
 
 jobs:
   test:
@@ -61,20 +62,86 @@ jobs:
       run: conda run -n iqc-env pytest iqc/tests/
 
   docker-build:
+    # Per-PR container check. Deliberately does NOT build the root Dockerfile:
+    # that image compiles TAMM + ExaChem (and Libint, GlobalArrays, BLIS, HDF5)
+    # from source, which does not fit a hosted runner. Measured on this repo:
+    # the job was killed by a runner shutdown after 41 min while still only 25%
+    # through Libint (unit unity_1945 of ~1948), hours from finishing and past
+    # the point where the 6 h job limit applies. Instead we lint both
+    # Dockerfiles and build the light `base` target of Dockerfile.uv, which
+    # produces a genuinely usable image (IQC + xTB + PySCF + NWChem + EMT) in
+    # a couple of minutes. The ExaChem-compiling targets are verified locally;
+    # see docs/docker.md.
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-      
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
-      
-    - name: Build Docker image
+
+    - name: Lint Dockerfiles
+      run: |
+        docker build --check -f Dockerfile .
+        docker build --check -f Dockerfile.uv .
+
+    - name: Validate docker-compose definition
+      run: docker compose -f docker-compose.yml config >/dev/null
+
+    - name: Build light image (Dockerfile.uv, base target)
       uses: docker/build-push-action@v5
       with:
         context: .
+        file: Dockerfile.uv
+        target: base
         push: false
-        tags: iqc:latest
+        load: true
+        tags: iqc:base
         cache-from: type=gha
         cache-to: type=gha,mode=max
+
+    - name: Smoke-test the light image
+      # Capability-aware: requires the calculators this image ships
+      # (EMT/xTB/PySCF/NWChem + pytest) and SKIPs the ones it does not.
+      run: docker run --rm iqc:base bash /opt/iqc/scripts/docker_smoke_test.sh
+
+  docker-build-mlip:
+    # Opt-in (manual) build of the MLIP target. Not on every PR: it pulls
+    # PyTorch + MACE + FAIRChem UMA (~6.4 GB). Worth running when the MLIP
+    # dependency set changes, because this is where the torch CPU-index
+    # resolve can silently regress into CUDA wheels.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Free runner disk space
+      # Same reclaim the test job needs: ubuntu-latest ships ~14 GB free and
+      # the MLIP layers do not fit without this.
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                    /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                    "$AGENT_TOOLSDIRECTORY" || true
+        df -h /
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build MLIP image (Dockerfile.uv, mlip target)
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: Dockerfile.uv
+        target: mlip
+        push: false
+        load: true
+        tags: iqc:mlip
+        cache-from: type=gha
+
+    - name: Assert torch is the CPU build
+      run: |
+        docker run --rm iqc:mlip python -c \
+          "import torch; assert '+cpu' in torch.__version__, torch.__version__; print(torch.__version__)"

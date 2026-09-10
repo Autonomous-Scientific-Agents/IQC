@@ -1,0 +1,144 @@
+# =============================================================================
+# IQC split image family (CPU-only, conda-free, uv-based)
+#
+# One multi-stage build with several targets so you build/pull only what a task
+# needs. Docker shares the common `base` layers on disk, and ExaChem is compiled
+# ONCE (in `exachem-builder`) and copied into both `exachem` and `full`.
+#
+#   base    : IQC + xTB + PySCF + NWChem + EMT + Jupyter          (light QC)
+#   mlip    : base + PyTorch(CPU) + MACE + FAIRChem UMA           (ML potentials)
+#   exachem : base + ExaChem (SCF/MP2/CCSD/CCSD(T))               (compiled QC)
+#   full    : mlip + ExaChem                                      (mixed workflows)
+#
+# Why no conda: every dependency is available either as a PyPI wheel (installed
+# with uv) or an apt package (NWChem, libxtb, OpenMPI, CMake, compilers). This
+# is smaller and faster than the conda monolith (see Dockerfile), uses ONE MPI
+# (apt OpenMPI everywhere), and builds ExaChem with the system toolchain that
+# TAMM actually expects.
+#
+# Build a single target:
+#   docker build -f Dockerfile.uv --target base    -t iqc:base    .
+#   docker build -f Dockerfile.uv --target mlip    -t iqc:mlip    .
+#   docker build -f Dockerfile.uv --target exachem -t iqc:exachem .
+#   docker build -f Dockerfile.uv --target full    -t iqc:full-uv .
+# Or use docker-compose.yml, which builds each target as a service.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# base: IQC + light quantum chemistry (xTB, PySCF, NWChem, EMT) + Jupyter
+# -----------------------------------------------------------------------------
+FROM python:3.11-slim AS base
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH \
+    UV_LINK_MODE=copy \
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    IQC_IMAGE_TARGET=base \
+    OMPI_ALLOW_RUN_AS_ROOT=1 \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    HF_HOME=/opt/hf-cache
+
+# Runtime QC codes from apt (NWChem + the xTB shared library) plus the bits
+# needed to build mpi4py against the system OpenMPI. One MPI (OpenMPI) is used
+# by NWChem, mpi4py, and (in the exachem targets) ExaChem.
+# NWChem + one MPI (OpenMPI, shared by NWChem/mpi4py/ExaChem) + the compiler
+# bits to build mpi4py. The xTB shared library is NOT installed from apt: the
+# PyPI `xtb` wheel bundles its own libxtb (see the execstack fix below).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        nwchem \
+        openmpi-bin libopenmpi-dev \
+        gcc libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# uv (fast installer/resolver) from the official image.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+RUN uv venv "$VIRTUAL_ENV"
+
+WORKDIR /opt/iqc
+# Copy only what the install/tests need (keeps the context layer tiny).
+# env*.yml are included because a repo-hygiene test reads env.yml.
+COPY pyproject.toml README.md env.yml env-docker.yml ./
+COPY iqc ./iqc
+COPY scripts ./scripts
+COPY docs ./docs
+
+# IQC + xTB Python bindings + PySCF + YAML params + Jupyter. RDKit, ASE,
+# pymatgen, mpi4py, etc. come from pyproject dependencies as PyPI wheels.
+# The xtb wheel bundles Fortran libs with an executable stack that modern
+# kernels refuse to load; clear that flag so `xtb.ase.calculator` imports.
+RUN uv pip install -e ".[xtb,test]" pyscf pyyaml jupyterlab ipywidgets \
+    && XTBDIR="$(python -c 'import xtb, os; print(os.path.dirname(xtb.__file__))')" \
+    && python scripts/clear_execstack.py "$XTBDIR" "${XTBDIR}.libs" \
+    && python -c "import iqc, ase, rdkit, pyscf; from xtb.ase.calculator import XTB; print('base import OK')"
+
+RUN mkdir -p /opt/hf-cache /work && chmod -R 777 /opt/hf-cache /work
+WORKDIR /work
+EXPOSE 8888
+# Plain `docker run iqc:base` -> Jupyter Lab. `docker run iqc:base iqc ...`
+# runs the CLI directly (the venv is on PATH; no entrypoint wrapper needed).
+CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", \
+     "--allow-root", "--ServerApp.token=", "--ServerApp.password="]
+
+# -----------------------------------------------------------------------------
+# mlip: base + PyTorch (CPU) + MACE + FAIRChem UMA
+# -----------------------------------------------------------------------------
+FROM base AS mlip
+ENV IQC_IMAGE_TARGET=mlip
+# Route the whole MLIP resolve through the PyTorch CPU index so fairchem-core's
+# torch pin resolves to its `+cpu` build (no ~6 GB of NVIDIA CUDA wheels).
+ENV UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu
+WORKDIR /opt/iqc
+RUN uv pip install -e ".[mlip]" \
+    && uv pip install --no-deps mace-torch \
+    && python -c "import torch; assert '+cpu' in torch.__version__, torch.__version__; \
+import mace, fairchem.core; print('mlip OK', torch.__version__)"
+WORKDIR /work
+
+# -----------------------------------------------------------------------------
+# exachem-builder: compile ExaChem + TAMM from source with the system toolchain
+# -----------------------------------------------------------------------------
+FROM base AS exachem-builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        g++ gfortran cmake make ninja-build git \
+        autoconf automake libtool m4 \
+        libnuma-dev \
+    && rm -rf /var/lib/apt/lists/*
+ENV EXACHEM_PREFIX=/opt/exachem \
+    EXACHEM_SRC=/opt/exachem-src \
+    BUILD_JOBS=16
+RUN bash /opt/iqc/scripts/build_exachem.sh && rm -rf /opt/exachem-src
+
+# -----------------------------------------------------------------------------
+# exachem: base + the compiled ExaChem (no build toolchain in the final image)
+# -----------------------------------------------------------------------------
+FROM base AS exachem
+
+ENV IQC_IMAGE_TARGET=exachem
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgfortran5 libnuma1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=exachem-builder /opt/exachem /opt/exachem
+ENV EXACHEM_BINARY=/opt/exachem/install/bin/ExaChem \
+    PATH=/opt/exachem/install/bin:$PATH
+RUN test -x "$EXACHEM_BINARY" \
+    && { ldd "$EXACHEM_BINARY" | grep -i "not found" && exit 1 || true; } \
+    && echo "ExaChem runtime libs OK"
+
+# -----------------------------------------------------------------------------
+# full: mlip + ExaChem (needed for single runs that mix calculator families,
+#       e.g. IR with a MACE Hessian and ExaChem/ORCA dipoles)
+# -----------------------------------------------------------------------------
+FROM mlip AS full
+ENV IQC_IMAGE_TARGET=full
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgfortran5 libnuma1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=exachem-builder /opt/exachem /opt/exachem
+ENV EXACHEM_BINARY=/opt/exachem/install/bin/ExaChem \
+    PATH=/opt/exachem/install/bin:$PATH
+RUN test -x "$EXACHEM_BINARY" && echo "full image ExaChem OK"

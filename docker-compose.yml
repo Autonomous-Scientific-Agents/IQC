@@ -1,0 +1,101 @@
+# IQC split-image stack (conda-free, uv-based) built from Dockerfile.uv.
+#
+# Each service is a purpose-built target sharing the common `base` layers.
+# They share a ./work bind mount (your inputs/outputs) and a persistent
+# Hugging Face model cache, so results flow between services.
+#
+# One-shot CLI runs (pick the smallest image with the calculator you need):
+#   docker compose run --rm qc      iqc --smiles O --task thermo --calculator xtb
+#   docker compose run --rm qc      iqc --smiles O --task single --params /work/pyscf.yaml
+#   docker compose run --rm mlip    iqc --smiles O --task single --calculator mace
+#   docker compose run --rm exachem iqc --smiles O --task single --calculator exachem
+#   docker compose run --rm full    iqc --task ir --xyz /work/m.xyz --params /work/ir.yaml
+#
+# Interactive Jupyter Lab (has the full stack): http://localhost:8888
+#   docker compose up jupyter
+#
+# Build everything up front (optional; services build on first use otherwise):
+#   docker compose build
+#
+# NOTE: a single IQC run that MIXES calculator families (e.g. a MACE Hessian
+# with ExaChem dipoles) must use the `full` service — cross-container calls are
+# not possible because each calculation runs in one process.
+
+x-common: &common
+  working_dir: /work
+  volumes:
+    - ./work:/work
+    - iqc-hf-cache:/opt/hf-cache
+  environment:
+    # Uncomment to use gated FAIRChem UMA checkpoints in mlip/full:
+    # - HF_TOKEN=${HF_TOKEN:-}
+    #
+    # IQC_DISABLE_MPI is intentionally unset: it would override the launcher
+    # variables IQC uses to detect an MPI run, so `mpiexec -n N iqc ...`
+    # inside a service would silently run N duplicate serial jobs. IQC
+    # defaults to serial without a launcher anyway.
+    PYTHONUNBUFFERED: "1"
+
+services:
+  # Light quantum chemistry: xTB, PySCF, NWChem, EMT.
+  qc:
+    build:
+      context: .
+      dockerfile: Dockerfile.uv
+      target: base
+    image: iqc:base
+    <<: *common
+    command: ["iqc", "--help"]
+
+  # Machine-learning potentials: MACE, FAIRChem UMA (+ everything in base).
+  mlip:
+    build:
+      context: .
+      dockerfile: Dockerfile.uv
+      target: mlip
+    image: iqc:mlip
+    <<: *common
+    command: ["iqc", "--help"]
+
+  # ExaChem (SCF/MP2/CCSD/CCSD(T)) + everything in base.
+  exachem:
+    build:
+      context: .
+      dockerfile: Dockerfile.uv
+      target: exachem
+    image: iqc:exachem
+    <<: *common
+    command: ["iqc", "--help"]
+
+  # Full stack: MLIP + ExaChem, for single runs that mix calculator families.
+  full:
+    build:
+      context: .
+      dockerfile: Dockerfile.uv
+      target: full
+    image: iqc:full-uv
+    <<: *common
+    command: ["iqc", "--help"]
+
+  # Interactive Jupyter Lab on the full stack.
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile.uv
+      target: full
+    image: iqc:full-uv
+    <<: *common
+    ports:
+      - "8888:8888"
+    command:
+      - jupyter
+      - lab
+      - --ip=0.0.0.0
+      - --port=8888
+      - --no-browser
+      - --allow-root
+      - --ServerApp.token=
+      - --ServerApp.password=
+
+volumes:
+  iqc-hf-cache:
