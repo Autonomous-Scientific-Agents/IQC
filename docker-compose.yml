@@ -29,7 +29,12 @@ x-common: &common
   environment:
     # Uncomment to use gated FAIRChem UMA checkpoints in mlip/full:
     # - HF_TOKEN=${HF_TOKEN:-}
-    IQC_DISABLE_MPI: "1"
+    #
+    # IQC_DISABLE_MPI is intentionally unset: it would override the launcher
+    # variables IQC uses to detect an MPI run, so `mpiexec -n N iqc ...`
+    # inside a service would silently run N duplicate serial jobs. IQC
+    # defaults to serial without a launcher anyway.
+    PYTHONUNBUFFERED: "1"
 
 services:
   # Light quantum chemistry: xTB, PySCF, NWChem, EMT.

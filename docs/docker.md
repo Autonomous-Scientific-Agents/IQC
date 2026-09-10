@@ -95,6 +95,13 @@ docker run --rm -v "$PWD":/work iqc:full \
   mpiexec -n 4 iqc --xyz /work/molecules --task single --calculator xtb
 ```
 
+IQC detects the launcher's rank/size variables and splits the input across
+ranks. The images deliberately do **not** set `IQC_DISABLE_MPI`: that flag
+short-circuits detection, so each rank would report rank 0 / size 1 and redo
+the entire input (4 duplicate result sets for `-n 4`). A serial `docker run
+... iqc ...` needs no flag — IQC runs serial when no launcher variables are
+present.
+
 ## MLIP models at runtime
 
 Model checkpoints are **not** baked in (keeps the image small):
@@ -120,6 +127,23 @@ suite:
 ```bash
 docker run --rm iqc:full bash /opt/iqc/scripts/docker_smoke_test.sh
 ```
+
+Each image sets `IQC_IMAGE_TARGET`, and the smoke test maps that to the set of
+calculators the target is expected to ship. A required calculator that is
+missing — or installed but failing to import, e.g. a missing shared library —
+**fails** the run; only calculators the target intentionally excludes are
+skipped. Override the expected set for ad-hoc runs:
+
+```bash
+docker run --rm -e IQC_SMOKE_REQUIRE="xtb pyscf" iqc:base \
+  bash /opt/iqc/scripts/docker_smoke_test.sh
+```
+
+Each calculator check runs in its own directory and the resulting JSONL row is
+validated: no `error`/`*_error` fields, the task's energies present and finite,
+and `opt_converged` true for optimizations. This matters because `iqc` exits 0
+after recording a per-molecule failure, so exit status alone does not show that
+a calculator worked.
 
 Required checks: pytest, EMT, xTB (single/opt/thermo), PySCF, ExaChem, NWChem.
 Optional checks (need network / gated model): MACE, FAIRChem UMA import.

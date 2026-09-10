@@ -93,12 +93,18 @@ RUN pip install --no-cache-dir -e ".[mlip,parsl,mcp,test]" \
 # Runtime configuration
 # -----------------------------------------------------------------------------
 # Single-thread BLAS/OMP by default (safe on shared hosts, avoids
-# pthread_create storms); serial MPI for one-shot CLI; writable HF cache.
+# pthread_create storms); writable HF cache.
+#
+# IQC_DISABLE_MPI is deliberately NOT set: it short-circuits
+# iqc.mpitools.should_initialize_mpi ahead of the launcher-variable check, so
+# `mpiexec -n 4 iqc ...` would start four processes that each see rank 0 /
+# size 1 and redo the whole input. IQC already runs serial when no launcher
+# variables are present, so one-shot CLI runs need no forced disable.
 ENV OMP_NUM_THREADS=1 \
     OPENBLAS_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1 \
-    IQC_DISABLE_MPI=1 \
+    IQC_IMAGE_TARGET=full-conda \
     HF_HOME=/opt/hf-cache \
     OMPI_ALLOW_RUN_AS_ROOT=1 \
     OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1

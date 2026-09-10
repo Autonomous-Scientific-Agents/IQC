@@ -114,6 +114,12 @@ def get_mpi_context():
     import mpi4py
 
     mpi4py.rc.initialize = False
+    # rc.finalize defaults to "follow rc.initialize", so leaving it unset
+    # means mpi4py registers no atexit MPI_Finalize while we initialize MPI
+    # ourselves below. Every `mpiexec -n N iqc ...` run then ends with the
+    # launcher reporting an abnormal termination ("called init, but exited
+    # without calling finalize") and a nonzero exit status.
+    mpi4py.rc.finalize = True
     from mpi4py import MPI as real_mpi
 
     if not real_mpi.Is_initialized():

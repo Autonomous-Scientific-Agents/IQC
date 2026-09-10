@@ -37,7 +37,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     OPENBLAS_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1 \
-    IQC_DISABLE_MPI=1 \
+    IQC_IMAGE_TARGET=base \
     OMPI_ALLOW_RUN_AS_ROOT=1 \
     OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
     HF_HOME=/opt/hf-cache
@@ -88,6 +88,7 @@ CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", \
 # mlip: base + PyTorch (CPU) + MACE + FAIRChem UMA
 # -----------------------------------------------------------------------------
 FROM base AS mlip
+ENV IQC_IMAGE_TARGET=mlip
 # Route the whole MLIP resolve through the PyTorch CPU index so fairchem-core's
 # torch pin resolves to its `+cpu` build (no ~6 GB of NVIDIA CUDA wheels).
 ENV UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu
@@ -116,6 +117,8 @@ RUN bash /opt/iqc/scripts/build_exachem.sh && rm -rf /opt/exachem-src
 # exachem: base + the compiled ExaChem (no build toolchain in the final image)
 # -----------------------------------------------------------------------------
 FROM base AS exachem
+
+ENV IQC_IMAGE_TARGET=exachem
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgfortran5 libnuma1 \
     && rm -rf /var/lib/apt/lists/*
@@ -131,6 +134,7 @@ RUN test -x "$EXACHEM_BINARY" \
 #       e.g. IR with a MACE Hessian and ExaChem/ORCA dipoles)
 # -----------------------------------------------------------------------------
 FROM mlip AS full
+ENV IQC_IMAGE_TARGET=full
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgfortran5 libnuma1 \
     && rm -rf /var/lib/apt/lists/*
