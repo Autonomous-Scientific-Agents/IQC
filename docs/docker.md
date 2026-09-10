@@ -131,6 +131,30 @@ as a stand-in binary, absent from the slim base; the other asserts a "Forces"
 warning that does not apply — the ExaChem SCF run itself succeeds). These are
 test-fixture assumptions, not functional failures.
 
+## What CI verifies
+
+Per-PR CI lints both Dockerfiles, validates `docker-compose.yml`, builds the
+`base` target of `Dockerfile.uv`, and runs the smoke test inside it.
+
+CI does **not** build the ExaChem-compiling images (the root `Dockerfile`, or
+the `exachem`/`full` targets). Compiling TAMM + ExaChem pulls in Libint,
+GlobalArrays, BLIS, and HDF5 from source and does not fit a hosted runner: a
+measured attempt was killed after 41 minutes while still only 25% through
+Libint (unit `unity_1945` of ~1948), with hours left before ExaChem itself
+starts. Build those images locally, and verify them with the smoke test:
+
+```bash
+docker build -t iqc:full .
+docker run --rm iqc:full bash /opt/iqc/scripts/docker_smoke_test.sh
+```
+
+`BUILD_JOBS` (default 16) controls compile parallelism — lower it on machines
+with limited RAM, since the Libint unity units are memory-hungry.
+
+A manual `docker-build-mlip` job (run via *Actions → CI → Run workflow*) builds
+the `mlip` target and asserts torch resolved to its `+cpu` build; run it when
+the MLIP dependency set changes.
+
 ## Notes
 
 - **MPI as root**: the image sets `OMPI_ALLOW_RUN_AS_ROOT=1` and
