@@ -124,7 +124,7 @@ docker run --rm iqc:full bash /opt/iqc/scripts/docker_smoke_test.sh
 Required checks: pytest, EMT, xTB (single/opt/thermo), PySCF, ExaChem, NWChem.
 Optional checks (need network / gated model): MACE, FAIRChem UMA import.
 
-Expected result (verified): `RESULT: PASS` — 303 pytest tests pass and every
+Expected result (verified): `RESULT: PASS` — the pytest suite passes and every
 bundled calculator runs. Two ExaChem tests are deselected because they assume
 an environment where ExaChem is *not* installed (one hardcodes `/usr/bin/true`
 as a stand-in binary, absent from the slim base; the other asserts a "Forces"
@@ -242,5 +242,6 @@ docker run --rm iqc:exachem bash /opt/iqc/scripts/docker_smoke_test.sh   # + Exa
 docker run --rm iqc:full-uv bash /opt/iqc/scripts/docker_smoke_test.sh   # everything
 ```
 
-All four report `RESULT: PASS` (base: 240 tests; full: 296 tests + every
-bundled calculator).
+All four report `RESULT: PASS`: the pytest suite plus every calculator that
+image ships (absent ones are reported as SKIP, so the same script is a valid
+check for each target).
