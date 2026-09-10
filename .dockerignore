@@ -1,0 +1,35 @@
+# Keep the Docker build context small and the image clean.
+# Only the source tree (iqc/, scripts/, pyproject.toml, README, docs, env files)
+# is needed to build the image.
+
+.git
+.venv
+venv
+*.egg-info
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ipynb_checkpoints
+
+# Bulky local run artifacts (results, scratch dirs, generated data)
+*.jsonl
+*.parquet
+*.pkl
+*.log
+iqc_thermo_results_*
+20*_*.txt
+iqc_tmp/
+tmp/
+tmp_thermo_*/
+pbs_logs/
+pbs_scripts/
+mol_*_calc_*/
+*_calc_orca/
+web_app/
+notebooks/
+
+# Editor / OS cruft
+.vscode/
+.idea/
+.DS_Store
