@@ -45,9 +45,13 @@ Read-only DuckDB over the per-job parquet/JSONL glob:
   no successful rows — an empty result glob (fresh sweep), an empty JSONL, or
   output made up only of failure rows (which legitimately lack the energy
   and/or identity columns) — yield empty done / all-remaining instead of an
-  error, so their inputs stay eligible for retry; genuinely corrupt/unreadable
-  files and misspelled explicit column names still error. Many concurrent
-  readers are safe by construction.
+  error, so their inputs stay eligible for retry. This also covers later-stage
+  failures that retain initial or optimization energies but lack the requested
+  final energy. Missing-column validation checks recorded failure status first:
+  it raises only when a row without a recorded failure contains another energy
+  value. Thus misspelled columns on successful data still error, while failed
+  calculations remain retryable. Unreadable/corrupt Parquet files still raise.
+  Many concurrent readers are safe by construction.
 - `claim_chunk` / `complete_chunk` / `fail_chunk` — whole-chunk claiming via
   atomic `os.rename` (todo → claimed/`<user>` → done, or back to todo on
   failure, auto re-eligible). Exactly one user wins a contested chunk.

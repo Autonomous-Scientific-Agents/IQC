@@ -411,3 +411,108 @@ def test_mixed_success_and_failure_only_files(tmp_path):
     _write_parquet(tmp_path / "input.parquet",
                    [{"unique_name": u} for u in ["good", "bad"]])
     assert bk.remaining(str(tmp_path / "input.parquet"), glob) == ["bad"]
+
+
+@pytest.mark.parametrize("energy_column", ["total_energy_eV", "energy_eV"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        {"error": "final energy failed"},
+        {"single_error": "SCF failed"},
+        {"nonphysical": True},
+        {"opt_converged": False},
+    ],
+)
+def test_intermediate_energy_on_failed_rows_does_not_block_retries(
+    tmp_path, energy_column, failure
+):
+    pytest.importorskip("duckdb")
+    results = tmp_path / "failed.parquet"
+    inputs = tmp_path / "input.parquet"
+    _write_parquet(
+        results, [{"unique_name_base": "mol", "initial_energy_eV": -1.0, **failure}]
+    )
+    _write_parquet(inputs, [{"unique_name": "mol"}])
+    assert bk.done_uids(str(results), energy_column=energy_column) == set()
+    assert bk.remaining(str(inputs), str(results), energy_column=energy_column) == [
+        "mol"
+    ]
+    assert bk.summary(str(results), energy_column=energy_column) == {
+        "total_rows": 1,
+        "distinct_uids": 1,
+        "done_uids": 0,
+        "not_done_uids": 1,
+    }
+
+
+def test_late_thermo_energy_failure_stays_retryable(tmp_path):
+    pytest.importorskip("duckdb")
+    import json
+    import numpy as np
+    from ase import Atoms
+    from ase.calculators.calculator import Calculator, all_changes
+    from iqc.asetools import run_thermo
+
+    class GeometryCalculator(Calculator):
+        implemented_properties = ["energy", "forces"]
+
+        def calculate(
+            self, atoms=None, properties=("energy",), system_changes=all_changes
+        ):
+            super().calculate(atoms, properties, system_changes)
+            self.results = {"energy": -1.0, "forces": np.zeros((len(atoms), 3))}
+
+    class FailedEnergy(Calculator):
+        implemented_properties = ["energy"]
+
+        def calculate(self, *args, **kwargs):
+            raise RuntimeError("final electronic calculation failed")
+
+    _, result = run_thermo(
+        Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]]),
+        calculator=GeometryCalculator(),
+        energy_calculator=FailedEnergy(),
+        vib_dir=tmp_path,
+        unique_name="mol",
+    )
+    assert (
+        result["opt_converged"]
+        and "final electronic calculation failed" in result["error"]
+    )
+    assert "initial_energy_eV" in result and "total_energy_eV" not in result
+    fields = [
+        "unique_name",
+        "initial_energy_eV",
+        "opt_energy_eV",
+        "opt_converged",
+        "error",
+    ]
+    output = tmp_path / "result.jsonl"
+    output.write_text(json.dumps({k: result[k] for k in fields}) + "\n" + '{"partial":')
+    inputs = tmp_path / "input.parquet"
+    _write_parquet(inputs, [{"unique_name": "mol"}])
+    assert bk.done_uids(str(output)) == set()
+    assert bk.remaining(str(inputs), str(output)) == ["mol"]
+    assert bk.summary(str(output))["not_done_uids"] == 1
+
+
+@pytest.mark.parametrize("query", ["done", "remaining", "summary"])
+def test_failed_rows_do_not_hide_missing_column_on_successful_rows(tmp_path, query):
+    pytest.importorskip("duckdb")
+    results = tmp_path / "mixed.parquet"
+    inputs = tmp_path / "input.parquet"
+    _write_parquet(
+        results,
+        [
+            {"unique_name_base": "failed", "initial_energy_eV": -1.0, "error": "boom"},
+            {"unique_name_base": "ok", "total_energy_eV": -2.0, "error": ""},
+        ],
+    )
+    _write_parquet(inputs, [{"unique_name": "failed"}, {"unique_name": "ok"}])
+    with pytest.raises(ValueError, match="not found"):
+        if query == "remaining":
+            bk.remaining(str(inputs), str(results), energy_column="enrgy_eV")
+        elif query == "summary":
+            bk.summary(str(results), energy_column="enrgy_eV")
+        else:
+            bk.done_uids(str(results), energy_column="enrgy_eV")

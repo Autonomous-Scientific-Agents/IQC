@@ -43,10 +43,8 @@ _RUNID_SUFFIX_RE = r"_[0-9]+_[0-9]+_[0-9]{8}_[0-9]{6}$"
 DEFAULT_ENERGY_COLUMN = "total_energy_eV"
 
 # IQC energy columns end in ``_eV`` (total_energy_eV, energy_eV, scf_energy_eV,
-# opt_total_energy_eV, initial_*_eV, ...). We use the presence of *any* such
-# column to tell "the requested energy column is misspelled" (other energy
-# columns exist, just not that one) from "this is a failure-only source" (no
-# energy columns at all).
+# opt_total_energy_eV, initial_*_eV, ...). These are candidate values for
+# missing-column validation; recorded failures must be excluded first.
 _ENERGY_COLUMN_SUFFIX = "_eV"
 
 
@@ -154,6 +152,20 @@ def _base_expr(columns: Iterable[str]) -> str:
     )
 
 
+def _no_failure_predicate(schema: dict[str, str]) -> str:
+    """Rows without recorded failures, independent of available energy columns."""
+    parts = []
+    if "nonphysical" in schema:
+        parts.append("(nonphysical IS NULL OR nonphysical = FALSE)")
+    if "opt_converged" in schema:
+        parts.append("(opt_converged IS NULL OR opt_converged = TRUE)")
+    for c in sorted(schema):
+        if c == "error" or c.endswith("_error"):
+            q = _quote(c)
+            parts.append(f"({q} IS NULL OR {q} = '')")
+    return " AND ".join(parts) or "TRUE"
+
+
 def _success_predicate(schema: dict[str, str], energy_column: str) -> str:
     """SQL predicate for a *successful* result row.
 
@@ -170,22 +182,16 @@ def _success_predicate(schema: dict[str, str], energy_column: str) -> str:
             f"include: {sorted(cols)[:12]}..."
         )
     e = _quote(energy_column)
-    parts = [f"{e} IS NOT NULL"]
+    parts = [f"{e} IS NOT NULL", _no_failure_predicate(schema)]
     if any(t in schema[energy_column] for t in ("DOUBLE", "FLOAT", "REAL", "DECIMAL")):
         parts.append(f"NOT isnan({e})")
         parts.append(f"NOT isinf({e})")
-    if "nonphysical" in cols:
-        parts.append("(nonphysical IS NULL OR nonphysical = FALSE)")
-    if "opt_converged" in cols:
-        parts.append("(opt_converged IS NULL OR opt_converged = TRUE)")
-    for c in sorted(cols):
-        if c == "error" or c.endswith("_error"):
-            q = _quote(c)
-            parts.append(f"({q} IS NULL OR {q} = '')")
     return " AND ".join(parts)
 
 
-def _classify_source(schema: dict[str, str], energy_column: str) -> tuple[bool, bool]:
+def _classify_source(
+    con, scan: str, schema: dict[str, str], energy_column: str
+) -> tuple[bool, bool]:
     """Return ``(has_identity, has_energy)`` for a result schema.
 
     A source made up only of failed/interrupted rows legitimately lacks the
@@ -195,23 +201,28 @@ def _classify_source(schema: dict[str, str], energy_column: str) -> tuple[bool, 
     (opened before the first completion) has neither. These contribute *no done
     UIDs* (so their inputs stay eligible for retry) rather than erroring.
 
-    The requested ``energy_column`` being absent is a *misspelling* — and still
-    raises — only when the source contains some other energy column (a ``*_eV``
-    column): the data clearly has energies, just not under that name. A source
-    with no energy columns at all is failure-only and is tolerated for *any*
-    requested column name (default or a valid non-default like ``energy_eV``).
-    Genuine unreadable/corrupt files raise earlier, in :func:`_describe`.
+    If the requested column is absent, only rows without recorded failures
+    and with an actual energy value can establish a missing-column error.
+    Failed later stages may retain intermediate energies; those must not block
+    retries. Empty/all-null rows left by an interrupted append also contribute
+    no evidence of a misspelled column. The ordinary success path needs no
+    extra scan. Unreadable/corrupt files raise earlier, in :func:`_describe`.
     """
     has_identity = "unique_name_base" in schema or "unique_name" in schema
     has_energy = energy_column in schema
-    if not has_energy and any(
-        c.endswith(_ENERGY_COLUMN_SUFFIX) for c in schema
-    ):
-        present = sorted(c for c in schema if c.endswith(_ENERGY_COLUMN_SUFFIX))
-        raise ValueError(
-            f"energy column {energy_column!r} not found; available energy "
-            f"columns: {present}"
-        )
+    present = sorted(c for c in schema if c.endswith(_ENERGY_COLUMN_SUFFIX))
+    if not has_energy and present:
+        any_energy = " OR ".join(f"{_quote(c)} IS NOT NULL" for c in present)
+        candidate = _no_failure_predicate(schema)
+        has_candidate = con.execute(
+            f"SELECT EXISTS (SELECT 1 FROM ({scan}) "
+            f"WHERE ({candidate}) AND ({any_energy}))"
+        ).fetchone()[0]
+        if has_candidate:
+            raise ValueError(
+                f"energy column {energy_column!r} not found; available energy "
+                f"columns: {present}"
+            )
     return has_identity, has_energy
 
 
@@ -239,7 +250,7 @@ def done_uids(
         return set()
     scan = _scan_sql(files)
     schema = _describe(con, scan)
-    has_identity, has_energy = _classify_source(schema, energy_column)
+    has_identity, has_energy = _classify_source(con, scan, schema, energy_column)
     if not (has_identity and has_energy):
         return set()
     base = _base_expr(schema)
@@ -284,7 +295,7 @@ def remaining(
         return _all_inputs()
     scan = _scan_sql(files)
     schema = _describe(con, scan)
-    has_identity, has_energy = _classify_source(schema, energy_column)
+    has_identity, has_energy = _classify_source(con, scan, schema, energy_column)
     if not (has_identity and has_energy):
         return _all_inputs()
     base = _base_expr(schema)
@@ -320,7 +331,7 @@ def summary(
         return _empty_summary()
     scan = _scan_sql(files)
     schema = _describe(con, scan)
-    has_identity, has_energy = _classify_source(schema, energy_column)
+    has_identity, has_energy = _classify_source(con, scan, schema, energy_column)
     if has_identity:
         base = _base_expr(schema)
         distinct_expr = f"COUNT(DISTINCT {base})"
