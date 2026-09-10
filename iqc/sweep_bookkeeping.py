@@ -7,8 +7,9 @@ replaces the old text ledgers (``done.txt`` / ``claimed.txt`` /
 * **State derived on read** — the *done* / *remaining* sets are computed with a
   single DuckDB query over the immutable per-job parquet/JSONL glob. Read-only,
   so any number of users/readers are safe by construction, and one place
-  defines "done" (a row with non-null energy) → no semantic drift between
-  tools.
+  defines "done" — a *successful* row (finite energy, no ``error``/``*_error``,
+  not ``nonphysical``, ``opt_converged`` not false), matching
+  ``status_query`` → no semantic drift between tools.
 * **Atomic chunk claiming** — a submitter claims a whole chunk by
   ``os.rename('.../todo/c.parquet', '.../claimed/<user>/c.parquet')``. POSIX /
   Lustre ``rename`` is atomic, so exactly one user wins a given chunk and the
@@ -66,26 +67,79 @@ def base_from_unique_name(unique_name: str) -> str:
     return re.sub(_RUNID_SUFFIX_RE, "", unique_name)
 
 
-def _parquet_columns(duckdb, glob: str) -> set[str]:
-    """Return the union of column names across the parquet/JSONL glob."""
-    rows = duckdb.sql(
-        f"DESCRIBE SELECT * FROM read_parquet('{glob}', union_by_name=true)"
-    ).fetchall()
-    return {r[0] for r in rows}
+def _connect(duckdb):
+    """A fresh in-memory read-only connection (many readers are safe)."""
+    return duckdb.connect(database=":memory:")
+
+
+def _quote(ident: str) -> str:
+    """Double-quote a SQL identifier, escaping embedded quotes."""
+    return '"' + ident.replace('"', '""') + '"'
+
+
+def _sql_str_list(paths: Iterable[str]) -> str:
+    """Render paths as a SQL list literal: ['a', 'b'] with quotes escaped."""
+    return "[" + ", ".join("'" + p.replace("'", "''") + "'" for p in paths) + "]"
+
+
+def _glob_files(con, glob: str) -> list[str]:
+    """Return the files matching ``glob`` (empty list when none exist).
+
+    DuckDB's ``glob`` table function returns zero rows for a pattern that
+    matches nothing — this is how we tell "no results yet" (a normal fresh-sweep
+    state) apart from "a file exists but is unreadable" (a real error that the
+    subsequent read surfaces).
+    """
+    return [r[0] for r in con.execute("SELECT file FROM glob(?)", [glob]).fetchall()]
+
+
+def _scan_sql(files: list[str]) -> str:
+    """A ``FROM``-able subquery reading every file, keyed by column name.
+
+    Parquet files are read with ``read_parquet``; everything else (``.jsonl``
+    and extensionless sweep output) with ``read_json`` in newline-delimited mode
+    with ``ignore_errors`` so a walltime-truncated last line is dropped while the
+    valid rows before it are kept. Mixed globs are UNIONed by name.
+    """
+    parquet = [f for f in files if f.lower().endswith((".parquet", ".pq"))]
+    jsonish = [f for f in files if f not in parquet]
+    parts: list[str] = []
+    if parquet:
+        parts.append(
+            f"SELECT * FROM read_parquet({_sql_str_list(parquet)}, union_by_name=true)"
+        )
+    if jsonish:
+        parts.append(
+            "SELECT * FROM read_json("
+            f"{_sql_str_list(jsonish)}, union_by_name=true, "
+            "format='newline_delimited', ignore_errors=true)"
+        )
+    return " UNION ALL BY NAME ".join(f"({p})" for p in parts)
+
+
+def _describe(con, scan_sql: str) -> dict[str, str]:
+    """Return {column_name: upper-case column_type} for a scan subquery."""
+    rows = con.execute(f"DESCRIBE SELECT * FROM ({scan_sql})").fetchall()
+    return {r[0]: str(r[1]).upper() for r in rows}
 
 
 def _base_expr(columns: Iterable[str]) -> str:
     """SQL expression yielding the base identity for a result row.
 
-    Uses the stored ``unique_name_base`` when the column exists (COALESCEd with
-    the regex fallback for rows within a mixed file that happen to be null),
-    otherwise strips the suffix off ``unique_name``.
+    ``unique_name_base`` is the canonical key. Only when *both* it and the
+    legacy ``unique_name`` exist do we ``COALESCE`` (so a mixed file with some
+    null bases still resolves); referencing ``unique_name`` when the column is
+    absent would raise a binder error even if every base is non-null.
     """
     cols = set(columns)
     strip = f"regexp_replace(unique_name, '{_RUNID_SUFFIX_RE}', '')"
-    if "unique_name_base" in cols:
+    has_base = "unique_name_base" in cols
+    has_name = "unique_name" in cols
+    if has_base and has_name:
         return f"COALESCE(unique_name_base, {strip})"
-    if "unique_name" in cols:
+    if has_base:
+        return "unique_name_base"
+    if has_name:
         return strip
     raise ValueError(
         "result files have neither 'unique_name_base' nor 'unique_name'; "
@@ -93,9 +147,39 @@ def _base_expr(columns: Iterable[str]) -> str:
     )
 
 
-def _connect(duckdb):
-    """A fresh in-memory read-only connection (many readers are safe)."""
-    return duckdb.connect(database=":memory:")
+def _success_predicate(schema: dict[str, str], energy_column: str) -> str:
+    """SQL predicate for a *successful* result row.
+
+    A non-null energy is necessary but not sufficient: IQC keeps a final energy
+    on an exhausted optimization and on later-stage failures. Mirrors
+    ``status_query._record_error`` so done/remaining/summary agree with the
+    status tooling: finite energy AND no ``error``/``*_error`` AND not
+    ``nonphysical`` AND ``opt_converged`` not false.
+    """
+    cols = set(schema)
+    if energy_column not in cols:
+        raise ValueError(
+            f"energy column {energy_column!r} not found; available columns "
+            f"include: {sorted(cols)[:12]}..."
+        )
+    e = _quote(energy_column)
+    parts = [f"{e} IS NOT NULL"]
+    if any(t in schema[energy_column] for t in ("DOUBLE", "FLOAT", "REAL", "DECIMAL")):
+        parts.append(f"NOT isnan({e})")
+        parts.append(f"NOT isinf({e})")
+    if "nonphysical" in cols:
+        parts.append("(nonphysical IS NULL OR nonphysical = FALSE)")
+    if "opt_converged" in cols:
+        parts.append("(opt_converged IS NULL OR opt_converged = TRUE)")
+    for c in sorted(cols):
+        if c == "error" or c.endswith("_error"):
+            q = _quote(c)
+            parts.append(f"({q} IS NULL OR {q} = '')")
+    return " AND ".join(parts)
+
+
+def _empty_summary() -> dict:
+    return {"total_rows": 0, "distinct_uids": 0, "done_uids": 0, "not_done_uids": 0}
 
 
 def done_uids(
@@ -103,28 +187,24 @@ def done_uids(
     *,
     energy_column: str = DEFAULT_ENERGY_COLUMN,
 ) -> set[str]:
-    """Return the set of base identities that are *done*.
+    """Return the set of base identities that have a *successful* result.
 
-    A base identity is done iff at least one of its result rows has a non-null
-    energy. This is the single, authoritative definition of "done" shared by
-    every tool (fixes the historical drift where a null-energy row counted as
-    done in one index but not in another).
+    One authoritative definition of "done" shared by every tool (fixes the
+    historical drift where a null-energy row counted as done in one index but
+    not another). An empty result glob (fresh sweep) yields an empty set rather
+    than an error.
     """
     duckdb = _require_duckdb()
     con = _connect(duckdb)
-    cols = _parquet_columns(con, results_glob)
-    if energy_column not in cols:
-        raise ValueError(
-            f"energy column {energy_column!r} not found in {results_glob}; "
-            f"available columns include: {sorted(cols)[:12]}..."
-        )
-    base = _base_expr(cols)
-    rows = con.sql(
-        f"""
-        SELECT DISTINCT {base} AS uid
-        FROM read_parquet('{results_glob}', union_by_name=true)
-        WHERE {energy_column} IS NOT NULL
-        """
+    files = _glob_files(con, results_glob)
+    if not files:
+        return set()
+    scan = _scan_sql(files)
+    schema = _describe(con, scan)
+    base = _base_expr(schema)
+    success = _success_predicate(schema, energy_column)
+    rows = con.execute(
+        f"SELECT DISTINCT {base} AS uid FROM ({scan}) WHERE {success}"
     ).fetchall()
     return {r[0] for r in rows}
 
@@ -136,33 +216,38 @@ def remaining(
     uid_column: str = "unique_name",
     energy_column: str = DEFAULT_ENERGY_COLUMN,
 ) -> list[str]:
-    """Return input identities with no done result yet (an ANTI JOIN).
+    """Return input identities with no successful result yet (an ANTI JOIN).
 
     ``input_parquet`` supplies the authoritative work list; ``uid_column`` is
-    its stable identity column (``unique_name`` for the sweep, e.g.
-    ``C10H22_conf0000``). Result rows are keyed by their base identity so the
-    join is exact — no suffix parsing on the common path.
+    its stable identity column (``unique_name`` for the sweep). Result rows are
+    keyed by their stored base identity so the join is exact — no suffix parsing
+    on the common path. Before the first result file exists, every input UID is
+    returned.
     """
     duckdb = _require_duckdb()
     con = _connect(duckdb)
-    rcols = _parquet_columns(con, results_glob)
-    base = _base_expr(rcols)
-    if energy_column not in rcols:
-        raise ValueError(
-            f"energy column {energy_column!r} not found in {results_glob}."
-        )
-    rows = con.sql(
+    uid = _quote(uid_column)
+    input_lit = input_parquet.replace("'", "''")
+    input_scan = (
+        f"SELECT DISTINCT {uid} AS uid "
+        f"FROM read_parquet('{input_lit}', union_by_name=true)"
+    )
+    files = _glob_files(con, results_glob)
+    if not files:
+        rows = con.execute(
+            f"SELECT uid FROM ({input_scan}) ORDER BY uid"
+        ).fetchall()
+        return [r[0] for r in rows]
+    scan = _scan_sql(files)
+    schema = _describe(con, scan)
+    base = _base_expr(schema)
+    success = _success_predicate(schema, energy_column)
+    rows = con.execute(
         f"""
         WITH done AS (
-            SELECT DISTINCT {base} AS uid
-            FROM read_parquet('{results_glob}', union_by_name=true)
-            WHERE {energy_column} IS NOT NULL
+            SELECT DISTINCT {base} AS uid FROM ({scan}) WHERE {success}
         )
-        SELECT i.uid
-        FROM (
-            SELECT DISTINCT {uid_column} AS uid
-            FROM read_parquet('{input_parquet}', union_by_name=true)
-        ) i
+        SELECT i.uid FROM ({input_scan}) i
         ANTI JOIN done d ON i.uid = d.uid
         ORDER BY i.uid
         """
@@ -175,20 +260,26 @@ def summary(
     *,
     energy_column: str = DEFAULT_ENERGY_COLUMN,
 ) -> dict:
-    """Return {total_rows, distinct_uids, done_uids, error_rows}."""
+    """Return {total_rows, distinct_uids, done_uids, not_done_uids}.
+
+    Zero counts for an empty result glob (fresh sweep), rather than an error.
+    """
     duckdb = _require_duckdb()
     con = _connect(duckdb)
-    cols = _parquet_columns(con, results_glob)
-    base = _base_expr(cols)
-    has_energy = energy_column in cols
-    energy_ok = f"{energy_column} IS NOT NULL" if has_energy else "FALSE"
-    row = con.sql(
+    files = _glob_files(con, results_glob)
+    if not files:
+        return _empty_summary()
+    scan = _scan_sql(files)
+    schema = _describe(con, scan)
+    base = _base_expr(schema)
+    success = _success_predicate(schema, energy_column)
+    row = con.execute(
         f"""
         SELECT
             COUNT(*) AS total_rows,
             COUNT(DISTINCT {base}) AS distinct_uids,
-            COUNT(DISTINCT CASE WHEN {energy_ok} THEN {base} END) AS done_uids
-        FROM read_parquet('{results_glob}', union_by_name=true)
+            COUNT(DISTINCT CASE WHEN {success} THEN {base} END) AS done_uids
+        FROM ({scan})
         """
     ).fetchone()
     return {

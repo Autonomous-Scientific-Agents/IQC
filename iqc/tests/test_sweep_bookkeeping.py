@@ -1,4 +1,5 @@
-"""Tests for iqc.sweep_bookkeeping (DuckDB query layer + atomic claiming)."""
+"""Tests for iqc.sweep_bookkeeping (DuckDB query layer + atomic claiming)
+and the producer-side identity that feeds it."""
 
 from __future__ import annotations
 
@@ -28,6 +29,61 @@ def test_base_from_unique_name(full, base):
 
 
 # --------------------------------------------------------------------------- #
+# Producer identity: compute_unique_name_base + tabular reader UID (P1)
+# --------------------------------------------------------------------------- #
+
+
+class _Rec:
+    def __init__(self, uid):
+        self.uid = uid
+
+
+def test_compute_unique_name_base_uses_input_uid_for_tabular():
+    from iqc.main import compute_unique_name_base
+
+    recs = [_Rec("H2_conf0000"), _Rec("H2_conf0001")]
+    # Tabular: carry the input UID, not the {stem}_row{i} filename base.
+    assert compute_unique_name_base("data_xyz", recs, 1, 2, 2, "chunk_001_row1") == "H2_conf0001"
+    # No UID on the record -> fall back to base_name.
+    assert compute_unique_name_base("data_xyz", [_Rec(None)], 0, 1, 1, "chunk_row0") == "chunk_row0"
+
+
+def test_compute_unique_name_base_keeps_frames_distinct():
+    from iqc.main import compute_unique_name_base
+
+    # Multi-frame single file: each frame gets a distinct identity.
+    b0 = compute_unique_name_base("xyz", ["f.xyz"], 0, 1, 3, "traj")
+    b1 = compute_unique_name_base("xyz", ["f.xyz"], 1, 1, 3, "traj")
+    assert b0 == "traj_frame0" and b1 == "traj_frame1"
+    # A directory of files (number_of_files > 1) keeps the per-file base.
+    assert compute_unique_name_base("xyz", ["a", "b"], 0, 2, 2, "molA") == "molA"
+    # A single-frame single file is unchanged.
+    assert compute_unique_name_base("xyz", ["f.xyz"], 0, 1, 1, "molA") == "molA"
+
+
+def test_reader_attaches_uid_from_column(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+    from iqc.datatools import read_xyz_column_records
+
+    p = tmp_path / "chunk.parquet"
+    pq.write_table(
+        pa.table({"opt_xyz": ["1\n\nH 0 0 0", "1\n\nH 0 0 1"],
+                  "unique_name": ["H2_conf0000", "H2_conf0001"]}),
+        str(p),
+    )
+    recs = read_xyz_column_records(str(p), "opt_xyz", uid_column="unique_name")
+    assert [r.uid for r in recs] == ["H2_conf0000", "H2_conf0001"]
+
+    # Auto default (uid_required=False): a missing column is tolerated.
+    recs2 = read_xyz_column_records(str(p), "opt_xyz", uid_column="nope", uid_required=False)
+    assert [r.uid for r in recs2] == [None, None]
+    # Explicit request for a missing column raises.
+    with pytest.raises(Exception):
+        read_xyz_column_records(str(p), "opt_xyz", uid_column="nope", uid_required=True)
+
+
+# --------------------------------------------------------------------------- #
 # Atomic chunk claiming (pure os.rename — no DuckDB needed)
 # --------------------------------------------------------------------------- #
 
@@ -48,11 +104,9 @@ def test_claim_is_exactly_once(tmp_path):
     third = bk.claim_chunk(todo, claimed, "carol")
 
     assert first is not None and second is not None
-    # Two chunks, two winners, distinct files, then nothing left.
     assert {first.name, second.name} == {"c0.parquet", "c1.parquet"}
     assert first != second
     assert third is None
-    # Claimed files live under <root>/<user>/ and are gone from todo.
     assert first.parent.name == "alice"
     assert second.parent.name == "bob"
     assert list(todo.glob("*.parquet")) == []
@@ -76,7 +130,6 @@ def test_claim_survives_a_lost_race(tmp_path, monkeypatch):
     def flaky_rename(src, dst):
         calls["n"] += 1
         if calls["n"] == 1:
-            # Simulate another user winning c0 the instant before us.
             raise FileNotFoundError(src)
         return real_rename(src, dst)
 
@@ -98,7 +151,6 @@ def test_complete_and_fail_move_chunks(tmp_path):
     assert moved == done / "c0.parquet"
     assert moved.exists() and not chunk.exists()
 
-    # A failed chunk returns to todo/ and is picked up again.
     failed = bk.fail_chunk(moved, todo)
     assert failed == todo / "c0.parquet"
     assert failed.exists()
@@ -114,7 +166,6 @@ def _write_parquet(path: Path, rows: list[dict]):
     pa = pytest.importorskip("pyarrow")
     import pyarrow.parquet as pq
 
-    # Union the keys so every row has every column (None where absent).
     keys: list[str] = []
     for r in rows:
         for k in r:
@@ -130,56 +181,93 @@ def test_done_and_remaining_with_mixed_schema(tmp_path):
     by_job = tmp_path / "by_job"
     by_job.mkdir()
 
-    # New-style file: carries the stored unique_name_base column.
     _write_parquet(
         by_job / "job_a.parquet",
         [
-            {
-                "unique_name": "C2H6_conf0_0_0_20260101_000000",
-                "unique_name_base": "C2H6_conf0",
-                "total_energy_eV": -100.0,
-            },
-            {
-                # Null energy => NOT done, even though the row exists.
-                "unique_name": "C3H8_conf0_0_0_20260101_000001",
-                "unique_name_base": "C3H8_conf0",
-                "total_energy_eV": None,
-            },
+            {"unique_name": "C2H6_conf0_0_0_20260101_000000",
+             "unique_name_base": "C2H6_conf0", "total_energy_eV": -100.0},
+            {"unique_name": "C3H8_conf0_0_0_20260101_000001",
+             "unique_name_base": "C3H8_conf0", "total_energy_eV": None},  # null -> not done
         ],
     )
-    # Legacy file: no unique_name_base column -> exercises the regex fallback.
+    # Legacy file: no unique_name_base column -> regex fallback.
     _write_parquet(
         by_job / "job_legacy.parquet",
-        [
-            {
-                "unique_name": "C4H10_conf0_0_0_20251231_235959",
-                "total_energy_eV": -200.0,
-            }
-        ],
+        [{"unique_name": "C4H10_conf0_0_0_20251231_235959", "total_energy_eV": -200.0}],
     )
 
     glob = str(by_job / "*.parquet")
-    done = bk.done_uids(glob)
-    assert done == {"C2H6_conf0", "C4H10_conf0"}  # C3H8 excluded (null energy)
+    assert bk.done_uids(glob) == {"C2H6_conf0", "C4H10_conf0"}
 
     summ = bk.summary(glob)
-    assert summ["total_rows"] == 3
-    assert summ["distinct_uids"] == 3
-    assert summ["done_uids"] == 2
-    assert summ["not_done_uids"] == 1
+    assert summ == {"total_rows": 3, "distinct_uids": 3, "done_uids": 2, "not_done_uids": 1}
 
-    # Input work list keyed by the stable base identity.
     _write_parquet(
         tmp_path / "input.parquet",
-        [
-            {"unique_name": "C2H6_conf0"},  # done
-            {"unique_name": "C3H8_conf0"},  # null energy -> still remaining
-            {"unique_name": "C4H10_conf0"},  # done (via legacy fallback)
-            {"unique_name": "C5H12_conf0"},  # never attempted
-        ],
+        [{"unique_name": u} for u in
+         ["C2H6_conf0", "C3H8_conf0", "C4H10_conf0", "C5H12_conf0"]],
     )
     rem = bk.remaining(str(tmp_path / "input.parquet"), glob)
     assert rem == ["C3H8_conf0", "C5H12_conf0"]
+
+
+def test_done_excludes_failed_and_nonphysical(tmp_path):
+    """A non-null energy is not enough: failures/nonphysical/non-converged are
+    not done (matches status_query)."""
+    pytest.importorskip("duckdb")
+    p = tmp_path / "job.parquet"
+    _write_parquet(
+        p,
+        [
+            {"unique_name_base": "ok", "total_energy_eV": -1.0},
+            {"unique_name_base": "err", "total_energy_eV": -1.0, "error": "boom"},
+            {"unique_name_base": "task_err", "total_energy_eV": -1.0, "single_error": "x"},
+            {"unique_name_base": "nonphys", "total_energy_eV": -1.0, "nonphysical": True},
+            {"unique_name_base": "noconv", "total_energy_eV": -1.0, "opt_converged": False},
+            {"unique_name_base": "nan", "total_energy_eV": float("nan")},
+        ],
+    )
+    assert bk.done_uids(str(p)) == {"ok"}
+
+
+def test_reads_interrupted_jsonl(tmp_path):
+    """A walltime-killed job leaves JSONL with a truncated last line; valid
+    rows before it must still be read (P2)."""
+    pytest.importorskip("duckdb")
+    f = tmp_path / "iqc_single_results_run.jsonl"
+    f.write_text(
+        '{"unique_name_base": "good", "total_energy_eV": -5.0}\n'
+        '{"unique_name_base": "half", "total_energy_eV": -6.'  # truncated, no newline
+    )
+    assert bk.done_uids(str(tmp_path / "*.jsonl")) == {"good"}
+
+
+def test_empty_result_glob_is_empty_done(tmp_path):
+    """Fresh sweep, before any result file exists: remaining = all inputs,
+    done = empty, summary = zeros (no IOException) (P2)."""
+    pytest.importorskip("duckdb")
+    by_job = tmp_path / "by_job"
+    by_job.mkdir()
+    glob = str(by_job / "*.parquet")
+
+    _write_parquet(
+        tmp_path / "input.parquet",
+        [{"unique_name": u} for u in ["a", "b", "c"]],
+    )
+
+    assert bk.done_uids(glob) == set()
+    assert bk.summary(glob) == {"total_rows": 0, "distinct_uids": 0,
+                                "done_uids": 0, "not_done_uids": 0}
+    assert bk.remaining(str(tmp_path / "input.parquet"), glob) == ["a", "b", "c"]
+
+
+def test_base_only_schema_does_not_reference_unique_name(tmp_path):
+    """A parquet with only unique_name_base (+ energy) must not fail with a
+    binder error referencing the absent unique_name column (P2)."""
+    pytest.importorskip("duckdb")
+    p = tmp_path / "job.parquet"
+    _write_parquet(p, [{"unique_name_base": "X_conf0", "total_energy_eV": -1.0}])
+    assert bk.done_uids(str(p)) == {"X_conf0"}
 
 
 def test_done_uids_bad_energy_column(tmp_path):

@@ -56,6 +56,7 @@ from iqc.main import (
     build_completed_calculation_index,
     convert_jsonl_results_to_parquet,
     get_structure_input_mode,
+    resolve_uid_column,
     validate_input_args,
 )
 
@@ -423,12 +424,16 @@ def _build_xyz_input_set(args, logger: logging.Logger):
         logger.info(f"Using SMILES input: {args.smiles}")
         return xyz_files, input_mode, number_of_xyz, number_of_files
 
+    uid_col, uid_req = resolve_uid_column(args)
+
     if input_mode == "data_xyz":
         xyz_files = read_xyz_column_records(
             args.input,
             args.xyz,
             sort_column=args.sort,
             sort_order=args.sort_order,
+            uid_column=uid_col,
+            uid_required=uid_req,
         )
         number_of_xyz = len(xyz_files)
         number_of_files = number_of_xyz
@@ -446,6 +451,8 @@ def _build_xyz_input_set(args, logger: logging.Logger):
             args.smiles,
             sort_column=args.sort,
             sort_order=args.sort_order,
+            uid_column=uid_col,
+            uid_required=uid_req,
         )
         number_of_xyz = len(xyz_files)
         number_of_files = number_of_xyz
@@ -711,6 +718,7 @@ def main() -> int:
         "nmr_params": nmr_params,
         "input_mode": input_mode,
         "number_of_files": number_of_files,
+        "number_of_xyz": number_of_xyz,
         "worker_id": 0,
         "n_workers": number_of_xyz,
         "rank_output_dir_factory": rank_output_dir_factory,

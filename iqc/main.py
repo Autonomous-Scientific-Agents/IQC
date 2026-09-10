@@ -417,6 +417,39 @@ def get_structure_input_mode(args):
     return "xyz"
 
 
+def resolve_uid_column(args):
+    """Return ``(uid_column, uid_required)`` for tabular input readers.
+
+    An explicit ``--uid-column`` is required (error if absent). With none given
+    we opportunistically use a ``unique_name`` column when the input has one —
+    the sweep convention — and otherwise fall back to the filename/row base.
+    """
+    explicit = getattr(args, "uid_column", None)
+    if explicit:
+        return explicit, True
+    return "unique_name", False
+
+
+def compute_unique_name_base(
+    input_mode, xyz_files, xyz_index, number_of_files, number_of_xyz, base_name
+):
+    """Stable per-structure identity stored as the result ``unique_name_base``.
+
+    - tabular inputs: the UID carried from the input row (``record.uid``) when
+      present, else the filename/row ``base_name``;
+    - a multi-frame single XYZ file: ``{base_name}_frame{i}`` so distinct
+      configurations (which share the filename) do not collapse to one id;
+    - everything else (a directory of files, a single structure, SMILES):
+      ``base_name``.
+    """
+    if input_mode in ("data_xyz", "data_smiles"):
+        record_uid = getattr(xyz_files[xyz_index], "uid", None)
+        return record_uid or base_name
+    if input_mode == "xyz" and number_of_files == 1 and (number_of_xyz or 1) > 1:
+        return f"{base_name}_frame{xyz_index}"
+    return base_name
+
+
 class _SkipExisting:
     """Sentinel: ``_process_one_row`` returns this when the row matched a
     skip-existing key. Lets the caller distinguish it from a ``None`` return
@@ -544,6 +577,7 @@ def _process_one_row(
     calculator,
     worker_id,
     n_workers,
+    number_of_xyz=None,
     rank_output_dir_factory,
     direct_work_dir,
     completed_file_index,
@@ -607,6 +641,12 @@ def _process_one_row(
     record_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     unique_name = f"{base_name}_{xyz_index}_{worker_id}_{record_stamp}"
     logging.info(f"Processing input: {xyz_file} with unique ID: {unique_name}")
+
+    # Stable per-structure identity for bookkeeping (see the ``unique_name_base``
+    # assignment below).
+    unique_name_base = compute_unique_name_base(
+        input_mode, xyz_files, xyz_index, number_of_files, number_of_xyz, base_name
+    )
 
     # --- Read atoms ----------------------------------------------------------
     try:
@@ -1003,15 +1043,17 @@ def _process_one_row(
     results["_unique_name"] = unique_name
     results["_record_stamp"] = record_stamp
     results["_work_dir_used"] = work_dir_used[0]
-    # Stable per-input identity WITHOUT the run-id suffix. ``unique_name`` is
-    # ``f"{base_name}_{xyz_index}_{worker_id}_{record_stamp}"`` — two runs of the
-    # same input differ only in that suffix. Persisting ``base_name`` as a real
-    # column lets bookkeeping tools dedup / compute the done-set by an exact
-    # column join instead of regex-stripping the suffix off ``unique_name`` in
-    # every consumer (the "identity by string parsing" failure mode). Unlike
-    # ``_unique_name`` (a private key the dispatchers pop before writing), this
-    # is meant to survive into the JSONL/parquet output.
-    results["unique_name_base"] = base_name
+    # Stable per-structure identity for bookkeeping. Two runs of the same input
+    # produce ``unique_name`` values that differ only in the run-id suffix, and
+    # rechunking a tabular input changes ``base_name`` (``{stem}_row{i}``)
+    # entirely — so neither is a reliable dedup key. ``unique_name_base`` is the
+    # UID carried from the input (or a frame-distinct filename fallback),
+    # letting bookkeeping tools compute the done/remaining sets by an exact
+    # column join instead of regex-stripping suffixes in every consumer (the
+    # "identity by string parsing" failure mode). Unlike ``_unique_name`` (a
+    # private key the dispatchers pop before writing), this survives into the
+    # JSONL/parquet output.
+    results["unique_name_base"] = unique_name_base
     return results
 
 
@@ -1199,12 +1241,15 @@ def main():
             number_of_files = 1
             logging.info(f"Using SMILES input: {args.smiles}")
         elif input_mode == "data_xyz":
+            uid_col, uid_req = resolve_uid_column(args)
             try:
                 xyz_files = read_xyz_column_records(
                     args.input,
                     args.xyz,
                     sort_column=args.sort,
                     sort_order=args.sort_order,
+                    uid_column=uid_col,
+                    uid_required=uid_req,
                 )
             except Exception as e:
                 logging.error(f"Error reading XYZ column '{args.xyz}': {e}")
@@ -1219,12 +1264,15 @@ def main():
                 )
             logging.info(f"Number of configurations: {number_of_xyz}")
         elif input_mode == "data_smiles":
+            uid_col, uid_req = resolve_uid_column(args)
             try:
                 xyz_files = read_smiles_column_records(
                     args.input,
                     args.smiles,
                     sort_column=args.sort,
                     sort_order=args.sort_order,
+                    uid_column=uid_col,
+                    uid_required=uid_req,
                 )
             except Exception as e:
                 logging.error(f"Error reading SMILES column '{args.smiles}': {e}")
@@ -1363,6 +1411,7 @@ def main():
             xyz_files=xyz_files,
             input_mode=input_mode,
             number_of_files=number_of_files,
+            number_of_xyz=number_of_xyz,
             calculator=calculator,
             worker_id=rank,
             n_workers=size,

@@ -47,6 +47,10 @@ class XYZColumnRecord:
 
     row_index: int
     xyz: str
+    # Stable per-row identity read from a UID column (e.g. ``unique_name``),
+    # used as the result ``unique_name_base``. ``None`` when no UID column was
+    # requested or the value was missing.
+    uid: "str | None" = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +59,7 @@ class SMILESColumnRecord:
 
     row_index: int
     smiles: str
+    uid: "str | None" = None
 
 
 def format_bytes(size: int) -> str:
@@ -338,19 +343,51 @@ def _read_column_values(input_file: str | Path, column_name: str) -> list[Any]:
     return values
 
 
+def _read_optional_uid_values(
+    input_file: str | Path,
+    uid_column: str | None,
+    uid_required: bool,
+    n_rows: int,
+) -> list[str | None] | None:
+    """Read a UID column, or return None when there is none to read.
+
+    ``uid_required`` True re-raises a missing-column error (explicit request);
+    False silently returns None (the auto ``unique_name`` default just isn't
+    present in this file).
+    """
+    if not uid_column:
+        return None
+    try:
+        values = _read_column_values(input_file, uid_column)
+    except ColumnNotFoundError:
+        if uid_required:
+            raise
+        return None
+    if len(values) != n_rows:
+        raise ValueError(
+            f"UID column '{uid_column}' has {len(values)} rows but the input "
+            f"column has {n_rows}."
+        )
+    return [None if _is_missing_value(v) else str(v) for v in values]
+
+
 def read_xyz_column_records(
     input_file: str | Path,
     column_name: str,
     sort_column: str | None = None,
     sort_order: str = "up",
+    uid_column: str | None = None,
+    uid_required: bool = False,
 ) -> list[XYZColumnRecord]:
     """Read XYZ strings from a named column in a supported tabular data file."""
 
     values = _read_column_values(input_file, column_name)
+    uids = _read_optional_uid_values(input_file, uid_column, uid_required, len(values))
     records = [
         XYZColumnRecord(
             row_index=row_index,
             xyz=_coerce_text_value(value, row_index, column_name, "XYZ"),
+            uid=uids[row_index] if uids is not None else None,
         )
         for row_index, value in enumerate(values)
     ]
@@ -367,14 +404,18 @@ def read_smiles_column_records(
     column_name: str,
     sort_column: str | None = None,
     sort_order: str = "up",
+    uid_column: str | None = None,
+    uid_required: bool = False,
 ) -> list[SMILESColumnRecord]:
     """Read SMILES strings from a named column in a supported tabular data file."""
 
     values = _read_column_values(input_file, column_name)
+    uids = _read_optional_uid_values(input_file, uid_column, uid_required, len(values))
     records = [
         SMILESColumnRecord(
             row_index=row_index,
             smiles=_coerce_text_value(value, row_index, column_name, "SMILES"),
+            uid=uids[row_index] if uids is not None else None,
         )
         for row_index, value in enumerate(values)
     ]

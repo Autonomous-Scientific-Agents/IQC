@@ -21,17 +21,29 @@ at most the rows still in flight. File count for the sweep drops from ~10⁵
 Per-mol partials are **off by default** and gated behind `--el-keep-partials`
 (see the deviation note below).
 
-### Identity: stored `unique_name_base` (`iqc/main.py`)
-`_process_one_row` now emits a `unique_name_base` column (the input identity
-without the run-id suffix). Downstream done/remaining is an exact column join
-instead of every tool regex-stripping `unique_name` — that "identity by string
-parsing" was one of the proposal's root causes.
+### Identity: stored `unique_name_base` (`iqc/main.py`, `iqc/datatools.py`, `iqc/cli.py`)
+`_process_one_row` emits a `unique_name_base` column carrying the **stable input
+identity**, so downstream done/remaining is an exact column join instead of
+every tool regex-stripping `unique_name` (the "identity by string parsing" root
+cause). The value is chosen per input mode:
+- tabular inputs: the UID read from a `--uid-column` (defaulting to a
+  `unique_name` column when present), so the id survives rechunking rather than
+  being the volatile `{stem}_row{i}` filename base;
+- a multi-frame single XYZ file: `{base}_frame{i}` so distinct configurations
+  don't collapse to one identity;
+- a directory of files / single structure / SMILES: the filename/derived base.
 
 ### D. Query layer + claiming (`iqc/sweep_bookkeeping.py`, `iqc-sweep-book`)
 Read-only DuckDB over the per-job parquet/JSONL glob:
-- `done_uids` / `remaining` / `summary` — one definition of *done* (a row with
-  non-null `total_energy_eV`), so no cross-tool drift. Many concurrent readers
-  are safe by construction.
+- `done_uids` / `remaining` / `summary` — one definition of *done*: a
+  **successful** row (finite energy, no `error`/`*_error`, not `nonphysical`,
+  `opt_converged` not false), matching `status_query` so there is no cross-tool
+  drift. A non-null energy alone is not "done" — IQC keeps a final energy on an
+  exhausted optimization / later-stage failure, and those must stay eligible for
+  retry. JSONL results left by a walltime-killed job (before the epilogue
+  parquet conversion) are read with truncated-last-line tolerance, and an empty
+  result glob (fresh sweep) yields empty done / all-remaining rather than an
+  error. Many concurrent readers are safe by construction.
 - `claim_chunk` / `complete_chunk` / `fail_chunk` — whole-chunk claiming via
   atomic `os.rename` (todo → claimed/`<user>` → done, or back to todo on
   failure, auto re-eligible). Exactly one user wins a contested chunk.
