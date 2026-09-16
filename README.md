@@ -141,22 +141,42 @@ mapping, and Hugging Face setup.
 
 ### Option 3: Using Docker
 
+The `Dockerfile` builds a full CPU-only image that bundles IQC with every
+**open-source** quantum-chemistry code and ML potential IQC supports:
+xTB, PySCF, NWChem, ExaChem (compiled from source), MACE, FAIRChem UMA, and
+ASE EMT. Proprietary codes (ORCA, Gaussian, VASP) are not baked in but can be
+mounted at runtime. See [docs/docker.md](docs/docker.md) for the full matrix,
+proprietary-code mounts, and model-cache setup.
+
+Prefer **smaller, purpose-built images**? `Dockerfile.uv` + `docker-compose.yml`
+provide a conda-free, uv-based split family (`base` / `mlip` / `exachem` /
+`full`) so you pull only what a task needs — e.g. `docker compose run --rm qc
+iqc --smiles O --task thermo --calculator xtb`. See
+[Split images with docker compose](docs/docker.md#split-images-with-docker-compose).
+
 1. Build the Docker image:
    ```bash
-   docker build -t iqc .
+   docker build -t iqc:full .
    ```
+   (The build compiles ExaChem + TAMM from source, so the first build is long;
+   layers are cached for fast rebuilds.)
 
 2. Run the container with Jupyter Lab:
    ```bash
-   docker run -p 8888:8888 -it iqc
+   docker run --rm -p 8888:8888 -v "$PWD":/work iqc:full
+   ```
+   Then open `http://localhost:8888` in your browser.
+
+3. Or run the CLI directly (anything after the image name runs in the env):
+   ```bash
+   docker run --rm -v "$PWD":/work iqc:full \
+     iqc --smiles O --task thermo --calculator xtb
    ```
 
-3. Access Jupyter Lab by opening `http://localhost:8888` in your web browser.
-
-To persist your notebooks, you can mount a local directory:
-```bash
-docker run -p 8888:8888 -v $(pwd)/notebooks:/app/notebooks -it iqc
-```
+4. Verify the image (pytest + a live run of every bundled calculator):
+   ```bash
+   docker run --rm iqc:full bash /opt/iqc/scripts/docker_smoke_test.sh
+   ```
 
 ## Troubleshooting
 If you encounter a possible OpenMPI error:

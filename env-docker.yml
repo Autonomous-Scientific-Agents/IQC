@@ -1,0 +1,66 @@
+# Conda environment for the full IQC Docker image (CPU-only).
+#
+# Everything comes from conda-forge so the whole stack shares ONE MPI
+# (OpenMPI). ExaChem is compiled from source against these same conda
+# compilers + OpenMPI (see scripts/build_exachem.sh), and mpi4py / NWChem
+# are built against the same OpenMPI — this avoids the classic "two MPIs in
+# one environment" breakage. OpenMPI (not MPICH) is required because the
+# conda-forge NWChem package is only built against OpenMPI.
+#
+# PyTorch and the MLIP stack (MACE / FAIRChem UMA) are NOT here; they are
+# installed via pip in the Dockerfile (CPU wheel first), matching the
+# documented install order in README.md / docs/calculators.md.
+name: iqc-env
+channels:
+  - conda-forge
+dependencies:
+  # python 3.11: conda-forge NWChem has no 3.12 build; 3.11 satisfies NWChem,
+  # PySCF, and FAIRChem (which needs >= 3.11).
+  - python=3.11
+  - pip
+
+  # --- Toolchain to compile ExaChem/TAMM from source (CPU) ---
+  - c-compiler
+  - cxx-compiler
+  - fortran-compiler
+  - openmpi
+  - mpi4py
+  - cmake>=3.26,<4        # TAMM subprojects predate CMake 4.x removals
+  - make
+  - ninja
+  - git
+  - pkg-config
+  # NOTE: autoconf/automake/libtool are intentionally NOT here. TAMM bootstraps
+  # its bundled numactl with autotools, and conda's libtoolize is broken in the
+  # base image (misplaces ltmain.sh). The Dockerfile installs system autotools
+  # via apt instead; with none in the conda env, autoreconf/libtoolize resolve
+  # to /usr/bin while gcc/mpicc/cmake still come from conda.
+
+  # --- Core IQC runtime ---
+  - numpy
+  - scipy
+  - psutil
+  - ase
+  - rdkit
+  - matplotlib
+  - pandas
+  - pyarrow
+  - openpyxl
+  - xlrd
+  - pymatgen
+
+  # --- Quantum-chemistry codes available on conda-forge ---
+  - pyscf          # PySCF calculator (HF/DFT/MP2/CCSD/CCSD(T))
+  - xtb-python     # GFN2-xTB calculator
+  - nwchem         # NWChem (NMR backend), built against the same OpenMPI
+
+  # --- Notebook / visualization ---
+  - jupyterlab
+  - ipywidgets
+  - nglview
+
+  - pip:
+      - argcomplete
+      - pubchempy
+      - PyYAML
+      - pydantic>=2.12,<3
