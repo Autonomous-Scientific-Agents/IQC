@@ -83,13 +83,47 @@ screen uses `IQC_MAX_ABSOLUTE_ENERGY_PER_ATOM_EV` (default 1e9).
 
 ## Vibrations and thermochemistry
 
-Imaginary eigenvalues can precede rigid-body modes in ASE output. IQC excludes
-rigid modes by frequency magnitude instead of discarding the first 5/6 entries.
-Imaginary vibrational frequencies remain negative in the reported signed
-frequency list. This is a magnitude-based mode selection, not an exact
-translation/rotation projection: inspect soft modes and poorly optimized
-structures. Partial Hessians keep all computed modes and cannot supply
-whole-molecule ideal-gas thermochemistry.
+ASE diagonalises the full 3N x 3N Hessian, so the six (five for linear
+molecules) translational and rotational modes remain in its output,
+contaminated by residual gradients, grid noise or finite-difference error.
+By default IQC removes them exactly: the Hessian returned by ASE is projected
+onto the complement of the rigid-body subspace (Eckart/Sayvetz projection)
+before frequencies, normal modes and thermochemistry energies are extracted
+(`vibration_params.project_trans_rot`, default `true`). The rigid-body
+eigenvalues then vanish by construction and the remaining 3N-6 (3N-5) modes are
+unambiguous. Because the projection acts on the Hessian, it applies to every
+calculator that reaches the vibration step - force-capable (MACE, xTB, PySCF,
+ORCA, VASP, ...) or energy-only with numerical forces (ExaChem, PySCF CCSD(T)).
+It is skipped automatically for partial Hessians (`indices`).
+
+The contamination that was removed is still reported: results carry
+`trans_rot_projected`, `trans_rot_frequencies_cm^-1` (the rigid-body block
+before projection) and `trans_rot_coupling`. `max_trans_rot` is checked
+against those pre-projection values, so a loosely optimized structure or a
+poor `delta` still produces the "Translational or rotational modes are too
+high" warning. Projection is exact only at a stationary point; it removes
+contamination from the mode list but does not repair a bad Hessian, so treat
+large `trans_rot_frequencies_cm^-1` as a convergence problem.
+
+With `project_trans_rot: false` the previous behaviour is restored: rigid
+modes are excluded by frequency magnitude instead of discarding the first 5/6
+entries. Magnitude ordering cannot distinguish a genuine soft mode (a
+30 cm^-1 torsion) from a contaminated rotation, so use it only for
+comparison with earlier results. Imaginary vibrational frequencies remain
+negative in the reported signed frequency list in both modes. Partial
+Hessians keep all computed modes and cannot supply whole-molecule ideal-gas
+thermochemistry.
+
+The projector is also available on its own for any ASE `Vibrations`,
+`Infrared` or `VibrationsData` object, or a raw Cartesian Hessian:
+
+```python
+from iqc.hessiantools import project_vibrations_data, project_hessian
+
+projected, report = project_vibrations_data(vib)      # vib = ase Vibrations
+energies = projected.get_energies()[report["n_rigid"]:]  # exactly 3N-6
+hessian_p, report = project_hessian(hessian_eV_per_A2, atoms)  # analytic Hessians
+```
 
 With `imag_recovery: true`, displaced trial structures are reoptimized and their
 Hessians recomputed. Attempts alternate positive and negative displacement for
