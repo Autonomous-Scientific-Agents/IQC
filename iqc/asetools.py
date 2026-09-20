@@ -22,6 +22,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem, rdmolops
 import io
 from iqc.electronic_state import integer_state, set_electronic_state, validate_electronic_state
+from iqc.hessiantools import canonicalize_vibrations_data, project_vibrations_data
 
 # Optional dependencies with informative messages
 XTB = None
@@ -2511,21 +2512,126 @@ def _imaginary_mode_vectors(frequencies, vib_modes, nrot, max_vib_imag):
     ]
 
 
+def _rotational_dof(atoms):
+    """Rotational degrees of freedom: 0 (atom), 2 (linear) or 3 (nonlinear)."""
+    return 0 if len(atoms) == 1 else (2 if is_linear_by_inertia(atoms) else 3)
+
+
+def _apply_rigid_body_projection(atoms, vib_data, results, enabled):
+    """Project translations/rotations out of ``vib_data`` if requested.
+
+    Works on the Hessian held by ASE's ``VibrationsData``, so it is
+    independent of the calculator that produced the forces. Records in
+    ``results``:
+
+    * ``trans_rot_projected`` - whether the projection was applied,
+    * ``trans_rot_frequencies_cm^-1`` - rigid-body block frequencies *before*
+      projection (the contamination that was removed; ``max_trans_rot`` is
+      checked against these),
+    * ``trans_rot_coupling`` - norm of the rigid-body/internal coupling block.
+
+    Returns ``(vib_data, rigid_body_frequencies)``; the frequencies are
+    ``None`` when the projection was not applied. Never raises: partial
+    Hessians (``indices``) and any projection failure fall back to the
+    unprojected data with a recorded warning.
+
+    Independently of ``enabled``, the Hessian blocks are first brought into
+    ascending atom order: ASE's ``Vibrations`` fills them in ``indices``
+    order while ``VibrationsData`` mass-weights them in sorted order, so an
+    unsorted ``indices`` list otherwise yields inconsistent frequencies and
+    misassigned mode vectors.
+    """
+    results["trans_rot_projected"] = False
+    try:
+        vib_data = canonicalize_vibrations_data(vib_data)
+    except Exception as exc:  # e.g. mocked VibrationsData in tests
+        logging.debug("Could not canonicalize vibration data: %s", exc)
+    if not enabled:
+        return vib_data, None
+    try:
+        projected, report = project_vibrations_data(
+            vib_data, n_rot=_rotational_dof(atoms)
+        )
+    except ValueError as exc:
+        # Partial Hessian or unusable geometry: keep the unprojected modes.
+        results["warnings"].append(f"Rigid-body projection skipped: {exc}")
+        logging.warning("Rigid-body projection skipped: %s", exc)
+        return vib_data, None
+    except Exception as exc:
+        results["warnings"].append(f"Rigid-body projection failed: {exc}")
+        logging.warning("Rigid-body projection failed: %s", exc)
+        return vib_data, None
+    rigid = np.asarray(report["rigid_body_frequencies_cm"], dtype=float)
+    results["trans_rot_projected"] = True
+    results["trans_rot_frequencies_cm^-1"] = rigid.tolist()
+    results["trans_rot_coupling"] = report["rigid_body_coupling_norm"]
+    logging.debug(
+        "Projected %d rigid-body modes (pre-projection |freq| <= %.1f cm^-1)",
+        report["n_rigid"],
+        float(np.max(np.abs(rigid))) if rigid.size else 0.0,
+    )
+    return projected, rigid
+
+
+def _jmol_modes_text(vib_data):
+    """Jmol XYZ+vectors text for every mode in ``vib_data``.
+
+    Mirrors the layout of ``ase.vibrations.Vibrations._write_jmol`` (one XYZ
+    frame per mode, ``Mode #n, f = <freq><i> cm^-1.`` comment line, three
+    displacement columns) but reads from a ``VibrationsData`` so projected
+    modes are exported rather than the raw finite-difference ones.
+    """
+    atoms = vib_data.get_atoms()
+    symbols = atoms.get_chemical_symbols()
+    frequencies = np.asarray(vib_data.get_frequencies(), dtype=complex)
+    modes = vib_data.get_modes(all_atoms=True)
+    lines = []
+    for n, (freq, mode) in enumerate(zip(frequencies, modes)):
+        lines.append("%6d" % len(atoms))
+        if freq.imag != 0:
+            lines.append("Mode #%d, f = %.1fi cm^-1." % (n, float(freq.imag)))
+        else:
+            lines.append("Mode #%d, f = %.1f  cm^-1." % (n, float(freq.real)))
+        for symbol, pos, vec in zip(symbols, atoms.positions, mode):
+            lines.append(
+                "%2s %12.5f %12.5f %12.5f %12.5f %12.5f %12.5f"
+                % (symbol, pos[0], pos[1], pos[2], vec[0], vec[1], vec[2])
+            )
+    return "\n".join(lines) + "\n"
+
+
 def _record_vibrational_analysis(
-    atoms, results, frequencies, modes, max_trans_rot, max_vib_imag
+    atoms,
+    results,
+    frequencies,
+    modes,
+    max_trans_rot,
+    max_vib_imag,
+    rigid_body_frequencies=None,
 ):
+    """Split ``frequencies`` into external and vibrational modes and record them.
+
+    ``rigid_body_frequencies`` (signed cm^-1) are the translational/rotational
+    frequencies before projection when the Hessian was projected; the
+    ``max_trans_rot`` check then uses them, because after projection the
+    external modes in ``frequencies`` are zero by construction.
+    """
     frequencies = np.asarray(frequencies, dtype=complex)
     if not np.isfinite(frequencies).all():
         raise ValueError("Vibrational frequencies contain NaN/Inf")
     complete = len(frequencies) == 3 * len(atoms)
     results["vibration_complete"] = complete
-    nrot = 0 if len(atoms) == 1 else (2 if is_linear_by_inertia(atoms) else 3)
+    nrot = _rotational_dof(atoms)
     if complete:
         external, selected = _vibrational_mode_indices(frequencies, nrot)
     else:
         # Partial Hessians have no complete rigid-body subspace to remove.
         external, selected = np.array([], dtype=int), np.arange(len(frequencies))
-    if np.any(np.abs(frequencies[external]) > max_trans_rot):
+    if rigid_body_frequencies is not None:
+        external_magnitudes = np.abs(np.asarray(rigid_body_frequencies, dtype=float))
+    else:
+        external_magnitudes = np.abs(frequencies[external])
+    if np.any(external_magnitudes > max_trans_rot):
         results["warnings"].append("Translational or rotational modes are too high")
     imaginary = [i for i in selected if abs(frequencies[i].imag) > max_vib_imag]
     results["number_of_imaginary"] = len(imaginary)
@@ -3024,6 +3130,7 @@ def run_vibrations(
     imag_recovery=False,
     imag_displacement=0.3,
     max_imag_attempts=1,
+    project_trans_rot=True,
     **params,
 ):
     """
@@ -3037,11 +3144,19 @@ def run_vibrations(
         indices (list): List of atom indices to include in vibration calculation
         fmax (float): Maximum force for geometry optimization
         delta (float): Displacement for finite difference calculation
-        max_trans (float): Max abs. value in cm-1 for translation modes
-        max_rot (float): Max abs. value in cm-1 for rotation modes
+        max_trans_rot (float): Max abs. value in cm-1 for translational or
+            rotational modes before a warning is recorded. With
+            ``project_trans_rot`` this is checked against the rigid-body
+            frequencies *before* projection.
         max_vib_imag (float): Max abs. value for the imaginary part in cm-1 for vibrational modes
         trajectory (str): Path to save trajectory file during optimization
         save_geometry (bool): Whether to save the final optimized geometry to xyz file
+        project_trans_rot (bool): Project translations and rotations out of
+            the Hessian (Eckart/Sayvetz projection) before extracting
+            frequencies, modes and thermochemistry energies. Calculator
+            independent; skipped automatically for partial Hessians
+            (``indices``). Set False to keep ASE's raw 3N modes and select
+            vibrations by magnitude only.
 
     Returns:
         tuple: A tuple containing the atoms and a dictionary with calculated properties
@@ -3128,6 +3243,9 @@ def run_vibrations(
         vib.run()
         vib_data = vib.get_vibrations()  # Get the VibrationsData object
         results["vib_time"] = time.time() - start_time
+        vib_data, rigid_body_freqs = _apply_rigid_body_projection(
+            atoms, vib_data, results, project_trans_rot
+        )
 
         # Get frequencies and energies from vib_data
         frequencies = vib_data.get_frequencies()  # cm^-1
@@ -3153,27 +3271,21 @@ def run_vibrations(
             vib_modes.tolist() if hasattr(vib_modes, "tolist") else vib_modes
         )
         try:
-            # In-memory text file:
-            buffer = io.BytesIO()
-            f = io.TextIOWrapper(buffer, encoding="utf-8", write_through=True)
-
-            # Write Jmol XYZ+vectors into the in-memory "file"
-            vib._write_jmol(f)  # <-- accepts any TextIO-like object
-
-            # Rewind and read the string
-            f.seek(0)
-            xyz_with_modes = buffer.getvalue().decode("utf-8")
-
-            # Clean up
-            f.close()
-            buffer.close()
-            results["jmol_vib_modes_xyz"] = xyz_with_modes
+            # Export the (possibly projected) modes in the same Jmol XYZ
+            # layout ASE's Vibrations._write_jmol produces.
+            results["jmol_vib_modes_xyz"] = _jmol_modes_text(vib_data)
         except Exception as e:
             warning = f"Could not export Jmol vibrational modes: {e}"
             logging.warning(warning)
             results["warnings"].append(warning)
         imag_vectors = _record_vibrational_analysis(
-            atoms, results, frequencies, vib_modes, max_trans_rot, max_vib_imag
+            atoms,
+            results,
+            frequencies,
+            vib_modes,
+            max_trans_rot,
+            max_vib_imag,
+            rigid_body_frequencies=rigid_body_freqs,
         )
 
         logging.debug(
@@ -3212,6 +3324,7 @@ def run_vibrations(
                 multiplicity=multiplicity,
                 charge=charge,
                 imag_recovery=False,
+                project_trans_rot=project_trans_rot,
                 **params,
             )
 
@@ -3354,6 +3467,7 @@ def run_ir(
     imag_recovery=False,
     imag_displacement=0.3,
     max_imag_attempts=1,
+    project_trans_rot=True,
     **params,
 ):
     """
@@ -3387,6 +3501,12 @@ def run_ir(
         ir_spectrum_end (float): End of IR spectrum range in cm^-1
         sparse_spectrum (bool): Store only points above threshold instead of full spectrum
         intensity_threshold (float): Absolute intensity cutoff used with sparse_spectrum
+        project_trans_rot (bool): Project translations/rotations out of the
+            Hessian before extracting the normal modes and the energies used
+            for thermochemistry (see run_vibrations). The IR spectrum itself
+            is built by ASE from the unprojected Hessian; the difference is
+            confined to the rigid-body block far below the default
+            ``ir_spectrum_start``.
 
     Returns:
         tuple: A tuple containing the atoms and a dictionary with calculated properties
@@ -3554,6 +3674,9 @@ def run_ir(
         ir.run()
 
         vib_data = ir.get_vibrations()
+        vib_data, rigid_body_freqs = _apply_rigid_body_projection(
+            atoms, vib_data, results, project_trans_rot
+        )
         mode_frequencies = vib_data.get_frequencies()
         try:
             vib_energies, vib_modes = vib_data.get_energies_and_modes()
@@ -3574,7 +3697,13 @@ def run_ir(
             vib_modes.tolist() if hasattr(vib_modes, "tolist") else vib_modes
         )
         imag_vectors = _record_vibrational_analysis(
-            atoms, results, mode_frequencies, vib_modes, max_trans_rot, max_vib_imag
+            atoms,
+            results,
+            mode_frequencies,
+            vib_modes,
+            max_trans_rot,
+            max_vib_imag,
+            rigid_body_frequencies=rigid_body_freqs,
         )
 
         freq_intensity = ir.get_spectrum(
@@ -3659,6 +3788,7 @@ def run_ir(
                 multiplicity=multiplicity,
                 charge=charge,
                 imag_recovery=False,
+                project_trans_rot=project_trans_rot,
                 **params,
             )
 

@@ -236,6 +236,14 @@ results = run_thermo(atoms)
 
 Each task returns a dictionary containing the results and timing information in milliseconds.
 
+`vib`, `ir`, `thermo` and `ir-thermo` project translations and rotations out
+of the Hessian before extracting frequencies and thermochemistry, for every
+calculator (`vibration_params.project_trans_rot`, default `true`). The removed
+rigid-body contamination is reported in `trans_rot_frequencies_cm^-1`; see
+[docs/calculation_recovery.md](docs/calculation_recovery.md#vibrations-and-thermochemistry).
+The projector itself is reusable on any ASE `Vibrations`/`VibrationsData`
+object or raw Hessian via `iqc.hessiantools`.
+
 ## Calculator Selection
 
 Use `--calculator` to choose the ASE calculator for `single`, `opt`, `vib`,
