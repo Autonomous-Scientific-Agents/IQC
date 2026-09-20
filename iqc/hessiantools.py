@@ -35,7 +35,7 @@ Two caveats govern its use:
 Typical use outside the IQC pipeline::
 
     from ase.vibrations import Vibrations
-    from iqc.hessiantools import project_vibrations_data
+    from iqc.hessiantools import internal_mode_mask, project_vibrations_data
 
     vib = Vibrations(atoms); vib.run()
     projected, report = project_vibrations_data(vib.get_vibrations())

@@ -500,6 +500,29 @@ def test_jmol_export_matches_ase_layout_and_uses_projected_modes(tmp_path, monke
     assert len(zeros) == 6
 
 
+def test_module_docstring_example_runs(tmp_path, monkeypatch):
+    """The usage example in iqc/hessiantools.py must execute as displayed in
+    a fresh namespace (reviewer: import list had drifted from the code)."""
+    import textwrap
+
+    import iqc.hessiantools as ht
+
+    monkeypatch.chdir(tmp_path)
+    doc = ht.__doc__
+    start = doc.index("    from ase.vibrations import Vibrations")
+    example = textwrap.dedent(doc[start:])  # runs to the end of the docstring
+    atoms = molecule("H2O")
+    atoms.calc = EMT()
+    BFGS(atoms, logfile=None).run(fmax=1e-4)
+    namespace = {"atoms": atoms}
+    with patch("builtins.print"):
+        exec(example, namespace)
+    internal = namespace["internal"]
+    assert internal.shape == (3,)
+    assert namespace["report"]["n_rigid"] == 6
+    assert np.all(np.abs(internal) > 1e-3)
+
+
 def test_imaginary_recovery_forwards_projection_flag(tmp_path):
     class Saddle(Calculator):
         implemented_properties = ["energy", "forces"]
