@@ -118,12 +118,29 @@ The projector is also available on its own for any ASE `Vibrations`,
 `Infrared` or `VibrationsData` object, or a raw Cartesian Hessian:
 
 ```python
-from iqc.hessiantools import project_vibrations_data, project_hessian
+from iqc.hessiantools import (
+    internal_mode_mask, project_hessian, project_vibrations_data,
+)
 
 projected, report = project_vibrations_data(vib)      # vib = ase Vibrations
-energies = projected.get_energies()[report["n_rigid"]:]  # exactly 3N-6
+energies = projected.get_energies()                   # 3N modes in ASE order
+internal = energies[internal_mode_mask(energies, report["n_rigid"])]  # 3N-6
 hessian_p, report = project_hessian(hessian_eV_per_A2, atoms)  # analytic Hessians
 ```
+
+Select the internal modes by magnitude, as the pipeline does, rather than
+slicing off the first `n_rigid` entries: ASE orders modes by eigenvalue, so a
+genuine imaginary vibration at a saddle point precedes the (zero) rigid-body
+block and a plain slice would discard it.
+
+An unsorted `indices` list is canonicalized before anything else
+(`canonicalize_vibrations_data`): ASE's `Vibrations` fills the Hessian blocks
+in `indices` order but `VibrationsData` mass-weights them in ascending-index
+order, so for a permutation that moves atoms of unequal mass ASE's own
+frequencies are inconsistent (EMT water, `indices=[2, 1, 0]`: 2670 vs
+2406 cm⁻¹). IQC sorts the blocks whether or not projection is enabled, so
+`vib_modes`, `jmol_vib_modes_xyz` and the imaginary-mode recovery vectors are
+always in atom order.
 
 With `imag_recovery: true`, displaced trial structures are reoptimized and their
 Hessians recomputed. Attempts alternate positive and negative displacement for

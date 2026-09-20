@@ -22,7 +22,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem, rdmolops
 import io
 from iqc.electronic_state import integer_state, set_electronic_state, validate_electronic_state
-from iqc.hessiantools import project_vibrations_data
+from iqc.hessiantools import canonicalize_vibrations_data, project_vibrations_data
 
 # Optional dependencies with informative messages
 XTB = None
@@ -2534,8 +2534,18 @@ def _apply_rigid_body_projection(atoms, vib_data, results, enabled):
     ``None`` when the projection was not applied. Never raises: partial
     Hessians (``indices``) and any projection failure fall back to the
     unprojected data with a recorded warning.
+
+    Independently of ``enabled``, the Hessian blocks are first brought into
+    ascending atom order: ASE's ``Vibrations`` fills them in ``indices``
+    order while ``VibrationsData`` mass-weights them in sorted order, so an
+    unsorted ``indices`` list otherwise yields inconsistent frequencies and
+    misassigned mode vectors.
     """
     results["trans_rot_projected"] = False
+    try:
+        vib_data = canonicalize_vibrations_data(vib_data)
+    except Exception as exc:  # e.g. mocked VibrationsData in tests
+        logging.debug("Could not canonicalize vibration data: %s", exc)
     if not enabled:
         return vib_data, None
     try:

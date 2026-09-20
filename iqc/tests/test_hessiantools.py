@@ -14,7 +14,9 @@ from ase.vibrations import Vibrations, VibrationsData
 
 from iqc import asetools as at
 from iqc.hessiantools import (
+    canonicalize_vibrations_data,
     eigenvalues_to_frequencies_cm,
+    internal_mode_mask,
     project_hessian,
     project_vibrations_data,
     rigid_body_basis,
@@ -201,6 +203,87 @@ def test_project_vibrations_data_accepts_ase_objects(tmp_path, monkeypatch):
         project_vibrations_data(np.eye(9))
 
 
+def test_reordered_indices_are_brought_into_atom_order():
+    """ASE's Vibrations fills Hessian blocks in ``indices`` order while
+    VibrationsData mass-weights them in sorted order. A complete Hessian with
+    permuted ``indices`` must therefore be canonicalized and project
+    identically to the default ordering - including permutations that swap
+    atoms of unequal mass, where ASE's own frequencies are inconsistent."""
+    atoms = molecule("H2O")
+    H = _add_rigid_body_contamination(
+        _spring_hessian(atoms, {(0, 1): 30.0, (0, 2): 30.0, (1, 2): 0.004}), atoms, 80.0
+    )
+    canonical, rep0 = project_vibrations_data(VibrationsData.from_2d(atoms, H))
+    reference = np.sort(VibrationsData.from_2d(atoms, H).get_frequencies().real)
+    for indices in ([0, 2, 1], [2, 1, 0], [1, 2, 0]):
+        perm = (3 * np.asarray(indices)[:, None] + np.arange(3)[None, :]).ravel()
+        H_perm = H[np.ix_(perm, perm)]  # block k describes atom indices[k]
+        reordered = VibrationsData.from_2d(atoms, H_perm, indices=indices)
+        fixed = canonicalize_vibrations_data(reordered)
+        assert list(fixed.get_indices()) == [0, 1, 2]
+        np.testing.assert_allclose(fixed.get_hessian_2d(), H, atol=1e-12)
+        np.testing.assert_allclose(
+            np.sort(fixed.get_frequencies().real), reference, rtol=1e-9
+        )
+        if indices != [0, 2, 1]:  # O moved: ASE alone mis-weights the masses
+            assert not np.allclose(np.sort(reordered.get_frequencies().real), reference)
+        projected, rep = project_vibrations_data(reordered)
+        assert rep["n_rigid"] == rep0["n_rigid"]
+        np.testing.assert_allclose(
+            projected.get_hessian_2d(), canonical.get_hessian_2d(), atol=1e-9
+        )
+        np.testing.assert_allclose(
+            np.sort(projected.get_frequencies().real),
+            np.sort(canonical.get_frequencies().real),
+            rtol=1e-9,
+            atol=1e-3,
+        )
+    # Sorted or absent indices pass through untouched (same object).
+    plain = VibrationsData.from_2d(atoms, H)
+    assert canonicalize_vibrations_data(plain) is plain
+    sorted_idx = VibrationsData.from_2d(atoms, H, indices=[0, 1, 2])
+    assert canonicalize_vibrations_data(sorted_idx) is sorted_idx
+    # Partial Hessians are canonicalized too but cannot be projected.
+    partial_perm = (3 * np.array([2, 0])[:, None] + np.arange(3)[None, :]).ravel()
+    partial = VibrationsData.from_2d(
+        atoms, H[np.ix_(partial_perm, partial_perm)], indices=[2, 0]
+    )
+    fixed = canonicalize_vibrations_data(partial)
+    assert list(fixed.get_indices()) == [0, 2]
+    np.testing.assert_allclose(fixed.get_hessian_2d()[:3, :3], H[:3, :3])
+    with pytest.raises(ValueError, match="complete Hessian"):
+        project_vibrations_data(partial)
+
+
+def test_internal_mode_mask_keeps_imaginary_modes():
+    """At a saddle point the imaginary mode sorts before the zero rigid block;
+    a ``[n_rigid:]`` slice loses it, the magnitude mask does not."""
+
+    def genuine_imaginary(energies):
+        # projected rigid modes can come out as +-1e-14 eV^2 -> tiny "imaginary"
+        return np.sum(np.iscomplex(energies) & (np.abs(energies) > 1e-5))
+
+    atoms = molecule("H2O")
+    H = _spring_hessian(atoms, {(0, 1): 30.0, (0, 2): 30.0, (1, 2): -0.5})
+    projected, report = project_vibrations_data(VibrationsData.from_2d(atoms, H))
+    energies = projected.get_energies()
+    assert genuine_imaginary(energies) == 1
+    sliced = energies[report["n_rigid"] :]
+    assert genuine_imaginary(sliced) == 0  # the previously documented slice is wrong
+    assert np.any(np.abs(sliced) < 1e-5)  # ... and it keeps a rigid mode instead
+    mask = internal_mode_mask(energies, report["n_rigid"])
+    internal = energies[mask]
+    assert internal.shape == (3,)
+    assert genuine_imaginary(internal) == 1
+    assert np.all(np.abs(internal) > 1e-3)
+    # Same selection the pipeline makes on frequencies.
+    freqs = projected.get_frequencies()
+    _, selected = at._vibrational_mode_indices(freqs, 3)
+    assert set(np.flatnonzero(mask)) == set(selected)
+    with pytest.raises(ValueError):
+        internal_mode_mask(energies, 10)
+
+
 # --------------------------------------------------------------------------
 # Pipeline integration
 # --------------------------------------------------------------------------
@@ -289,6 +372,43 @@ def test_run_vibrations_projects_by_default_and_reports_contamination(
     wrong = np.sort(unprojected["vibrational_frequencies_cm^-1"])
     assert wrong[0] > clean_vib[0] + 50
     assert any("too high" in w for w in unprojected["warnings"])
+
+
+@pytest.mark.parametrize("indices", [[0, 2, 1], [2, 1, 0]])
+@pytest.mark.parametrize("project", [True, False])
+def test_run_vibrations_reordered_indices_match_default(
+    h2o_emt_minimum, tmp_path, indices, project
+):
+    """Reviewer reproduction: a permuted complete ``indices`` list must not
+    change the modes. [0, 2, 1] swaps equal masses (only the projector was
+    affected); [2, 1, 0] moves oxygen, where ASE's own mass weighting is
+    inconsistent, so canonicalization is needed with projection off too."""
+    _, default = _run_vib(h2o_emt_minimum, EMT(), tmp_path, project_trans_rot=project)
+    _, reordered = _run_vib(
+        h2o_emt_minimum, EMT(), tmp_path, indices=indices, project_trans_rot=project
+    )
+    assert not default["error"] and not reordered["error"]
+    assert reordered["trans_rot_projected"] is project
+    assert reordered["vibration_complete"] is True
+    np.testing.assert_allclose(
+        np.sort(reordered["vibrational_frequencies_cm^-1"]),
+        np.sort(default["vibrational_frequencies_cm^-1"]),
+        rtol=1e-6,
+    )
+    if project:
+        np.testing.assert_allclose(
+            np.sort(np.abs(reordered["trans_rot_frequencies_cm^-1"])),
+            np.sort(np.abs(default["trans_rot_frequencies_cm^-1"])),
+            atol=1e-3,
+        )
+    # Mode vectors are in atom order: the bend (lowest real mode) moves the
+    # hydrogens, not the oxygen, in both runs.
+    for res in (default, reordered):
+        modes = np.asarray(res["vib_modes"])
+        freqs = np.asarray(res["frequencies_cm^-1"], dtype=complex)
+        bend = int(np.argmin(np.where(np.abs(freqs) > 100, np.abs(freqs), np.inf)))
+        norms = np.linalg.norm(modes[bend], axis=1)
+        assert norms[0] < norms[1] and norms[0] < norms[2]
 
 
 def test_run_vibrations_partial_hessian_skips_projection(h2o_emt_minimum, tmp_path):

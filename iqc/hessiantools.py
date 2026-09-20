@@ -39,7 +39,11 @@ Typical use outside the IQC pipeline::
 
     vib = Vibrations(atoms); vib.run()
     projected, report = project_vibrations_data(vib.get_vibrations())
-    energies = projected.get_energies()[report["n_rigid"]:]   # exactly 3N-6
+    energies = projected.get_energies()                       # 3N, ASE order
+    internal = energies[internal_mode_mask(energies, report["n_rigid"])]
+    # ``internal`` has exactly 3N-6 (3N-5) entries and keeps genuine imaginary
+    # modes; a plain ``energies[n_rigid:]`` slice would drop them, because ASE
+    # sorts by eigenvalue and imaginary modes precede the zero rigid block.
 """
 
 from __future__ import annotations
@@ -51,9 +55,11 @@ from ase import units
 from ase.vibrations import VibrationsData
 
 __all__ = [
+    "canonicalize_vibrations_data",
     "rigid_body_basis",
     "project_hessian",
     "project_vibrations_data",
+    "internal_mode_mask",
     "eigenvalues_to_frequencies_cm",
 ]
 
@@ -70,6 +76,26 @@ def eigenvalues_to_frequencies_cm(eigenvalues):
     """
     ev = np.asarray(eigenvalues, dtype=float)
     return np.sign(ev) * np.sqrt(np.abs(ev)) * _EIGENVALUE_TO_EV / units.invcm
+
+
+def internal_mode_mask(values, n_rigid):
+    """Boolean mask selecting the internal (vibrational) modes.
+
+    ``values`` are the mode energies or frequencies of a *projected* Hessian
+    (real, complex, or signed-negative for imaginary modes). The ``n_rigid``
+    entries of smallest magnitude are the projected rigid-body modes (zero by
+    construction) and are masked out; everything else - including genuine
+    imaginary modes, which ASE orders *before* the near-zero rigid block -
+    is kept. Do not slice ``[n_rigid:]`` instead: at a saddle point that
+    discards the imaginary vibration and keeps a rigid mode.
+    """
+    values = np.asarray(values)
+    n_rigid = int(n_rigid)
+    if not 0 <= n_rigid <= values.size:
+        raise ValueError(f"n_rigid={n_rigid} out of range for {values.size} modes")
+    mask = np.ones(values.size, dtype=bool)
+    mask[np.argsort(np.abs(values), kind="stable")[:n_rigid]] = False
+    return mask
 
 
 def rigid_body_basis(atoms, n_rot=None, rank_tol=1e-6):
@@ -211,6 +237,9 @@ def project_vibrations_data(vib_data, n_rot=None, rank_tol=1e-6):
     the result of any ASE finite-difference run can be projected regardless
     of calculator.
 
+    The input is first passed through :func:`canonicalize_vibrations_data`,
+    so an unsorted ``indices`` list covering all atoms is projected in atom
+    order; the returned object is in canonical atom order (``indices=None``).
     Raises ``ValueError`` for partial Hessians (``indices`` restricting the
     displaced atoms): there is no complete rigid-body subspace to remove.
 
@@ -224,14 +253,45 @@ def project_vibrations_data(vib_data, n_rot=None, rank_tol=1e-6):
             "project_vibrations_data expects an ase.vibrations.VibrationsData "
             f"(or an object with get_vibrations()), got {type(vib_data).__name__}"
         )
+    vib_data = canonicalize_vibrations_data(vib_data)
     atoms = vib_data.get_atoms()
     indices = vib_data.get_indices()
-    if indices is not None and len(indices) != len(atoms):
+    n_atoms = len(atoms)
+    if indices is not None and len(indices) != n_atoms:
         raise ValueError(
             "Rigid-body projection requires a complete Hessian; "
-            f"only {len(indices)} of {len(atoms)} atoms were displaced"
+            f"only {len(indices)} of {n_atoms} atoms were displaced"
         )
     projected, report = project_hessian(
         vib_data.get_hessian_2d(), atoms, n_rot=n_rot, rank_tol=rank_tol
     )
     return VibrationsData.from_2d(atoms, projected), report
+
+
+def canonicalize_vibrations_data(vib_data):
+    """Return ``vib_data`` with its Hessian blocks in ascending atom order.
+
+    ``ase.vibrations.Vibrations``/``Infrared`` fill the Hessian in the order
+    of the ``indices`` they were given, whereas ``VibrationsData``
+    mass-weights the Hessian and reports modes in ascending-index (mask)
+    order. For an unsorted ``indices`` list that permutes atoms of unequal
+    mass, ASE's own frequencies are therefore inconsistent (EMT water with
+    ``indices=[2, 1, 0]``: 2670 vs 2406 cm^-1), and any consumer that lines
+    the blocks up with ``atoms`` - such as the rigid-body projector - sees the
+    wrong atoms. Sorting the blocks removes the ambiguity; partial Hessians
+    are handled the same way.
+
+    Returns the input object unchanged when ``indices`` is ``None`` or
+    already sorted.
+    """
+    indices = vib_data.get_indices()
+    if indices is None:
+        return vib_data
+    indices = np.asarray(indices, dtype=int)
+    order = np.argsort(indices, kind="stable")
+    if np.array_equal(order, np.arange(len(indices))):
+        return vib_data
+    # New block j describes atom sorted(indices)[j] = indices[order[j]].
+    perm = (3 * order[:, None] + np.arange(3)[None, :]).ravel()
+    hessian = vib_data.get_hessian_2d()[np.ix_(perm, perm)]
+    return VibrationsData.from_2d(vib_data.get_atoms(), hessian, indices=indices[order])
