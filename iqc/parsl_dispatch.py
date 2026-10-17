@@ -41,6 +41,7 @@ from iqc.databasetools import create_database
 from iqc.datatools import read_smiles_column_records, read_xyz_column_records
 from iqc.main import (
     ComplexEncoder,
+    apply_exachem_artifact_args,
     SKIPPED_EXISTING,
     _default_skip_existing_sources,
     _make_run_id,
@@ -606,11 +607,7 @@ def main() -> int:
     # F4: route --keep-artifacts into ExaChem calculator kwargs so workers
     # build the artifact manifest. Setdefault preserves a YAML-supplied
     # explicit value if the user already pinned it.
-    if (
-        str(calculator_name).lower() == "exachem"
-        and getattr(args, "keep_artifacts", False)
-    ):
-        calc_params.setdefault("keep_artifacts", True)
+    apply_exachem_artifact_args(calc_params, calculator_name, args)
 
     # Resolve inputs.
     try:

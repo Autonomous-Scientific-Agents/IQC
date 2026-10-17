@@ -54,6 +54,34 @@ def _unique_child_path(parent, child_name):
     return os.path.abspath(os.path.expanduser(str(candidate)))
 
 
+def apply_exachem_artifact_args(calc_params, calculator_name, args):
+    """Route artifact CLI flags into ExaChem calculator kwargs (in place).
+
+    Shared by ``iqc``, ``iqc-parsl`` and ``iqc-el`` so every dispatcher honours
+    the same flags. Non-ExaChem calculators ignore them.
+
+    F4: ``--keep-artifacts`` -> ``keep_artifacts`` so the manifest is emitted
+    without also editing the YAML params file.
+    F9: ``--artifact-retention`` / ``--artifact-root`` -> the
+    ``artifact_retention`` dict so the archive hook fires without a YAML
+    override.
+    """
+
+    if str(calculator_name).lower() != "exachem":
+        return calc_params
+    if getattr(args, "keep_artifacts", False):
+        calc_params.setdefault("keep_artifacts", True)
+    if getattr(args, "artifact_retention", "off") == "on":
+        existing = calc_params.get("artifact_retention") or {}
+        existing.setdefault("enabled", True)
+        existing.setdefault("compress", True)
+        ar = getattr(args, "artifact_root", None)
+        if ar:
+            existing.setdefault("destination_root", ar)
+        calc_params["artifact_retention"] = existing
+    return calc_params
+
+
 def _rank_output_parent(cwd="."):
     """Return the directory that contains per-rank tmp_* result directories."""
 
@@ -1203,29 +1231,7 @@ def main():
                 )
                 comm.Abort(1)
 
-        # F4: route --keep-artifacts (CLI) into ExaChem calculator kwargs so
-        # the manifest is emitted without requiring users to also edit their
-        # YAML params file. Non-ExaChem calculators ignore this flag.
-        if (
-            str(calculator_name).lower() == "exachem"
-            and getattr(args, "keep_artifacts", False)
-        ):
-            calc_params.setdefault("keep_artifacts", True)
-
-        # F9: route --artifact-retention / --artifact-root (CLI) into the
-        # ExaChem calculator's artifact_retention dict so the F9 archive
-        # hook fires without needing a YAML override.
-        if (
-            str(calculator_name).lower() == "exachem"
-            and getattr(args, "artifact_retention", "off") == "on"
-        ):
-            existing = calc_params.get("artifact_retention") or {}
-            existing.setdefault("enabled", True)
-            existing.setdefault("compress", True)
-            ar = getattr(args, "artifact_root", None)
-            if ar:
-                existing.setdefault("destination_root", ar)
-            calc_params["artifact_retention"] = existing
+        apply_exachem_artifact_args(calc_params, calculator_name, args)
 
         # Initialize the calculator
         try:

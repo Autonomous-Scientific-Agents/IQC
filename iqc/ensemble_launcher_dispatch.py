@@ -48,6 +48,7 @@ from iqc.databasetools import create_database
 from iqc.datatools import read_smiles_column_records, read_xyz_column_records
 from iqc.main import (
     ComplexEncoder,
+    apply_exachem_artifact_args,
     SKIPPED_EXISTING,
     _default_skip_existing_sources,
     _make_run_id,
@@ -288,8 +289,16 @@ def _row_callable(
                     partials_dir, f"row_{xyz_index:07d}.jsonl"
                 )
                 tmp_path = partial_path + ".tmp"
+                # Write a filtered copy: the underscore-prefixed keys are
+                # caller-only helpers that the head strips before writing the
+                # combined JSONL, so keep partials schema-identical to it.
+                record = {
+                    k: v
+                    for k, v in result.items()
+                    if k not in ("_unique_name", "_record_stamp", "_work_dir_used")
+                }
                 with open(tmp_path, "w") as f:
-                    f.write(_json.dumps(result, cls=_Enc))
+                    f.write(_json.dumps(record, cls=_Enc))
                     f.write("\n")
                 _os.rename(tmp_path, partial_path)
             except Exception as e:  # noqa: BLE001
@@ -603,11 +612,7 @@ def main() -> int:
     if task == "nmr":
         calculator_name = args.backend or nmr_params.get("backend", "orca")
 
-    if (
-        str(calculator_name).lower() == "exachem"
-        and getattr(args, "keep_artifacts", False)
-    ):
-        calc_params.setdefault("keep_artifacts", True)
+    apply_exachem_artifact_args(calc_params, calculator_name, args)
 
     # Inputs.
     try:
