@@ -48,11 +48,13 @@ from iqc.databasetools import create_database
 from iqc.datatools import read_smiles_column_records, read_xyz_column_records
 from iqc.main import (
     ComplexEncoder,
+    apply_exachem_artifact_args,
     SKIPPED_EXISTING,
     _default_skip_existing_sources,
     _make_run_id,
     _rank_output_parent,
     _unique_child_path,
+    strip_private_keys,
     build_completed_calculation_index,
     convert_jsonl_results_to_parquet,
     get_structure_input_mode,
@@ -281,6 +283,7 @@ def _row_callable(
         if isinstance(result, dict) and partials_dir:
             import json as _json
             from iqc.main import ComplexEncoder as _Enc
+            from iqc.main import strip_private_keys as _strip
 
             try:
                 _os.makedirs(partials_dir, exist_ok=True)
@@ -288,8 +291,10 @@ def _row_callable(
                     partials_dir, f"row_{xyz_index:07d}.jsonl"
                 )
                 tmp_path = partial_path + ".tmp"
+                # Partials must match the combined JSONL schema.
+                record = _strip(result)
                 with open(tmp_path, "w") as f:
-                    f.write(_json.dumps(result, cls=_Enc))
+                    f.write(_json.dumps(record, cls=_Enc))
                     f.write("\n")
                 _os.rename(tmp_path, partial_path)
             except Exception as e:  # noqa: BLE001
@@ -603,11 +608,7 @@ def main() -> int:
     if task == "nmr":
         calculator_name = args.backend or nmr_params.get("backend", "orca")
 
-    if (
-        str(calculator_name).lower() == "exachem"
-        and getattr(args, "keep_artifacts", False)
-    ):
-        calc_params.setdefault("keep_artifacts", True)
+    apply_exachem_artifact_args(calc_params, calculator_name, args)
 
     # Inputs.
     try:
@@ -854,10 +855,7 @@ def main() -> int:
             failed += 1
             logging.error("row %s returned unexpected type %s", tid, type(result))
         else:
-            result.pop("_unique_name", None)
-            result.pop("_record_stamp", None)
-            result.pop("_work_dir_used", None)
-            outfile.write(json.dumps(result, cls=ComplexEncoder))
+            outfile.write(json.dumps(strip_private_keys(result), cls=ComplexEncoder))
             outfile.write("\n")
             completed += 1
         outfile.flush()

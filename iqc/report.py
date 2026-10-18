@@ -8,7 +8,6 @@ from rdkit.Chem import Draw
 import io
 import base64
 import logging
-import tomli
 import os
 from . import rdkittools
 from .rdkittools import xyz_to_mol
@@ -983,7 +982,6 @@ def main():
     import logging
     import os
     import sys
-    import tomli
 
     # Set up argument parser
     parser = argparse.ArgumentParser(
@@ -1093,6 +1091,11 @@ def main():
 
     if args.config:
         try:
+            try:
+                import tomllib as tomli  # Python 3.11+
+            except ImportError:
+                import tomli  # only needed for --config on Python < 3.11
+
             with open(args.config, "rb") as f:
                 config = tomli.load(f)
 

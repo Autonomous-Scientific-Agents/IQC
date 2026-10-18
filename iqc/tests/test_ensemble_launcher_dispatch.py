@@ -158,3 +158,50 @@ def test_incremental_append_writes_each_outcome(tmp_path, monkeypatch, caplog):
     assert "1 failed" in caplog.text
     # No per-mol partials when the flag is off.
     assert not (tmp_path / "results_partials").exists()
+
+
+def test_row_partial_omits_helper_keys_and_stays_readable(tmp_path, monkeypatch):
+    """Partials must not carry caller-only keys, and the skip index must still
+    read them (same calculation-key fields as before)."""
+    import iqc.main as iqc_main
+    from iqc.databasetools import calculation_key
+    from iqc.main import build_completed_calculation_index
+
+    record = {
+        "task": "single",
+        "initial_xyz": "xyz",
+        "params": "p",
+        "calculator": "emt",
+        "model": "",
+        "_unique_name": "u",
+        "_record_stamp": "s",
+        "_work_dir_used": False,
+    }
+    monkeypatch.setattr(iqc_main, "_process_one_row", lambda *a, **k: dict(record))
+    monkeypatch.setattr(
+        dispatch, "_get_worker_calculator", lambda *a, **k: types.SimpleNamespace()
+    )
+    monkeypatch.setattr(
+        dispatch, "_load_side_cache", lambda p: {"xyz_files": [], "completed_file_index": {}}
+    )
+    client = Mock()
+    mod = types.ModuleType("ensemble_launcher.orchestrator")
+    mod.ClusterClient = lambda **kw: client
+    monkeypatch.setitem(sys.modules, "ensemble_launcher", types.ModuleType("ensemble_launcher"))
+    monkeypatch.setitem(sys.modules, "ensemble_launcher.orchestrator", mod)
+
+    partials = tmp_path / "results_partials"
+    dispatch._row_callable(
+        0,
+        calc_name="emt",
+        calc_params={},
+        side_cache_path="unused",
+        nodes_per_mol=1,
+        ppn=1,
+        checkpoint_dir=str(tmp_path),
+        process_kwargs={"partials_dir": str(partials)},
+    )
+    row = json.loads((partials / "row_0000000.jsonl").read_text())
+    assert not any(k in row for k in ("_unique_name", "_record_stamp", "_work_dir_used"))
+    index, _ = build_completed_calculation_index([tmp_path])
+    assert calculation_key("xyz", "p", "emt", "", "single") in index
