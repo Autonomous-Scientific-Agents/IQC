@@ -29,6 +29,8 @@ dependencies = [
     # iqc.main imports yaml at module scope; without this a plain
     # `pip install .` produced an entry point that died on ModuleNotFoundError.
     "PyYAML",
+    # iqc.report reads --config TOML files; stdlib tomllib exists on 3.11+.
+    "tomli; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]

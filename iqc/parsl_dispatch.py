@@ -47,6 +47,7 @@ from iqc.main import (
     _make_run_id,
     _rank_output_parent,
     _unique_child_path,
+    strip_private_keys,
     build_completed_calculation_index,
     convert_jsonl_results_to_parquet,
     get_structure_input_mode,
@@ -604,9 +605,9 @@ def main() -> int:
     if task == "nmr":
         calculator_name = args.backend or nmr_params.get("backend", "orca")
 
-    # F4: route --keep-artifacts into ExaChem calculator kwargs so workers
-    # build the artifact manifest. Setdefault preserves a YAML-supplied
-    # explicit value if the user already pinned it.
+    # F4/F9: route --keep-artifacts, --artifact-retention and --artifact-root
+    # into ExaChem calculator kwargs so workers build the artifact manifest and
+    # archive it. Setdefault preserves YAML-supplied explicit values.
     apply_exachem_artifact_args(calc_params, calculator_name, args)
 
     # Resolve inputs.
@@ -772,10 +773,7 @@ def main() -> int:
                     bad_inputs += 1
                     continue
                 # Strip helper keys before serializing — they're caller-only.
-                result.pop("_unique_name", None)
-                result.pop("_record_stamp", None)
-                result.pop("_work_dir_used", None)
-                outfile.write(json.dumps(result, cls=ComplexEncoder))
+                outfile.write(json.dumps(strip_private_keys(result), cls=ComplexEncoder))
                 outfile.write("\n")
                 outfile.flush()
                 completed += 1

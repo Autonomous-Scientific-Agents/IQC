@@ -54,6 +54,7 @@ from iqc.main import (
     _make_run_id,
     _rank_output_parent,
     _unique_child_path,
+    strip_private_keys,
     build_completed_calculation_index,
     convert_jsonl_results_to_parquet,
     get_structure_input_mode,
@@ -282,6 +283,7 @@ def _row_callable(
         if isinstance(result, dict) and partials_dir:
             import json as _json
             from iqc.main import ComplexEncoder as _Enc
+            from iqc.main import strip_private_keys as _strip
 
             try:
                 _os.makedirs(partials_dir, exist_ok=True)
@@ -289,14 +291,8 @@ def _row_callable(
                     partials_dir, f"row_{xyz_index:07d}.jsonl"
                 )
                 tmp_path = partial_path + ".tmp"
-                # Write a filtered copy: the underscore-prefixed keys are
-                # caller-only helpers that the head strips before writing the
-                # combined JSONL, so keep partials schema-identical to it.
-                record = {
-                    k: v
-                    for k, v in result.items()
-                    if k not in ("_unique_name", "_record_stamp", "_work_dir_used")
-                }
+                # Partials must match the combined JSONL schema.
+                record = _strip(result)
                 with open(tmp_path, "w") as f:
                     f.write(_json.dumps(record, cls=_Enc))
                     f.write("\n")
@@ -859,10 +855,7 @@ def main() -> int:
             failed += 1
             logging.error("row %s returned unexpected type %s", tid, type(result))
         else:
-            result.pop("_unique_name", None)
-            result.pop("_record_stamp", None)
-            result.pop("_work_dir_used", None)
-            outfile.write(json.dumps(result, cls=ComplexEncoder))
+            outfile.write(json.dumps(strip_private_keys(result), cls=ComplexEncoder))
             outfile.write("\n")
             completed += 1
         outfile.flush()

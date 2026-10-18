@@ -2,7 +2,13 @@
 
 from types import SimpleNamespace
 
-from iqc.main import apply_exachem_artifact_args
+import pytest
+
+from iqc.main import (
+    PRIVATE_RESULT_KEYS,
+    apply_exachem_artifact_args,
+    strip_private_keys,
+)
 
 
 def _args(**kw):
@@ -47,9 +53,41 @@ def test_non_exachem_untouched():
     assert params == {}
 
 
-def test_dispatchers_use_shared_helper():
+def test_non_mapping_artifact_retention_raises_clear_error():
+    with pytest.raises(ValueError, match="must be a mapping"):
+        apply_exachem_artifact_args(
+            {"artifact_retention": True}, "exachem", _args(artifact_retention="on")
+        )
+
+
+def test_explicit_enabled_false_in_yaml_wins():
+    params = {"artifact_retention": {"enabled": False}}
+    apply_exachem_artifact_args(params, "exachem", _args(artifact_retention="on"))
+    assert params["artifact_retention"]["enabled"] is False
+
+
+def test_strip_private_keys_returns_copy_without_helpers():
+    result = {"energy": 1.0, "unique_name": "u", **{k: 1 for k in PRIVATE_RESULT_KEYS}}
+    stripped = strip_private_keys(result)
+    assert stripped == {"energy": 1.0, "unique_name": "u"}
+    assert all(k in result for k in PRIVATE_RESULT_KEYS)  # input untouched
+
+
+def test_el_dispatcher_uses_shared_helpers():
     import inspect
 
     import iqc.ensemble_launcher_dispatch as el
 
-    assert "apply_exachem_artifact_args" in inspect.getsource(el.main)
+    src = inspect.getsource(el.main)
+    assert "apply_exachem_artifact_args" in src
+    assert "strip_private_keys" in inspect.getsource(el)
+
+
+def test_parsl_dispatcher_uses_shared_helpers():
+    pytest.importorskip("parsl")
+    import inspect
+
+    import iqc.parsl_dispatch as pd
+
+    assert "apply_exachem_artifact_args" in inspect.getsource(pd.main)
+    assert "strip_private_keys" in inspect.getsource(pd.main)

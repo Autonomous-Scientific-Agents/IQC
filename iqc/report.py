@@ -983,11 +983,6 @@ def main():
     import os
     import sys
 
-    try:
-        import tomllib as tomli  # Python 3.11+
-    except ImportError:
-        import tomli
-
     # Set up argument parser
     parser = argparse.ArgumentParser(
         description="Generate HTML reports for molecular structures"
@@ -1096,6 +1091,11 @@ def main():
 
     if args.config:
         try:
+            try:
+                import tomllib as tomli  # Python 3.11+
+            except ImportError:
+                import tomli  # only needed for --config on Python < 3.11
+
             with open(args.config, "rb") as f:
                 config = tomli.load(f)
 

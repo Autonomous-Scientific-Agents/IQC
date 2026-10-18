@@ -54,6 +54,17 @@ def _unique_child_path(parent, child_name):
     return os.path.abspath(os.path.expanduser(str(candidate)))
 
 
+# Caller-only keys that ``_process_one_row`` adds to its result dict. Every
+# writer (combined JSONL, EL partials) must strip them so schemas don't drift.
+PRIVATE_RESULT_KEYS = ("_unique_name", "_record_stamp", "_work_dir_used")
+
+
+def strip_private_keys(result):
+    """Return a shallow copy of ``result`` without ``PRIVATE_RESULT_KEYS``."""
+
+    return {k: v for k, v in result.items() if k not in PRIVATE_RESULT_KEYS}
+
+
 def apply_exachem_artifact_args(calc_params, calculator_name, args):
     """Route artifact CLI flags into ExaChem calculator kwargs (in place).
 
@@ -73,6 +84,12 @@ def apply_exachem_artifact_args(calc_params, calculator_name, args):
         calc_params.setdefault("keep_artifacts", True)
     if getattr(args, "artifact_retention", "off") == "on":
         existing = calc_params.get("artifact_retention") or {}
+        if not isinstance(existing, dict):
+            raise ValueError(
+                "calculator_params.artifact_retention must be a mapping "
+                "(e.g. {enabled: true, compress: true, destination_root: ...}), "
+                f"got {type(existing).__name__}: {existing!r}"
+            )
         existing.setdefault("enabled", True)
         existing.setdefault("compress", True)
         ar = getattr(args, "artifact_root", None)
