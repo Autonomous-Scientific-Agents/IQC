@@ -27,9 +27,11 @@ For shared machines, set `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, and
 ### Codex
 
 Start Codex at the root of this checkout. The project `.codex/config.toml`
-registers IQC through `scripts/run_mcp_server.sh`, which uses `$IQC_PYTHON`,
-then `.venv/bin/python`, then `python3`/`python` on `PATH`, whichever first
-has `iqc` and `mcp` installed. Trusted project configuration must be enabled
+registers IQC through `scripts/run_mcp_server.sh`. If `$IQC_PYTHON` is set,
+the launcher tries that interpreter first and reports its import error on
+stderr if it cannot run the server. It then uses the first of
+`.venv/bin/python`, `python3`, and `python` that can import `iqc`, `ase`,
+`rdkit`, and `mcp`. Trusted project configuration must be enabled
 by the client. `AGENTS.md` supplies repository guidance and
 `.agents/skills/iqc/SKILL.md` is the discoverable chemistry skill.
 

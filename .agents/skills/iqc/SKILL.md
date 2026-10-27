@@ -25,10 +25,13 @@ IQC repository; this skill does not install or connect an MCP server.
   `ignore_imag_modes=True` permits a result. This is not a solution free energy.
 - `run_ir`: finite-difference frequencies and dipole derivatives. The optional
   `optimization_calculator`, `vibration_calculator`, and `dipole_calculator`
-  select roles. `calculator_params` applies to `calculator` and is the default
-  for each role; give a role its own parameters with
+  select roles. `calculator_params` applies to `calculator` and to roles
+  naming the same calculator; give other roles their own parameters with
   `optimization_calculator_params`, `vibration_calculator_params`, or
-  `dipole_calculator_params` (e.g. MACE Hessian with ORCA dipoles).
+  `dipole_calculator_params` (e.g. MACE Hessian with ORCA dipoles). Lists
+  longer than 1000 points, such as a full spectrum from
+  `sparse_spectrum=False`, appear only in `omitted_fields` unless
+  `keep_arrays=True`.
 - `inspect_data_file(path=...)`: inspect schema and statistics before choosing
   input columns for a batch CLI run.
 

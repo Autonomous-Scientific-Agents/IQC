@@ -73,14 +73,24 @@ mcp = FastMCP(
 # UMA) we cache to avoid re-downloading checkpoints in the same process.
 _CALC_CACHE: dict[str, Any] = {}
 
+# Result lists longer than this (e.g. a full ~3700-point IR spectrum) are
+# omitted unless the caller asks for arrays, so responses fit agent context.
+_MAX_LIST_LEN = 1000
+
+# Paths into a tool's TemporaryDirectory are gone by the time we respond.
+_TEMP_PATH_KEYS = {"ir_plot", "normal_mode_data"}
+
 
 def _jsonable(value, non_finite: list):
     """Convert a result value to strict-JSON data, element by element.
 
     numpy arrays/scalars become lists/numbers (no scientific imports here, so
-    startup stays cheap). Complex values follow asetools' frequency
-    convention: imaginary modes become negative reals. NaN/Inf become None and
-    are flagged in `non_finite` so a caller can tell missing from zero.
+    startup stays cheap). Purely real or purely imaginary complex values
+    (ASE frequencies and mode energies) follow asetools' frequency
+    convention: imaginary modes become negative reals. A complex value with
+    both parts nonzero is returned as {"real": x, "imag": y} so neither part
+    is lost. NaN/Inf become None and are flagged in `non_finite` so a caller
+    can tell missing from zero.
     """
 
     if value is None or isinstance(value, (bool, int, str)):
@@ -91,9 +101,14 @@ def _jsonable(value, non_finite: list):
         non_finite.append(True)
         return None
     if isinstance(value, complex):
-        return _jsonable(
-            -abs(value.imag) if value.imag else value.real, non_finite
-        )
+        if not value.imag:
+            return _jsonable(value.real, non_finite)
+        if not value.real:
+            return _jsonable(-abs(value.imag), non_finite)
+        return {
+            "real": _jsonable(value.real, non_finite),
+            "imag": _jsonable(value.imag, non_finite),
+        }
     if isinstance(value, dict):
         return {str(k): _jsonable(v, non_finite) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
@@ -110,16 +125,23 @@ def _trim_results(results: dict[str, Any], keep_arrays: bool = False) -> dict[st
 
     `forces`, `vib_modes`, and `jmol_vib_modes_xyz` can be huge for big
     molecules. We surface summary fields (energies, frequencies, timings,
-    errors, warnings) and keep arrays only when the caller asks.
+    errors, warnings) and keep arrays only when the caller asks. Lists longer
+    than `_MAX_LIST_LEN` are omitted unless `keep_arrays`, with their lengths
+    reported in `omitted_fields`.
     """
 
-    drop_keys = {"vib_modes", "jmol_vib_modes_xyz"}
+    drop_keys = {"vib_modes", "jmol_vib_modes_xyz"} | _TEMP_PATH_KEYS
     if not keep_arrays:
         drop_keys |= {"forces", "opt_forces"}
     out: dict[str, Any] = {}
     non_finite_fields = []
+    omitted_fields = {}
     for k, v in results.items():
         if k in drop_keys:
+            continue
+        n = len(v) if isinstance(v, (list, tuple)) or getattr(v, "ndim", 0) else 0
+        if not keep_arrays and n > _MAX_LIST_LEN:
+            omitted_fields[str(k)] = n
             continue
         non_finite: list = []
         out[k] = _jsonable(v, non_finite)
@@ -128,6 +150,8 @@ def _trim_results(results: dict[str, Any], keep_arrays: bool = False) -> dict[st
     if non_finite_fields:
         # NaN/Inf were replaced by null; surface which fields were affected.
         out["non_finite_fields"] = non_finite_fields
+    if omitted_fields:
+        out["omitted_fields"] = omitted_fields
     return out
 
 
@@ -166,7 +190,7 @@ def _get_calculator(name: str, params: Optional[dict] = None):
     params = params or {}
     name = name.strip().lower()  # get_calculator is case-insensitive too
     cache_key = f"{name}:" + json.dumps(params, sort_keys=True, default=str)
-    cacheable = name.startswith(("mace", "uma-"))
+    cacheable = name.startswith(("mace", "uma"))
     if cacheable and cache_key in _CALC_CACHE:
         return _CALC_CACHE[cache_key]
     calc = get_calculator(name=name, **params)
@@ -543,11 +567,13 @@ def run_ir(
     intensity_threshold: float = 1e-3,
     charge: Optional[int] = None,
     multiplicity: Optional[int] = None,
+    keep_arrays: bool = False,
 ) -> dict:
     """Infrared spectrum (frequencies + intensities) by finite differences.
 
     Three roles (optimization, vibration, dipole) can use different
-    calculators. Roles fall back to `calculator`. The **dipole** role must be
+    calculators. Roles without an override use `calculator`, which is only
+    constructed when some role needs it. The **dipole** role must be
     a calculator that implements dipoles (`xtb`, `orca`, `mace-polar`, or
     `pyscf` with HF/DFT) — `mace`, `emt`, `uma-*`, and correlated PySCF
     methods fail before any finite-difference work starts.
@@ -555,8 +581,10 @@ def run_ir(
     Args:
         smiles | xyz: Input structure.
         calculator: Fallback calculator for all three roles.
-        calculator_params: Extra kwargs for `calculator`, and the default
-            for any role override without its own `*_calculator_params`.
+        calculator_params: Extra kwargs for `calculator`. A role override
+            naming the same calculator inherits them; a role naming a
+            different calculator gets none unless its `*_calculator_params`
+            is set.
         optimization_calculator, vibration_calculator, dipole_calculator:
             Per-role overrides (calculator name).
         optimization_calculator_params, vibration_calculator_params,
@@ -569,6 +597,9 @@ def run_ir(
         sparse_spectrum: If True, only points above `intensity_threshold`
             are kept in the spectrum arrays.
         intensity_threshold: D/Å²·amu⁻¹ cutoff for `sparse_spectrum`.
+        keep_arrays: Return arrays longer than 1000 points (e.g. the full
+            spectrum with `sparse_spectrum=False`); otherwise they are listed
+            in `omitted_fields` with their lengths.
 
     Returns:
         Dict with `spectrum_frequencies`, `spectrum_intensities`,
@@ -578,16 +609,30 @@ def run_ir(
     from iqc.asetools import run_ir as _rir
 
     atoms = _load_atoms(smiles, xyz)
-    fallback = _get_calculator(calculator, calculator_params) if calculator else None
+
+    def same_name(a, b):
+        return bool(a and b) and a.strip().lower() == b.strip().lower()
 
     def role(name, params):
         if not name:
             return None
-        return _get_calculator(name, calculator_params if params is None else params)
+        if params is None:
+            # calculator_params belong to `calculator`; don't hand ORCA
+            # kwargs to xtb or MACE just because a role was overridden.
+            params = calculator_params if same_name(name, calculator) else None
+        return _get_calculator(name, params)
 
     opt_c = role(optimization_calculator, optimization_calculator_params)
     vib_c = role(vibration_calculator, vibration_calculator_params)
     dip_c = role(dipole_calculator, dipole_calculator_params)
+    # Build the fallback only if a role uses it, so a fully overridden run
+    # does not require the default backend (xtb) to be installed.
+    needs_fallback = None in (opt_c, vib_c, dip_c)
+    fallback = (
+        _get_calculator(calculator, calculator_params)
+        if calculator and needs_fallback
+        else None
+    )
 
     with _orca_scratch(fallback, opt_c, vib_c, dip_c), tempfile.TemporaryDirectory(
         prefix="iqc_mcp_ir_"
@@ -608,7 +653,7 @@ def run_ir(
             charge=charge,
             multiplicity=multiplicity,
         )
-    return _trim_results(results)
+    return _trim_results(results, keep_arrays=keep_arrays)
 
 
 # --------------------------------------------------------------------------- #

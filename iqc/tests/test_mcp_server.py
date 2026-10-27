@@ -193,6 +193,7 @@ def test_model_calculator_reused_for_identical_parameters(monkeypatch):
     assert server._get_calculator("MACE", {"model": "small"}) is server._get_calculator(
         "mace", {"model": "small"}
     )
+    assert server._get_calculator("uma") is server._get_calculator("UMA")
 
 
 def test_result_arrays_and_scalars_remain_numeric():
@@ -229,7 +230,9 @@ def test_complex_and_non_finite_values_stay_typed():
     json.dumps(result, allow_nan=False)
 
 
-def test_run_ir_per_role_calculator_params(monkeypatch):
+@pytest.fixture
+def ir_calls(monkeypatch):
+    """Record get_calculator calls made by run_ir without running chemistry."""
     from iqc import asetools
 
     made = []
@@ -243,6 +246,10 @@ def test_run_ir_per_role_calculator_params(monkeypatch):
     monkeypatch.setattr(
         asetools, "run_ir", lambda atoms, **kw: (atoms, {"error": "", "warnings": []})
     )
+    return made
+
+
+def test_run_ir_per_role_calculator_params(ir_calls):
     server.run_ir(
         xyz=COPPER,
         calculator="emt",
@@ -250,11 +257,33 @@ def test_run_ir_per_role_calculator_params(monkeypatch):
         dipole_calculator="orca",
         dipole_calculator_params={"orcasimpleinput": "HF def2-SVP"},
     )
-    assert made == [
+    assert sorted(ir_calls) == [
         ("emt", {}),
         ("emt", {}),
         ("orca", {"orcasimpleinput": "HF def2-SVP"}),
     ]
+
+
+def test_run_ir_params_only_inherited_by_same_calculator(ir_calls):
+    orca = {"orcasimpleinput": "B3LYP def2-SVP"}
+    server.run_ir(
+        xyz=COPPER,
+        calculator="orca",
+        calculator_params=orca,
+        vibration_calculator="xtb",
+        dipole_calculator="ORCA",
+    )
+    assert sorted(ir_calls) == [("orca", orca), ("orca", orca), ("xtb", {})]
+
+
+def test_run_ir_skips_unused_fallback(ir_calls):
+    server.run_ir(
+        xyz=COPPER,
+        optimization_calculator="mace",
+        vibration_calculator="mace",
+        dipole_calculator="orca",
+    )
+    assert "xtb" not in [name for name, _ in ir_calls]
 
 
 def test_orca_scratch_is_temporary(monkeypatch, tmp_path):
@@ -325,3 +354,63 @@ def test_launcher_skips_incompatible_mcp_environment(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "Run the IQC MCP server" in result.stdout
+
+
+def test_mixed_complex_values_keep_both_parts():
+    result = server._trim_results({"x": [3 + 12j, 0 + 2j, 5 + 0j]})
+    assert result["x"] == [{"real": 3.0, "imag": 12.0}, -2.0, 5.0]
+
+
+def test_temporary_paths_and_large_lists_are_omitted():
+    results = {
+        "ir_plot": "/tmp/iqc_mcp_ir_x/spectrum.png",
+        "normal_mode_data": "Normal modes saved as .traj files with prefix /tmp/x",
+        "spectrum_frequencies": list(range(3700)),
+        "vibrational_frequencies_cm^-1": [100.0, 200.0],
+    }
+    trimmed = server._trim_results(results)
+    assert trimmed == {
+        "vibrational_frequencies_cm^-1": [100.0, 200.0],
+        "omitted_fields": {"spectrum_frequencies": 3700},
+    }
+    kept = server._trim_results(results, keep_arrays=True)
+    assert len(kept["spectrum_frequencies"]) == 3700
+    assert "ir_plot" not in kept and "normal_mode_data" not in kept
+
+
+def test_launcher_rejects_interpreter_with_only_mcp(tmp_path):
+    """A Python that imports mcp but not the scientific stack is skipped,
+    and a skipped IQC_PYTHON is reported rather than silently replaced."""
+    shell = shutil.which("sh")
+    if shell is None:
+        pytest.skip("Launcher requires a POSIX shell")
+
+    scripts = tmp_path / "scripts"  # isolate the checkout's .venv candidate
+    scripts.mkdir()
+    launcher = scripts / "run_mcp_server.sh"
+    shutil.copyfile(ROOT / "scripts/run_mcp_server.sh", launcher)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name in ("python3", "python"):
+        fake = bin_dir / name
+        fake.write_text(
+            f"#!{shell}\n"
+            'case "$2" in *rdkit*) echo "No module named rdkit" >&2; exit 1;; esac\n'
+            "echo selected\n"
+        )
+        fake.chmod(0o755)
+    result = subprocess.run(
+        [shell, str(launcher)],
+        cwd=tmp_path,
+        env={
+            "PATH": f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin",
+            "HOME": str(tmp_path),
+            "IQC_PYTHON": str(bin_dir / "python3"),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 1
+    assert "selected" not in result.stdout
+    assert "skipping IQC_PYTHON" in result.stderr and "rdkit" in result.stderr
