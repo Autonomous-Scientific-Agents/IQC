@@ -37,6 +37,23 @@ x-common: &common
     PYTHONUNBUFFERED: "1"
 
 services:
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.uv
+      target: mcp
+    image: iqc:mcp
+    profiles: ["agent"]
+    stdin_open: true
+    # Run as the host user so the bind-mounted ./work is writable. Create it
+    # first (`mkdir -p work`) and export IQC_UID=$(id -u) IQC_GID=$(id -g).
+    user: "${IQC_UID:-1000}:${IQC_GID:-1000}"
+    environment:
+      HOME: /tmp
+    working_dir: /work
+    volumes:
+      - ./work:/work
+
   # Light quantum chemistry: xTB, PySCF, NWChem, EMT.
   qc:
     build:

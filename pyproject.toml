@@ -62,7 +62,8 @@ parsl = [
     "parsl>=2025.1.13",
 ]
 mcp = [
-    "mcp",
+    # The MCP SDK requires Python 3.10+; iqc-mcp reports this on older Pythons.
+    "mcp>=1.12,<2; python_version >= '3.10'",
 ]
 bookkeeping = [
     # DuckDB powers the sweep done/remaining query layer (iqc.sweep_bookkeeping).
