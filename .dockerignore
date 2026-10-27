@@ -3,6 +3,14 @@
 # is needed to build the image.
 
 .git
+.env
+.env.*
+.aws
+.ssh
+.claude
+.codex
+.agents
+.pr*
 .venv
 venv
 *.egg-info
@@ -28,6 +36,13 @@ mol_*_calc_*/
 *_calc_orca/
 web_app/
 notebooks/
+data/
+run/
+models/
+thrash/
+*.db
+*.zip
+*.tar.gz
 
 # Editor / OS cruft
 .vscode/

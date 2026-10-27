@@ -56,7 +56,7 @@ jobs:
       run: conda run -n iqc-env pip install -e .
     
     - name: Install test dependencies
-      run: conda run -n iqc-env pip install pytest
+      run: conda run -n iqc-env pip install -e '.[mcp,test]'
     
     - name: Run tests
       run: conda run -n iqc-env pytest iqc/tests/
@@ -105,6 +105,20 @@ jobs:
       # Capability-aware: requires the calculators this image ships
       # (EMT/xTB/PySCF/NWChem + pytest) and SKIPs the ones it does not.
       run: docker run --rm iqc:base bash /opt/iqc/scripts/docker_smoke_test.sh
+
+    - name: Build the MCP agent image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: Dockerfile.uv
+        target: mcp
+        push: false
+        load: true
+        tags: iqc:mcp
+        cache-from: type=gha
+
+    - name: Verify MCP protocol in the agent container
+      run: docker run --rm iqc:mcp python -m pytest /opt/iqc/iqc/tests/test_mcp_server.py -q -p no:cacheprovider
 
   docker-build-mlip:
     # Opt-in (manual) build of the MLIP target. Not on every PR: it pulls

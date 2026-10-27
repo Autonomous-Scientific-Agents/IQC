@@ -62,7 +62,7 @@ parsl = [
     "parsl>=2025.1.13",
 ]
 mcp = [
-    "mcp",
+    "mcp>=1.12,<2",
 ]
 bookkeeping = [
     # DuckDB powers the sweep done/remaining query layer (iqc.sweep_bookkeeping).

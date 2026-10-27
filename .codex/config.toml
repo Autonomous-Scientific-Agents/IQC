@@ -1,0 +1,13 @@
+# Activate the environment with IQC's mcp extra before starting Codex.
+# Use an absolute interpreter path if the client does not inherit your PATH.
+[mcp_servers.iqc]
+command = "python"
+args = ["-m", "iqc.mcp_server"]
+startup_timeout_sec = 30
+tool_timeout_sec = 600
+
+[mcp_servers.iqc.env]
+IQC_DISABLE_MPI = "1"
+OMP_NUM_THREADS = "1"
+MKL_NUM_THREADS = "1"
+OPENBLAS_NUM_THREADS = "1"

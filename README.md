@@ -3,6 +3,21 @@ Interactive Quantum Chemistry
 
 [![CI](https://github.com/Autonomous-Scientific-Agents/IQC/actions/workflows/ci.yml/badge.svg)](https://github.com/Autonomous-Scientific-Agents/IQC/actions/workflows/ci.yml)
 
+## Use with Codex, Claude, and other agents
+
+IQC includes an MCP server, a shared chemistry skill, repository instructions
+(`AGENTS.md` / `CLAUDE.md`), and project MCP configuration for Codex and Claude
+Code. Install in an activated Python 3.11+ environment:
+
+```bash
+python -m pip install -e '.[mcp,xtb]'
+python -m iqc.mcp_server --help
+```
+
+Then start your agent from this checkout. For client registration, skill
+installation outside the repository, and the `iqc:mcp` stdio container, see
+[the agent and MCP guide](docs/mcp.md).
+
 ## Installation
 
 ### Clone the repository

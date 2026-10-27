@@ -85,6 +85,20 @@ CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", \
      "--allow-root", "--ServerApp.token=", "--ServerApp.password="]
 
 # -----------------------------------------------------------------------------
+# mcp: stdio server for agent clients, using the light calculator stack
+# -----------------------------------------------------------------------------
+FROM base AS mcp
+ENV IQC_DISABLE_MPI=1
+WORKDIR /opt/iqc
+RUN uv pip install ".[mcp]" \
+    && python -m iqc.mcp_server --help
+# No notebook or network listener: clients communicate over stdin/stdout.
+RUN useradd --create-home --uid 10001 iqc-agent
+USER iqc-agent
+WORKDIR /work
+CMD ["python", "-m", "iqc.mcp_server"]
+
+# -----------------------------------------------------------------------------
 # mlip: base + PyTorch (CPU) + MACE + FAIRChem UMA
 # -----------------------------------------------------------------------------
 FROM base AS mlip

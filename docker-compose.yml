@@ -37,6 +37,18 @@ x-common: &common
     PYTHONUNBUFFERED: "1"
 
 services:
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.uv
+      target: mcp
+    image: iqc:mcp
+    profiles: ["agent"]
+    stdin_open: true
+    working_dir: /work
+    volumes:
+      - ./work:/work
+
   # Light quantum chemistry: xTB, PySCF, NWChem, EMT.
   qc:
     build:

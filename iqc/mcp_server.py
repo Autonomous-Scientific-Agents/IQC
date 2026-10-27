@@ -22,7 +22,10 @@ import logging
 import os
 import sys
 import tempfile
+import threading
+from contextlib import redirect_stdout
 from dataclasses import asdict, is_dataclass
+from functools import wraps
 from typing import Any, Optional
 
 try:
@@ -36,14 +39,28 @@ except ImportError as exc:
 
 logger = logging.getLogger("iqc.mcp")
 
+# ASE calculators have mutable state and some backends print to stdout.
+# FastMCP captures the protocol stream before invoking these wrappers.
+_TOOL_LOCK = threading.RLock()
+
+
+def _quiet_tool(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        with _TOOL_LOCK, redirect_stdout(sys.stderr):
+            return fn(*args, **kwargs)
+
+    return wrapped
+
+
 mcp = FastMCP(
     name="iqc",
     instructions=(
         "IQC (Interactive Quantum Chemistry) MCP server. Use these tools to "
         "build molecules from SMILES or XYZ and run single-point, geometry "
         "optimization, vibrational, thermochemistry, or IR calculations with "
-        "an ASE calculator (xtb, mace, mace-polar, emt, orca, uma-*). For IR, "
-        "the dipole calculator must support dipoles — use xtb, orca, or "
+        "an ASE calculator (see list_calculators). For IR, the dipole "
+        "calculator must support dipoles — use xtb, orca, pyscf HF/DFT, or "
         "mace-polar. Heavy calculators (MACE, UMA) require optional `mlip` "
         "extras; xtb requires the `xtb` extra."
     ),
@@ -53,6 +70,14 @@ mcp = FastMCP(
 # Calculators that are cheap to (re)instantiate per call. For others (MACE,
 # UMA) we cache to avoid re-downloading checkpoints in the same process.
 _CALC_CACHE: dict[str, Any] = {}
+
+
+def _json_default(value):
+    # Preserve numpy arrays/scalars as data, rather than repr strings. Import
+    # no scientific libraries here so startup stays cheap.
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    raise TypeError(f"Cannot encode {type(value).__name__}")
 
 
 def _trim_results(results: dict[str, Any], keep_arrays: bool = False) -> dict[str, Any]:
@@ -71,7 +96,7 @@ def _trim_results(results: dict[str, Any], keep_arrays: bool = False) -> dict[st
         if k in drop_keys:
             continue
         try:
-            json.dumps(v)
+            v = json.loads(json.dumps(v, default=_json_default, allow_nan=False))
         except (TypeError, ValueError):
             v = repr(v)
         out[k] = v
@@ -106,16 +131,18 @@ def _load_atoms(smiles: Optional[str], xyz: Optional[str]):
 
 
 def _get_calculator(name: str, params: Optional[dict] = None):
-    """Cache calculator instances by (name, frozen params)."""
+    """Cache in-process ML models; file-backed calculators get fresh instances."""
 
     from iqc.asetools import get_calculator
 
     params = params or {}
     cache_key = f"{name}:" + json.dumps(params, sort_keys=True, default=str)
-    if cache_key in _CALC_CACHE:
+    cacheable = name.startswith(("mace", "uma-"))
+    if cacheable and cache_key in _CALC_CACHE:
         return _CALC_CACHE[cache_key]
     calc = get_calculator(name=name, **params)
-    _CALC_CACHE[cache_key] = calc
+    if cacheable:
+        _CALC_CACHE[cache_key] = calc
     return calc
 
 
@@ -125,6 +152,7 @@ def _get_calculator(name: str, params: Optional[dict] = None):
 
 
 @mcp.tool()
+@_quiet_tool
 def smiles_to_xyz(smiles: str) -> dict:
     """Build a 3D structure from a SMILES string and return its XYZ text.
 
@@ -150,6 +178,7 @@ def smiles_to_xyz(smiles: str) -> dict:
 
 
 @mcp.tool()
+@_quiet_tool
 def xyz_to_smiles(xyz: str) -> dict:
     """Derive a canonical SMILES from XYZ coordinates (RDKit perception).
 
@@ -171,28 +200,81 @@ def xyz_to_smiles(xyz: str) -> dict:
 
 
 @mcp.tool()
+@_quiet_tool
 def list_calculators() -> dict:
     """List ASE calculator names IQC's MCP tools accept, with notes."""
 
     return {
         "calculators": [
-            {"name": "xtb", "type": "semi-empirical", "dipole": True,
-             "notes": "Fast GFN2-xTB. Requires `pip install iqc[xtb]`."},
-            {"name": "emt", "type": "classical", "dipole": False,
-             "notes": "Effective-medium theory; metals only. No dipoles."},
-            {"name": "mace", "type": "MLIP foundation model", "dipole": False,
-             "notes": "MACE-MP large. Requires `iqc[mlip]` + mace-torch."},
-            {"name": "mace-polar", "type": "MLIP (electrostatic)", "dipole": True,
-             "notes": "Electrostatic MACE; supports IR. Needs MACE main branch."},
-            {"name": "uma-s-omol", "type": "MLIP (FAIRChem)", "dipole": False,
-             "notes": "UMA small, organic-molecule head."},
-            {"name": "uma-m-omol", "type": "MLIP (FAIRChem)", "dipole": False,
-             "notes": "UMA medium, organic-molecule head."},
-            {"name": "orca", "type": "DFT/HF", "dipole": True,
-             "notes": "ORCA binary must be on PATH or pass calculator_params.command."},
+            {
+                "name": "xtb",
+                "type": "semi-empirical",
+                "dipole": True,
+                "notes": "Fast GFN2-xTB. Requires `pip install iqc[xtb]`.",
+            },
+            {
+                "name": "emt",
+                "type": "classical",
+                "dipole": False,
+                "notes": "Effective-medium theory; metals only. No dipoles.",
+            },
+            {
+                "name": "mace",
+                "type": "MLIP foundation model",
+                "dipole": False,
+                "notes": "MACE-MP large. Requires `iqc[mlip]` + mace-torch.",
+            },
+            {
+                "name": "mace-polar",
+                "type": "MLIP (electrostatic)",
+                "dipole": True,
+                "notes": "Electrostatic MACE; supports IR. Needs MACE main branch.",
+            },
+            {
+                "name": "uma-s-omol",
+                "type": "MLIP (FAIRChem)",
+                "dipole": False,
+                "notes": "UMA small, organic-molecule head.",
+            },
+            {
+                "name": "uma-m-omol",
+                "type": "MLIP (FAIRChem)",
+                "dipole": False,
+                "notes": "UMA medium, organic-molecule head.",
+            },
+            {
+                "name": "orca",
+                "type": "DFT/HF",
+                "dipole": True,
+                "notes": "ORCA binary must be on PATH or pass calculator_params.command.",
+            },
+            {
+                "name": "pyscf",
+                "type": "DFT/HF",
+                "dipole": True,
+                "notes": "Requires pyscf. Set method, xc, and basis explicitly.",
+            },
+            {
+                "name": "pyscf-ccsd(t)",
+                "type": "correlated",
+                "dipole": False,
+                "notes": "Requires pyscf; expensive finite-difference forces.",
+            },
+            {
+                "name": "exachem",
+                "type": "external quantum chemistry",
+                "dipole": False,
+                "notes": "Requires ExaChem executable; energy-only methods use FD forces.",
+            },
+            {
+                "name": "vasp",
+                "type": "plane-wave DFT",
+                "dipole": False,
+                "notes": "Requires licensed VASP and pseudopotentials; molecular box workflow.",
+            },
         ],
         "default_for_mcp": "xtb",
-        "ir_compatible": ["xtb", "orca", "mace-polar"],
+        "ir_compatible": ["xtb", "orca", "mace-polar", "pyscf"],
     }
 
 
@@ -202,12 +284,13 @@ def list_calculators() -> dict:
 
 
 @mcp.tool()
+@_quiet_tool
 def run_single_point(
     smiles: Optional[str] = None,
     xyz: Optional[str] = None,
     calculator: str = "xtb",
     calculator_params: Optional[dict] = None,
-    charge: int = 0,
+    charge: Optional[int] = None,
     multiplicity: Optional[int] = None,
     keep_forces: bool = False,
 ) -> dict:
@@ -219,7 +302,7 @@ def run_single_point(
         calculator: Calculator name (see `list_calculators`).
         calculator_params: Extra kwargs forwarded to the calculator constructor
             (e.g. {"orcasimpleinput": "B3LYP def2-SVP"} for ORCA).
-        charge: Net molecular charge.
+        charge: Net molecular charge; omitted uses input metadata, then zero.
         multiplicity: Spin multiplicity 2S+1; defaults from electron count.
         keep_forces: Include the full force array in the response.
 
@@ -235,7 +318,7 @@ def run_single_point(
     atoms, results = _rsp(
         atoms,
         calculator=calc,
-        unique_name="mcp_single",
+        unique_name="mcp_single_" + os.urandom(6).hex(),
         charge=charge,
         multiplicity=multiplicity,
     )
@@ -245,6 +328,7 @@ def run_single_point(
 
 
 @mcp.tool()
+@_quiet_tool
 def run_optimization(
     smiles: Optional[str] = None,
     xyz: Optional[str] = None,
@@ -252,7 +336,7 @@ def run_optimization(
     calculator_params: Optional[dict] = None,
     fmax: float = 0.01,
     max_steps: int = 200,
-    charge: int = 0,
+    charge: Optional[int] = None,
     multiplicity: Optional[int] = None,
 ) -> dict:
     """Optimize geometry with BFGS to the requested force tolerance.
@@ -263,7 +347,7 @@ def run_optimization(
         calculator_params: Extra kwargs for the calculator.
         fmax: Force convergence threshold in eV/Å.
         max_steps: BFGS step cap.
-        charge: Net molecular charge.
+        charge: Net molecular charge; omitted uses input metadata, then zero.
         multiplicity: Spin multiplicity 2S+1.
 
     Returns:
@@ -278,7 +362,7 @@ def run_optimization(
     atoms, results = _ropt(
         atoms,
         calculator=calc,
-        unique_name="mcp_opt",
+        unique_name="mcp_opt_" + os.urandom(6).hex(),
         fmax=fmax,
         max_steps=max_steps,
         charge=charge,
@@ -288,6 +372,7 @@ def run_optimization(
 
 
 @mcp.tool()
+@_quiet_tool
 def run_vibrations(
     smiles: Optional[str] = None,
     xyz: Optional[str] = None,
@@ -296,7 +381,7 @@ def run_vibrations(
     optimize: bool = True,
     delta: float = 0.01,
     fmax: float = 0.01,
-    charge: int = 0,
+    charge: Optional[int] = None,
     multiplicity: Optional[int] = None,
 ) -> dict:
     """Finite-difference vibrational analysis.
@@ -326,7 +411,7 @@ def run_vibrations(
             atoms,
             calculator=calc,
             optimize=optimize,
-            unique_name="mcp_vib",
+            unique_name="mcp_vib_" + os.urandom(6).hex(),
             vib_dir=vib_dir,
             delta=delta,
             fmax=fmax,
@@ -337,13 +422,14 @@ def run_vibrations(
 
 
 @mcp.tool()
+@_quiet_tool
 def run_thermo(
     smiles: Optional[str] = None,
     xyz: Optional[str] = None,
     calculator: str = "xtb",
     calculator_params: Optional[dict] = None,
     ignore_imag_modes: bool = True,
-    charge: int = 0,
+    charge: Optional[int] = None,
     multiplicity: Optional[int] = None,
 ) -> dict:
     """Ideal-gas thermochemistry at 298.15 K / 1 atm.
@@ -365,7 +451,7 @@ def run_thermo(
             atoms,
             calculator=calc,
             ignore_imag_modes=ignore_imag_modes,
-            unique_name="mcp_thermo",
+            unique_name="mcp_thermo_" + os.urandom(6).hex(),
             vib_dir=vib_dir,
             charge=charge,
             multiplicity=multiplicity,
@@ -374,6 +460,7 @@ def run_thermo(
 
 
 @mcp.tool()
+@_quiet_tool
 def run_ir(
     smiles: Optional[str] = None,
     xyz: Optional[str] = None,
@@ -387,7 +474,7 @@ def run_ir(
     fmax: float = 0.01,
     sparse_spectrum: bool = True,
     intensity_threshold: float = 1e-3,
-    charge: int = 0,
+    charge: Optional[int] = None,
     multiplicity: Optional[int] = None,
 ) -> dict:
     """Infrared spectrum (frequencies + intensities) by finite differences.
@@ -419,9 +506,21 @@ def run_ir(
 
     atoms = _load_atoms(smiles, xyz)
     fallback = _get_calculator(calculator, calculator_params) if calculator else None
-    opt_c = _get_calculator(optimization_calculator, calculator_params) if optimization_calculator else None
-    vib_c = _get_calculator(vibration_calculator, calculator_params) if vibration_calculator else None
-    dip_c = _get_calculator(dipole_calculator, calculator_params) if dipole_calculator else None
+    opt_c = (
+        _get_calculator(optimization_calculator, calculator_params)
+        if optimization_calculator
+        else None
+    )
+    vib_c = (
+        _get_calculator(vibration_calculator, calculator_params)
+        if vibration_calculator
+        else None
+    )
+    dip_c = (
+        _get_calculator(dipole_calculator, calculator_params)
+        if dipole_calculator
+        else None
+    )
 
     with tempfile.TemporaryDirectory(prefix="iqc_mcp_ir_") as vib_dir:
         atoms, results = _rir(
@@ -431,7 +530,7 @@ def run_ir(
             vibration_calculator=vib_c,
             dipole_calculator=dip_c,
             optimize=optimize,
-            unique_name="mcp_ir",
+            unique_name="mcp_ir_" + os.urandom(6).hex(),
             vib_dir=vib_dir,
             delta=delta,
             fmax=fmax,
@@ -449,6 +548,7 @@ def run_ir(
 
 
 @mcp.tool()
+@_quiet_tool
 def inspect_data_file(path: str) -> dict:
     """Inspect a tabular file (parquet, CSV/TSV, Excel, JSON/JSONL, Feather,
     Arrow IPC) and return its schema and basic statistics.
@@ -474,7 +574,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the IQC MCP server.")
     parser.add_argument(
         "--transport",
-        choices=("stdio", "sse"),
+        choices=("stdio", "sse", "streamable-http"),
         default="stdio",
         help="MCP transport (default: stdio).",
     )
@@ -489,10 +589,20 @@ def main() -> None:
         level=args.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         stream=sys.stderr,
+        force=True,
     )
 
     # Avoid initializing MPI for the long-lived server process.
     os.environ.setdefault("IQC_DISABLE_MPI", "1")
+
+    if args.transport == "stdio":
+        # Keep a dedicated protocol descriptor. Native libraries and child
+        # processes writing to fd 1 must not corrupt JSON-RPC on stdout.
+        protocol_stdout = os.fdopen(
+            os.dup(sys.stdout.fileno()), "w", encoding="utf-8", buffering=1
+        )
+        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+        sys.stdout = protocol_stdout
 
     mcp.run(transport=args.transport)
 
