@@ -103,11 +103,16 @@ def test_backend_output_cannot_corrupt_stdio(tmp_path):
     """A noisy Python/native backend must leave JSON-RPC parseable."""
     script = """
 import os
+import threading
 from iqc import mcp_server as server
 from iqc import asetools
 
 def noisy(*args, **kwargs):
     print("python backend diagnostic", flush=True)
+    # Background threads outlive the tool call and its stdout redirect.
+    threading.Timer(
+        0.05, lambda: print("late background diagnostic", flush=True)
+    ).start()
     os.write(1, b"native backend diagnostic\\n")
     # Child processes inherit fd 0; it must not be the JSON-RPC stream.
     assert os.read(0, 1) == b""
@@ -131,7 +136,9 @@ server.main()
             ),
         )
         async with stdio_client(params) as (reader, writer):
-            async with ClientSession(reader, writer) as session:
+            async with ClientSession(
+                reader, writer, message_handler=record
+            ) as session:
                 await session.initialize()
                 result = payload(
                     await session.call_tool(
@@ -143,6 +150,15 @@ server.main()
                     )
                 )
                 assert result["energy_eV"] == 1.0
+                await asyncio.sleep(0.5)  # let the late print happen
+                for message in messages:
+                    assert not isinstance(message, Exception), message
+                assert (await session.list_tools()).tools
+
+    messages = []
+
+    async def record(message):
+        messages.append(message)
 
     asyncio.run(asyncio.wait_for(scenario(), timeout=60))
 
@@ -230,22 +246,28 @@ def test_complex_and_non_finite_values_stay_typed():
     json.dumps(result, allow_nan=False)
 
 
+class _Calls(list):
+    run_ir_kwargs: dict = {}
+
+
 @pytest.fixture
 def ir_calls(monkeypatch):
     """Record get_calculator calls made by run_ir without running chemistry."""
     from iqc import asetools
 
-    made = []
+    made = _Calls()
 
     def fake_get_calculator(name, **params):
         made.append((name, params))
         return object()
 
+    def fake_run_ir(atoms, **kwargs):
+        made.run_ir_kwargs = kwargs
+        return atoms, {"error": "", "warnings": []}
+
     monkeypatch.setattr(asetools, "get_calculator", fake_get_calculator)
     monkeypatch.setattr(server, "_CALC_CACHE", {})
-    monkeypatch.setattr(
-        asetools, "run_ir", lambda atoms, **kw: (atoms, {"error": "", "warnings": []})
-    )
+    monkeypatch.setattr(asetools, "run_ir", fake_run_ir)
     return made
 
 
@@ -259,9 +281,11 @@ def test_run_ir_per_role_calculator_params(ir_calls):
     )
     assert sorted(ir_calls) == [
         ("emt", {}),
-        ("emt", {}),
         ("orca", {"orcasimpleinput": "HF def2-SVP"}),
     ]
+    kwargs = ir_calls.run_ir_kwargs
+    assert kwargs["vibration_calculator"] is kwargs["calculator"]
+    assert kwargs["plot_spectrum"] is False
 
 
 def test_run_ir_params_only_inherited_by_same_calculator(ir_calls):
@@ -273,7 +297,10 @@ def test_run_ir_params_only_inherited_by_same_calculator(ir_calls):
         vibration_calculator="xtb",
         dipole_calculator="ORCA",
     )
-    assert sorted(ir_calls) == [("orca", orca), ("orca", orca), ("xtb", {})]
+    assert sorted(ir_calls) == [("orca", orca), ("xtb", {})]
+    kwargs = ir_calls.run_ir_kwargs
+    # One ORCA instance, so forces and dipoles come from the same ORCA run.
+    assert kwargs["dipole_calculator"] is kwargs["calculator"]
 
 
 def test_run_ir_skips_unused_fallback(ir_calls):
@@ -365,6 +392,28 @@ def test_orca_scratch_is_temporary(monkeypatch, tmp_path):
         assert explicit.directory == str(tmp_path / "keep")
 
 
+def test_orca_scratch_kept_when_calculation_fails(monkeypatch, tmp_path):
+    from iqc import asetools
+
+    class ORCA:
+        directory = "."
+
+    def fail(atoms, calculator, **kwargs):
+        (Path(calculator.directory) / "orca.out").write_text("SCF NOT CONVERGED")
+        return atoms, {"error": f"ORCA work directory: {calculator.directory}"}
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(asetools, "get_calculator", lambda **kw: ORCA())
+    monkeypatch.setattr(asetools, "run_single_point", fail)
+    result = server.run_single_point(xyz=COPPER, calculator="orca")
+    (kept,) = result["orca_work_directories"]
+    try:
+        assert kept in result["error"]
+        assert (Path(kept) / "orca.out").read_text() == "SCF NOT CONVERGED"
+    finally:
+        shutil.rmtree(kept)
+
+
 def test_launcher_skips_incompatible_mcp_environment(tmp_path):
     shell = shutil.which("sh")
     if shell is None:
@@ -411,6 +460,70 @@ def test_launcher_skips_incompatible_mcp_environment(tmp_path):
 def test_mixed_complex_values_keep_both_parts():
     result = server._trim_results({"x": [3 + 12j, 0 + 2j, 5 + 0j]})
     assert result["x"] == [{"real": 3.0, "imag": 12.0}, -2.0, 5.0]
+
+
+def test_complex_noise_keeps_frequency_lists_numeric():
+    result = server._trim_results({"f": [1e-9 + 35j, 1595.2 + 1e-12j]})
+    assert result["f"] == [-35.0, 1595.2]
+
+
+def test_every_compute_tool_can_return_long_arrays(monkeypatch):
+    from iqc import asetools
+
+    long = list(range(1500))
+
+    def calculate(atoms, **kwargs):
+        return atoms, {"error": "", "long": long, "forces": [[0.0] * 3]}
+
+    for tool in ("run_single_point", "run_optimization"):
+        monkeypatch.setattr(asetools, tool, calculate)
+        trimmed = getattr(server, tool)(xyz=COPPER, calculator="emt")
+        assert trimmed["omitted_fields"] == {"long": 1500}
+        kept = getattr(server, tool)(xyz=COPPER, calculator="emt", keep_arrays=True)
+        assert kept["long"] == long
+    # keep_forces alone returns forces without lifting the length cap.
+    forces_only = server.run_single_point(
+        xyz=COPPER, calculator="emt", keep_forces=True
+    )
+    assert forces_only["forces"] == [[0.0] * 3]
+    assert forces_only["omitted_fields"] == {"long": 1500}
+
+
+def test_launcher_serves_checkout_from_any_directory(tmp_path):
+    shell = shutil.which("sh")
+    if shell is None:
+        pytest.skip("Launcher requires a POSIX shell")
+    checkout = tmp_path / "checkout"  # isolates the real checkout's .venv
+    (checkout / "scripts").mkdir(parents=True)
+    launcher = checkout / "scripts" / "run_mcp_server.sh"
+    shutil.copyfile(ROOT / "scripts" / "run_mcp_server.sh", launcher)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "python3"
+    # Succeeds only if the launcher put the checkout on PYTHONPATH.
+    fake.write_text(
+        f"#!{shell}\n"
+        f'case ":$PYTHONPATH:" in *":{checkout}:"*) ;; *) exit 1;; esac\n'
+        '[ "$1" = "-c" ] && exit 0\n'
+        'echo "selected cwd=$(pwd)"\n'
+    )
+    fake.chmod(0o755)
+    result = subprocess.run(
+        [shell, str(launcher)],
+        cwd=elsewhere,
+        env={
+            "PATH": f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin",
+            "HOME": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    # The client's cwd is preserved so relative XYZ paths still resolve.
+    assert result.stdout.strip() == f"selected cwd={elsewhere}"
 
 
 def test_temporary_paths_and_large_lists_are_omitted():

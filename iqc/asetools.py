@@ -3468,6 +3468,7 @@ def run_ir(
     imag_displacement=0.3,
     max_imag_attempts=1,
     project_trans_rot=True,
+    plot_spectrum=True,
     **params,
 ):
     """
@@ -3507,6 +3508,9 @@ def run_ir(
             is built by ASE from the unprojected Hessian; the difference is
             confined to the rigid-body block far below the default
             ``ir_spectrum_start``.
+        plot_spectrum (bool): Save a PNG of the spectrum next to the IR files
+            and report its path in ``ir_plot``. Callers that discard
+            ``vib_dir`` (e.g. the MCP server) pass False to skip matplotlib.
 
     Returns:
         tuple: A tuple containing the atoms and a dictionary with calculated properties
@@ -3731,25 +3735,26 @@ def run_ir(
         results["spectrum_intensities"] = intensities_to_store.tolist()
         results["ir_time"] = time.time() - start_time
 
-        try:
-            import matplotlib.pyplot as plt
+        if plot_spectrum:
+            try:
+                import matplotlib.pyplot as plt
 
-            fig, ax = plt.subplots()
-            ax.plot(frequencies, intensities)
-            ax.set_xlabel("Frequency (cm^-1)")
-            ax.set_ylabel("Intensity (a.u.)")
-            ax.set_title("Infrared Spectrum")
-            ax.grid(True)
+                fig, ax = plt.subplots()
+                ax.plot(frequencies, intensities)
+                ax.set_xlabel("Frequency (cm^-1)")
+                ax.set_ylabel("Intensity (a.u.)")
+                ax.set_title("Infrared Spectrum")
+                ax.grid(True)
 
-            ir_plot_path = f"{ir_name}_spectrum.png"
-            fig.savefig(ir_plot_path, format="png", dpi=300)
-            plt.close(fig)
+                ir_plot_path = f"{ir_name}_spectrum.png"
+                fig.savefig(ir_plot_path, format="png", dpi=300)
+                plt.close(fig)
 
-            results["ir_plot"] = os.path.abspath(ir_plot_path)
-        except Exception as e:
-            warning = f"IR spectrum plot could not be generated: {e}"
-            logging.warning(warning)
-            results["warnings"].append(warning)
+                results["ir_plot"] = os.path.abspath(ir_plot_path)
+            except Exception as e:
+                warning = f"IR spectrum plot could not be generated: {e}"
+                logging.warning(warning)
+                results["warnings"].append(warning)
 
         results["normal_mode_data"] = (
             "Normal modes saved as .traj files with prefix "

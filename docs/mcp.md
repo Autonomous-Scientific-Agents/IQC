@@ -134,8 +134,9 @@ server table. The Docker daemon must be running, and the host `work` directory
 must be writable by container UID 10001 (or override with `--user UID:GID` on
 Linux). Only mounted paths are accessible: `/work/input.xyz` means a file
 inside the mounted directory, not an arbitrary host path. ORCA and vibration
-scratch directories are temporary and removed after each tool call; other
-calculator files are written under `/work`, so keep each connection's
+scratch directories are temporary and removed after each tool call. When an
+ORCA calculation fails, its work directory is kept for inspection and listed
+in `orca_work_directories`. Other calculator files are written under `/work`, so keep each connection's
 workspace separate.
 
 Compose is also available:
@@ -176,9 +177,11 @@ and entropy eV/K. Read the chemistry skill for calculator selection and caveats.
 MCP thermochemistry currently exposes a single calculator, while the CLI/Python
 API also support composite thermochemistry.
 
-`run_vibrations`, `run_thermo`, and `run_ir` omit arrays longer than 1000
-entries by default and report their lengths in `omitted_fields`. Pass
-`keep_arrays=True` to retrieve them. With `run_ir(optimize=False)`, the
+Compute tools omit arrays longer than 1000 entries by default and report
+their lengths in `omitted_fields`. Pass `keep_arrays=True` to retrieve them;
+in `run_single_point`, `keep_forces=True` returns forces only. In `run_ir`,
+roles that name the same calculator with the same parameters share one
+instance, so forces and dipoles come from one evaluation per displacement. With `run_ir(optimize=False)`, the
 optimization calculator is not constructed; only vibration and dipole roles
 determine whether the fallback calculator is needed.
 

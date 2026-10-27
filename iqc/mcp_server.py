@@ -21,14 +21,21 @@ import json
 import logging
 import math
 import os
+import shutil
 import sys
 import tempfile
 import threading
-from contextlib import ExitStack, contextmanager, redirect_stdout
+from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from functools import wraps
 from pathlib import Path
 from typing import Any, Optional
+
+if sys.version_info < (3, 10):
+    raise SystemExit(
+        "iqc-mcp requires Python 3.10+ (the MCP SDK does not support "
+        f"{sys.version_info.major}.{sys.version_info.minor})."
+    )
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -41,15 +48,17 @@ except ImportError as exc:
 
 logger = logging.getLogger("iqc.mcp")
 
-# ASE calculators have mutable state and some backends print to stdout.
-# FastMCP captures the protocol stream before invoking these wrappers.
+# ASE calculators have mutable state, so tool calls run one at a time. In
+# stdio mode, main() moves JSON-RPC to private descriptors and points fd 0/1
+# at /dev/null/stderr, so backend output (any thread, Python or native) cannot
+# reach the protocol stream.
 _TOOL_LOCK = threading.RLock()
 
 
 def _quiet_tool(fn):
     @wraps(fn)
     def wrapped(*args, **kwargs):
-        with _TOOL_LOCK, redirect_stdout(sys.stderr):
+        with _TOOL_LOCK:
             return fn(*args, **kwargs)
 
     return wrapped
@@ -80,13 +89,16 @@ _MAX_LIST_LEN = 1000
 # Paths into a tool's TemporaryDirectory are gone by the time we respond.
 _TEMP_PATH_KEYS = {"ir_plot", "normal_mode_data"}
 
+# Complex parts this small relative to the other are treated as zero.
+_COMPLEX_RTOL = 1e-6
+
 
 def _jsonable(value, non_finite: list):
     """Convert a result value to strict-JSON data, element by element.
 
     numpy arrays/scalars become lists/numbers (no scientific imports here, so
-    startup stays cheap). Purely real or purely imaginary complex values
-    (ASE frequencies and mode energies) follow asetools' frequency
+    startup stays cheap). Real or imaginary complex values, within
+    `_COMPLEX_RTOL` (ASE frequencies and mode energies), follow asetools' frequency
     convention: imaginary modes become negative reals. A complex value with
     both parts nonzero is returned as {"real": x, "imag": y} so neither part
     is lost. NaN/Inf become None and are flagged in `non_finite` so a caller
@@ -101,9 +113,12 @@ def _jsonable(value, non_finite: list):
         non_finite.append(True)
         return None
     if isinstance(value, complex):
-        if not value.imag:
+        # Relative tolerance so numerical noise in the other part does not
+        # turn a frequency into an object inside a numeric list.
+        tol = _COMPLEX_RTOL * max(abs(value.real), abs(value.imag))
+        if abs(value.imag) <= tol:
             return _jsonable(value.real, non_finite)
-        if not value.real:
+        if abs(value.real) <= tol:
             return _jsonable(-abs(value.imag), non_finite)
         return {
             "real": _jsonable(value.real, non_finite),
@@ -120,19 +135,27 @@ def _jsonable(value, non_finite: list):
     return repr(value)
 
 
-def _trim_results(results: dict[str, Any], keep_arrays: bool = False) -> dict[str, Any]:
+def _trim_results(
+    results: dict[str, Any],
+    keep_arrays: bool = False,
+    keep_forces: Optional[bool] = None,
+) -> dict[str, Any]:
     """Drop bulky/non-serializable fields and large arrays from a result dict.
 
     `forces`, `vib_modes`, and `jmol_vib_modes_xyz` can be huge for big
     molecules. We surface summary fields (energies, frequencies, timings,
     errors, warnings) and keep arrays only when the caller asks. Lists longer
     than `_MAX_LIST_LEN` are omitted unless `keep_arrays`, with their lengths
-    reported in `omitted_fields`.
+    reported in `omitted_fields`. Forces follow `keep_forces`, which defaults
+    to `keep_arrays`, and are exempt from the length cap when kept.
     """
 
+    if keep_forces is None:
+        keep_forces = keep_arrays
+    force_keys = {"forces", "opt_forces"}
     drop_keys = {"vib_modes", "jmol_vib_modes_xyz"} | _TEMP_PATH_KEYS
-    if not keep_arrays:
-        drop_keys |= {"forces", "opt_forces"}
+    if not keep_forces:
+        drop_keys |= force_keys
     out: dict[str, Any] = {}
     non_finite_fields = []
     omitted_fields = {}
@@ -140,7 +163,7 @@ def _trim_results(results: dict[str, Any], keep_arrays: bool = False) -> dict[st
         if k in drop_keys:
             continue
         n = len(v) if isinstance(v, (list, tuple)) or getattr(v, "ndim", 0) else 0
-        if not keep_arrays and n > _MAX_LIST_LEN:
+        if n > _MAX_LIST_LEN and not keep_arrays and k not in force_keys:
             omitted_fields[str(k)] = n
             continue
         non_finite: list = []
@@ -199,29 +222,55 @@ def _get_calculator(name: str, params: Optional[dict] = None):
     return calc
 
 
+class _Scratch:
+    """ORCA work directories created for one tool call."""
+
+    def __init__(self):
+        self.dirs: list[str] = []
+        self.keep = False
+
+    def keep_on_error(self, results: dict) -> None:
+        # ORCA error text names the work directory and its orca.out; keep it
+        # so the agent can inspect more than the quoted tail.
+        if self.dirs and results.get("error"):
+            self.keep = True
+            results["orca_work_directories"] = list(self.dirs)
+
+
 @contextmanager
 def _orca_scratch(*calculators):
-    """Run ORCA calculators in temporary work directories removed on exit.
+    """Run ORCA calculators in temporary work directories.
 
     asetools otherwise names ORCA directories after `unique_name` in the
     current directory; with a fresh name per MCP call they would accumulate.
-    A `directory` passed explicitly in calculator_params is left alone.
+    Directories are removed on success and kept (and reported in
+    `orca_work_directories`) when the call fails. A `directory` passed
+    explicitly in calculator_params is left alone.
     """
 
     from iqc.asetools import _is_orca_calculator
 
-    with ExitStack() as stack:
-        seen = set()
-        for calc in calculators:
-            if not _is_orca_calculator(calc) or id(calc) in seen:
-                continue
-            seen.add(id(calc))
-            if Path(getattr(calc, "directory", ".")) != Path("."):
-                continue
-            calc.directory = stack.enter_context(
-                tempfile.TemporaryDirectory(prefix="iqc_mcp_orca_")
-            )
-        yield
+    scratch = _Scratch()
+    seen = set()
+    for calc in calculators:
+        if not _is_orca_calculator(calc) or id(calc) in seen:
+            continue
+        seen.add(id(calc))
+        if Path(getattr(calc, "directory", ".")) != Path("."):
+            continue
+        calc.directory = tempfile.mkdtemp(prefix="iqc_mcp_orca_")
+        scratch.dirs.append(calc.directory)
+    try:
+        yield scratch
+    except BaseException:
+        scratch.keep = True
+        raise
+    finally:
+        for directory in scratch.dirs:
+            if scratch.keep:
+                logger.warning("Keeping ORCA work directory %s", directory)
+            else:
+                shutil.rmtree(directory, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -375,6 +424,7 @@ def run_single_point(
     charge: Optional[int] = None,
     multiplicity: Optional[int] = None,
     keep_forces: bool = False,
+    keep_arrays: bool = False,
 ) -> dict:
     """Compute single-point energy (and forces if available).
 
@@ -387,6 +437,8 @@ def run_single_point(
         charge: Net molecular charge; omitted uses input metadata, then zero.
         multiplicity: Spin multiplicity 2S+1; defaults from electron count.
         keep_forces: Include the full force array in the response.
+        keep_arrays: Include other arrays longer than 1000 entries; otherwise
+            their lengths are reported in `omitted_fields`.
 
     Returns:
         Dict with `energy_eV`, `formula`, `calc_time`, error/warnings, and
@@ -397,7 +449,7 @@ def run_single_point(
 
     atoms = _load_atoms(smiles, xyz)
     calc = _get_calculator(calculator, calculator_params)
-    with _orca_scratch(calc):
+    with _orca_scratch(calc) as scratch:
         atoms, results = _rsp(
             atoms,
             calculator=calc,
@@ -405,7 +457,8 @@ def run_single_point(
             charge=charge,
             multiplicity=multiplicity,
         )
-    out = _trim_results(results, keep_arrays=keep_forces)
+        scratch.keep_on_error(results)
+    out = _trim_results(results, keep_arrays=keep_arrays, keep_forces=keep_forces)
     out["formula"] = atoms.get_chemical_formula() if atoms is not None else ""
     return out
 
@@ -421,6 +474,7 @@ def run_optimization(
     max_steps: int = 200,
     charge: Optional[int] = None,
     multiplicity: Optional[int] = None,
+    keep_arrays: bool = False,
 ) -> dict:
     """Optimize geometry with BFGS to the requested force tolerance.
 
@@ -432,6 +486,8 @@ def run_optimization(
         max_steps: BFGS step cap.
         charge: Net molecular charge; omitted uses input metadata, then zero.
         multiplicity: Spin multiplicity 2S+1.
+        keep_arrays: Include final forces and arrays longer than 1000
+            entries; otherwise long arrays are reported in `omitted_fields`.
 
     Returns:
         Dict including `opt_energy_eV`, `opt_xyz`, `opt_smiles`,
@@ -442,7 +498,7 @@ def run_optimization(
 
     atoms = _load_atoms(smiles, xyz)
     calc = _get_calculator(calculator, calculator_params)
-    with _orca_scratch(calc):
+    with _orca_scratch(calc) as scratch:
         atoms, results = _ropt(
             atoms,
             calculator=calc,
@@ -452,7 +508,8 @@ def run_optimization(
             charge=charge,
             multiplicity=multiplicity,
         )
-    return _trim_results(results)
+        scratch.keep_on_error(results)
+    return _trim_results(results, keep_arrays=keep_arrays)
 
 
 @mcp.tool()
@@ -493,7 +550,7 @@ def run_vibrations(
 
     atoms = _load_atoms(smiles, xyz)
     calc = _get_calculator(calculator, calculator_params)
-    with _orca_scratch(calc), tempfile.TemporaryDirectory(
+    with _orca_scratch(calc) as scratch, tempfile.TemporaryDirectory(
         prefix="iqc_mcp_vib_"
     ) as vib_dir:
         atoms, results = _rvib(
@@ -507,6 +564,7 @@ def run_vibrations(
             charge=charge,
             multiplicity=multiplicity,
         )
+        scratch.keep_on_error(results)
     return _trim_results(results, keep_arrays=keep_arrays)
 
 
@@ -540,7 +598,7 @@ def run_thermo(
 
     atoms = _load_atoms(smiles, xyz)
     calc = _get_calculator(calculator, calculator_params)
-    with _orca_scratch(calc), tempfile.TemporaryDirectory(
+    with _orca_scratch(calc) as scratch, tempfile.TemporaryDirectory(
         prefix="iqc_mcp_thermo_"
     ) as vib_dir:
         thermo, results = _rth(
@@ -552,6 +610,7 @@ def run_thermo(
             charge=charge,
             multiplicity=multiplicity,
         )
+        scratch.keep_on_error(results)
     return _trim_results(results, keep_arrays=keep_arrays)
 
 
@@ -621,6 +680,20 @@ def run_ir(
     def same_name(a, b):
         return bool(a and b) and a.strip().lower() == b.strip().lower()
 
+    # Roles with the same calculator and parameters share one instance, as
+    # they do without overrides: asetools then gets forces and dipoles from
+    # one evaluation per displacement (one ORCA run instead of two).
+    instances: dict = {}
+
+    def build(name, params):
+        key = (
+            name.strip().lower(),
+            json.dumps(params or {}, sort_keys=True, default=str),
+        )
+        if key not in instances:
+            instances[key] = _get_calculator(name, params)
+        return instances[key]
+
     def role(name, params):
         if not name:
             return None
@@ -628,7 +701,7 @@ def run_ir(
             # calculator_params belong to `calculator`; don't hand ORCA
             # kwargs to xtb or MACE just because a role was overridden.
             params = calculator_params if same_name(name, calculator) else None
-        return _get_calculator(name, params)
+        return build(name, params)
 
     opt_c = (
         role(optimization_calculator, optimization_calculator_params)
@@ -641,14 +714,14 @@ def run_ir(
     # does not require the default backend (xtb) to be installed.
     needs_fallback = (optimize and opt_c is None) or vib_c is None or dip_c is None
     fallback = (
-        _get_calculator(calculator, calculator_params)
+        build(calculator, calculator_params)
         if calculator and needs_fallback
         else None
     )
 
-    with _orca_scratch(fallback, opt_c, vib_c, dip_c), tempfile.TemporaryDirectory(
-        prefix="iqc_mcp_ir_"
-    ) as vib_dir:
+    with _orca_scratch(
+        fallback, opt_c, vib_c, dip_c
+    ) as scratch, tempfile.TemporaryDirectory(prefix="iqc_mcp_ir_") as vib_dir:
         atoms, results = _rir(
             atoms,
             calculator=fallback,
@@ -664,7 +737,9 @@ def run_ir(
             intensity_threshold=intensity_threshold,
             charge=charge,
             multiplicity=multiplicity,
+            plot_spectrum=False,  # the PNG would be deleted with vib_dir
         )
+        scratch.keep_on_error(results)
     return _trim_results(results, keep_arrays=keep_arrays)
 
 
@@ -722,22 +797,47 @@ def main() -> None:
     os.environ.setdefault("IQC_DISABLE_MPI", "1")
 
     if args.transport == "stdio":
-        # Keep a dedicated protocol descriptor. Native libraries and child
-        # processes writing to fd 1 must not corrupt JSON-RPC on stdout.
-        protocol_stdout = os.fdopen(
-            os.dup(sys.stdout.fileno()), "w", encoding="utf-8", buffering=1
-        )
-        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
-        sys.stdout = protocol_stdout
-        # Likewise keep JSON-RPC input off fd 0, so child processes (mpirun,
-        # file-IO engines) that read stdin cannot consume client requests.
-        protocol_stdin = os.fdopen(os.dup(sys.stdin.fileno()), "r", encoding="utf-8")
-        devnull = os.open(os.devnull, os.O_RDONLY)
-        os.dup2(devnull, sys.stdin.fileno())
-        os.close(devnull)
-        sys.stdin = protocol_stdin
+        _run_stdio()
+    else:
+        mcp.run(transport=args.transport)
 
-    mcp.run(transport=args.transport)
+
+def _run_stdio() -> None:
+    """Serve JSON-RPC on private copies of fd 0/1.
+
+    fd 1 is then pointed at stderr and fd 0 at /dev/null, and sys.stdout /
+    sys.stdin keep wrapping those descriptors. Output from native code, child
+    processes, or Python threads that outlive a tool call goes to stderr, and
+    children (mpirun, file-IO engines) cannot consume client requests.
+    """
+
+    import io
+
+    import anyio
+    from mcp.server.stdio import stdio_server
+
+    protocol_out = os.dup(sys.stdout.fileno())
+    protocol_in = os.dup(sys.stdin.fileno())
+    sys.stdout.flush()
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull, sys.stdin.fileno())
+    os.close(devnull)
+
+    stdin = io.TextIOWrapper(os.fdopen(protocol_in, "rb"), encoding="utf-8")
+    stdout = io.TextIOWrapper(os.fdopen(protocol_out, "wb"), encoding="utf-8")
+
+    async def serve():
+        # Mirrors FastMCP.run_stdio_async, with explicit protocol streams.
+        server = mcp._mcp_server
+        async with stdio_server(
+            anyio.wrap_file(stdin), anyio.wrap_file(stdout)
+        ) as (read_stream, write_stream):
+            await server.run(
+                read_stream, write_stream, server.create_initialization_options()
+            )
+
+    anyio.run(serve)
 
 
 if __name__ == "__main__":
