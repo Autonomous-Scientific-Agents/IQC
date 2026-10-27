@@ -11,9 +11,9 @@ Use Python 3.11 or newer (the optional MCP SDK requires at least Python 3.10).
 From the repository root:
 
 ```bash
-python -m venv .venv
+uv venv --python 3.12
 . .venv/bin/activate
-python -m pip install -e '.[mcp,xtb,test]'
+uv pip install -e '.[mcp,xtb,test]'
 python -m iqc.mcp_server --help
 IQC_DISABLE_MPI=1 python -m pytest iqc/tests/test_mcp_server.py
 ```

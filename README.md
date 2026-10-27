@@ -10,7 +10,7 @@ IQC includes an MCP server, a shared chemistry skill, repository instructions
 Code. Install in an activated Python 3.11+ environment:
 
 ```bash
-python -m pip install -e '.[mcp,xtb]'
+uv pip install -e '.[mcp,xtb]'
 python -m iqc.mcp_server --help
 ```
 

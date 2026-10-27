@@ -10,16 +10,18 @@ For using IQC to answer chemistry questions, read
 Use Python 3.11+ for the agent/MCP workflow (MCP requires 3.10+). From the repo:
 
 ```bash
-python -m venv .venv
+uv venv --python 3.12
 . .venv/bin/activate
-python -m pip install -e '.[mcp,xtb,test]'
+uv pip install -e '.[mcp,xtb,test]'
 IQC_DISABLE_MPI=1 python -m pytest iqc/tests/test_mcp_server.py
 IQC_DISABLE_MPI=1 python -m pytest iqc/tests/
 iqc --help
 python -m iqc.mcp_server --help
 ```
 
-Use an existing working environment when available. Optional calculators need
+Prefer uv for environment creation and package installation. CI uses uv with
+the `mcp,test` extras and a system OpenMPI runtime. Use an existing working
+environment when available. Optional calculators need
 separate dependencies, binaries, or models; absence is not a reason to install
 all ML/GPU packages. Keep torch, MACE, UMA and external engines lazy to import.
 `IQC_DISABLE_MPI=1` is for serial agent/test processes; do not set it for MPI

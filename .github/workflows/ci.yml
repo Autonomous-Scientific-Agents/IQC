@@ -14,6 +14,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
     strategy:
       matrix:
         python-version: ["3.12"]
@@ -22,46 +26,27 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Free runner disk space
-      # ubuntu-latest ships ~14 GB free out of 84 GB; ~25 GB of
-      # preinstalled tooling (dotnet, android, ghc, code, etc.) is
-      # irrelevant to a python conda env and pushes the runner past the
-      # disk limit when the heavy pip layer lands (issue: "No space
-      # left on device"). Reclaim ~25 GB before creating the env.
+    - name: Set up uv and Python
+      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      with:
+        version: "0.13.6"
+        python-version: ${{ matrix.python-version }}
+        enable-cache: true
+        cache-dependency-glob: pyproject.toml
+
+    - name: Install MPI runtime and build headers
       run: |
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                    /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
-                    "$AGENT_TOOLSDIRECTORY" || true
-        df -h /
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
 
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
+    - name: Install IQC and test dependencies
+      # Install from package metadata, without the optional ML/GPU stack.
+      run: |
+        uv venv --python '${{ matrix.python-version }}'
+        uv pip install --python .venv/bin/python -e '.[mcp,test]'
 
-    - name: Install Miniconda
-      uses: conda-incubator/setup-miniconda@v2
-      with:
-        # Hosted runners may not include a preinstalled Conda distribution.
-        miniconda-version: "latest"
-        auto-update-conda: true
-        python-version: ${{ matrix.python-version }}
-
-    - name: Create conda environment
-      # Use the slim CI env — no pytorch / mace / fairchem. Every iqc
-      # module imports those lazily (inside functions), so tests
-      # exercising the general iqc paths pass without them. See
-      # env-ci.yml for the pared-down dep list.
-      run: conda env create -f env-ci.yml
-    
-    - name: Install iqc
-      run: conda run -n iqc-env pip install -e .
-    
-    - name: Install test dependencies
-      run: conda run -n iqc-env pip install -e '.[mcp,test]'
-    
     - name: Run tests
-      run: conda run -n iqc-env pytest iqc/tests/
+      run: uv run --no-sync python -m pytest iqc/tests/
 
   docker-build:
     # Per-PR container check. Deliberately does NOT build the root Dockerfile:
