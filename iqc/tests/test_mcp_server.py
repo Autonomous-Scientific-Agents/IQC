@@ -5,6 +5,9 @@ import json
 import math
 import os
 from pathlib import Path
+import shlex
+import shutil
+import subprocess
 import sys
 
 import pytest
@@ -279,3 +282,46 @@ def test_orca_scratch_is_temporary(monkeypatch, tmp_path):
     explicit.directory = str(tmp_path / "keep")
     with server._orca_scratch(explicit):
         assert explicit.directory == str(tmp_path / "keep")
+
+
+def test_launcher_skips_incompatible_mcp_environment(tmp_path):
+    shell = shutil.which("sh")
+    if shell is None:
+        pytest.skip("Launcher requires a POSIX shell")
+
+    # Isolate the checkout's .venv candidate, and provide a working PATH
+    # fallback after an interpreter with a discoverable but incompatible MCP.
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    launcher = scripts / "run_mcp_server.sh"
+    shutil.copyfile(ROOT / "scripts/run_mcp_server.sh", launcher)
+    incompatible = tmp_path / "incompatible"
+    (incompatible / "mcp").mkdir(parents=True)
+    (incompatible / "mcp" / "__init__.py").write_text("")
+    candidate = tmp_path / "incompatible-python"
+    candidate.write_text(
+        f"#!{shell}\n"
+        f"export PYTHONPATH={shlex.quote(str(incompatible) + os.pathsep + str(ROOT))}\n"
+        f'exec {shlex.quote(sys.executable)} "$@"\n'
+    )
+    candidate.chmod(0o755)
+    executables = tmp_path / "bin"
+    executables.mkdir()
+    fallback = executables / "python3"
+    fallback.write_text(f'#!{shell}\nexec {shlex.quote(sys.executable)} "$@"\n')
+    fallback.chmod(0o755)
+    result = subprocess.run(
+        [shell, str(launcher), "--help"],
+        cwd=tmp_path,
+        env=dict(
+            os.environ,
+            IQC_PYTHON=str(candidate),
+            PYTHONPATH=str(ROOT),
+            PATH=str(executables) + os.pathsep + os.environ.get("PATH", ""),
+        ),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Run the IQC MCP server" in result.stdout

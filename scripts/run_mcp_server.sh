@@ -3,7 +3,9 @@
 # Tries $IQC_PYTHON, then this checkout's .venv, then python3/python on PATH.
 # Diagnostics go to stderr; stdout is reserved for JSON-RPC.
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-check='import importlib.util as u, sys; sys.exit(not (u.find_spec("mcp") and u.find_spec("iqc")))'
+# Package presence is insufficient: MCP 2.x has no FastMCP v1 API, and
+# incomplete installations may be discoverable but fail during import.
+check='import iqc.mcp_server'
 for py in "${IQC_PYTHON:-}" "$root/.venv/bin/python" python3 python; do
     [ -n "$py" ] || continue
     if "$py" -c "$check" >/dev/null 2>&1; then
