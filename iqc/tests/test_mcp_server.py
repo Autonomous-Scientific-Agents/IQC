@@ -286,6 +286,58 @@ def test_run_ir_skips_unused_fallback(ir_calls):
     assert "xtb" not in [name for name, _ in ir_calls]
 
 
+@pytest.mark.parametrize("optimization_calculator", [None, "xtb"])
+def test_run_ir_skips_disabled_optimization_backend(
+    monkeypatch, optimization_calculator
+):
+    from iqc import asetools
+
+    def get_calculator(name, **params):
+        if name == "xtb":
+            raise ImportError("xTB is not installed")
+        return object()
+
+    def calculate(atoms, **kwargs):
+        assert kwargs["optimize"] is False
+        assert kwargs["calculator"] is None
+        assert kwargs["optimization_calculator"] is None
+        assert kwargs["vibration_calculator"] is not None
+        assert kwargs["dipole_calculator"] is not None
+        return atoms, {"error": "", "warnings": []}
+
+    monkeypatch.setattr(asetools, "get_calculator", get_calculator)
+    monkeypatch.setattr(asetools, "run_ir", calculate)
+    result = server.run_ir(
+        xyz=COPPER,
+        optimize=False,
+        optimization_calculator=optimization_calculator,
+        vibration_calculator="pyscf",
+        dipole_calculator="pyscf",
+    )
+    assert not result["error"]
+
+
+@pytest.mark.parametrize("tool", ["run_vibrations", "run_thermo"])
+def test_large_frequency_arrays_can_be_requested(monkeypatch, tool):
+    from iqc import asetools
+
+    frequencies = list(range(1002))
+
+    def calculate(atoms, **kwargs):
+        # Response controls belong to MCP, not calculator/workflow kwargs.
+        assert "keep_arrays" not in kwargs
+        return atoms, {"frequencies_cm^-1": frequencies, "error": ""}
+
+    monkeypatch.setattr(asetools, tool, calculate)
+    run = getattr(server, tool)
+    summary = run(xyz=COPPER, calculator="emt")
+    assert "frequencies_cm^-1" not in summary
+    assert summary["omitted_fields"]["frequencies_cm^-1"] == len(frequencies)
+    full = run(xyz=COPPER, calculator="emt", keep_arrays=True)
+    assert full["frequencies_cm^-1"] == frequencies
+    assert "omitted_fields" not in full
+
+
 def test_orca_scratch_is_temporary(monkeypatch, tmp_path):
     from iqc import asetools
 

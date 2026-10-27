@@ -467,6 +467,7 @@ def run_vibrations(
     fmax: float = 0.01,
     charge: Optional[int] = None,
     multiplicity: Optional[int] = None,
+    keep_arrays: bool = False,
 ) -> dict:
     """Finite-difference vibrational analysis.
 
@@ -479,6 +480,8 @@ def run_vibrations(
         delta: Finite-difference displacement in Å.
         fmax: Pre-optimization force tolerance.
         charge, multiplicity: Charge and spin state.
+        keep_arrays: Include arrays longer than 1000 entries; otherwise
+            their lengths are reported in `omitted_fields`.
 
     Returns:
         Dict with `vibrational_frequencies_cm^-1`, `number_of_imaginary`,
@@ -504,7 +507,7 @@ def run_vibrations(
             charge=charge,
             multiplicity=multiplicity,
         )
-    return _trim_results(results)
+    return _trim_results(results, keep_arrays=keep_arrays)
 
 
 @mcp.tool()
@@ -517,11 +520,16 @@ def run_thermo(
     ignore_imag_modes: bool = True,
     charge: Optional[int] = None,
     multiplicity: Optional[int] = None,
+    keep_arrays: bool = False,
 ) -> dict:
     """Ideal-gas thermochemistry at 298.15 K / 1 atm.
 
     Runs opt + vibrations, then evaluates Gibbs free energy, enthalpy,
     entropy, and ZPE correction with ASE's IdealGasThermo.
+
+    Args:
+        keep_arrays: Include arrays longer than 1000 entries; otherwise
+            their lengths are reported in `omitted_fields`.
 
     Returns:
         Dict including `G_eV`, `H_eV`, `S_eV/K`, `E_ZPE_eV`, plus the
@@ -544,7 +552,7 @@ def run_thermo(
             charge=charge,
             multiplicity=multiplicity,
         )
-    return _trim_results(results)
+    return _trim_results(results, keep_arrays=keep_arrays)
 
 
 @mcp.tool()
@@ -622,12 +630,16 @@ def run_ir(
             params = calculator_params if same_name(name, calculator) else None
         return _get_calculator(name, params)
 
-    opt_c = role(optimization_calculator, optimization_calculator_params)
+    opt_c = (
+        role(optimization_calculator, optimization_calculator_params)
+        if optimize
+        else None
+    )
     vib_c = role(vibration_calculator, vibration_calculator_params)
     dip_c = role(dipole_calculator, dipole_calculator_params)
     # Build the fallback only if a role uses it, so a fully overridden run
     # does not require the default backend (xtb) to be installed.
-    needs_fallback = None in (opt_c, vib_c, dip_c)
+    needs_fallback = (optimize and opt_c is None) or vib_c is None or dip_c is None
     fallback = (
         _get_calculator(calculator, calculator_params)
         if calculator and needs_fallback
@@ -719,9 +731,7 @@ def main() -> None:
         sys.stdout = protocol_stdout
         # Likewise keep JSON-RPC input off fd 0, so child processes (mpirun,
         # file-IO engines) that read stdin cannot consume client requests.
-        protocol_stdin = os.fdopen(
-            os.dup(sys.stdin.fileno()), "r", encoding="utf-8"
-        )
+        protocol_stdin = os.fdopen(os.dup(sys.stdin.fileno()), "r", encoding="utf-8")
         devnull = os.open(os.devnull, os.O_RDONLY)
         os.dup2(devnull, sys.stdin.fileno())
         os.close(devnull)

@@ -176,6 +176,12 @@ and entropy eV/K. Read the chemistry skill for calculator selection and caveats.
 MCP thermochemistry currently exposes a single calculator, while the CLI/Python
 API also support composite thermochemistry.
 
+`run_vibrations`, `run_thermo`, and `run_ir` omit arrays longer than 1000
+entries by default and report their lengths in `omitted_fields`. Pass
+`keep_arrays=True` to retrieve them. With `run_ir(optimize=False)`, the
+optimization calculator is not constructed; only vibration and dipole roles
+determine whether the fallback calculator is needed.
+
 Calculator instances are mutable, so tool calls are serialized within each
 server. ML model instances are cached; file-backed calculators are recreated.
 Native backend output and Python diagnostics are routed to stderr in stdio
