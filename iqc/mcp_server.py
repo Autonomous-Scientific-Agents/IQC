@@ -113,6 +113,11 @@ def _jsonable(value, non_finite: list):
         non_finite.append(True)
         return None
     if isinstance(value, complex):
+        # Invalid components must not enter the tolerance calculation: an
+        # infinite tolerance could otherwise turn infj into a finite zero.
+        if not (math.isfinite(value.real) and math.isfinite(value.imag)):
+            non_finite.append(True)
+            return None
         # Relative tolerance so numerical noise in the other part does not
         # turn a frequency into an object inside a numeric list.
         tol = _COMPLEX_RTOL * max(abs(value.real), abs(value.imag))
@@ -714,9 +719,7 @@ def run_ir(
     # does not require the default backend (xtb) to be installed.
     needs_fallback = (optimize and opt_c is None) or vib_c is None or dip_c is None
     fallback = (
-        build(calculator, calculator_params)
-        if calculator and needs_fallback
-        else None
+        build(calculator, calculator_params) if calculator and needs_fallback else None
     )
 
     with _orca_scratch(
@@ -830,9 +833,10 @@ def _run_stdio() -> None:
     async def serve():
         # Mirrors FastMCP.run_stdio_async, with explicit protocol streams.
         server = mcp._mcp_server
-        async with stdio_server(
-            anyio.wrap_file(stdin), anyio.wrap_file(stdout)
-        ) as (read_stream, write_stream):
+        async with stdio_server(anyio.wrap_file(stdin), anyio.wrap_file(stdout)) as (
+            read_stream,
+            write_stream,
+        ):
             await server.run(
                 read_stream, write_stream, server.create_initialization_options()
             )

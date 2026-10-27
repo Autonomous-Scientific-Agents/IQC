@@ -136,9 +136,7 @@ server.main()
             ),
         )
         async with stdio_client(params) as (reader, writer):
-            async with ClientSession(
-                reader, writer, message_handler=record
-            ) as session:
+            async with ClientSession(reader, writer, message_handler=record) as session:
                 await session.initialize()
                 result = payload(
                     await session.call_tool(
@@ -465,6 +463,23 @@ def test_mixed_complex_values_keep_both_parts():
 def test_complex_noise_keeps_frequency_lists_numeric():
     result = server._trim_results({"f": [1e-9 + 35j, 1595.2 + 1e-12j]})
     assert result["f"] == [-35.0, 1595.2]
+
+
+@pytest.mark.parametrize("invalid", [float("inf"), float("-inf"), float("nan")])
+@pytest.mark.parametrize("finite", [0.0, 1.0])
+@pytest.mark.parametrize("component", ["real", "imag"])
+def test_non_finite_complex_values_are_flagged(invalid, finite, component):
+    import numpy as np
+
+    value = (
+        complex(invalid, finite) if component == "real" else complex(finite, invalid)
+    )
+    result = server._trim_results(
+        {"frequencies_cm^-1": np.array([1595.2, value], dtype=complex)}
+    )
+    assert result["frequencies_cm^-1"] == [1595.2, None]
+    assert result["non_finite_fields"] == ["frequencies_cm^-1"]
+    json.dumps(result, allow_nan=False)
 
 
 def test_every_compute_tool_can_return_long_arrays(monkeypatch):
