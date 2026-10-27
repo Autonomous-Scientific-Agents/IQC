@@ -1,8 +1,8 @@
-# Activate the environment with IQC's mcp extra before starting Codex.
-# Use an absolute interpreter path if the client does not inherit your PATH.
+# Start Codex at the repository root. The launcher uses $IQC_PYTHON, then
+# .venv/bin/python, then python3/python on PATH (see docs/mcp.md).
 [mcp_servers.iqc]
-command = "python"
-args = ["-m", "iqc.mcp_server"]
+command = "sh"
+args = ["scripts/run_mcp_server.sh"]
 startup_timeout_sec = 30
 tool_timeout_sec = 600
 

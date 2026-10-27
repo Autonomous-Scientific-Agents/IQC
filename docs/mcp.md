@@ -26,8 +26,10 @@ For shared machines, set `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, and
 
 ### Codex
 
-Start Codex from the activated environment in this checkout. The project
-`.codex/config.toml` registers IQC; trusted project configuration must be enabled
+Start Codex at the root of this checkout. The project `.codex/config.toml`
+registers IQC through `scripts/run_mcp_server.sh`, which uses `$IQC_PYTHON`,
+then `.venv/bin/python`, then `python3`/`python` on `PATH`, whichever first
+has `iqc` and `mcp` installed. Trusted project configuration must be enabled
 by the client. `AGENTS.md` supplies repository guidance and
 `.agents/skills/iqc/SKILL.md` is the discoverable chemistry skill.
 
@@ -60,9 +62,9 @@ entire `.agents/skills/iqc` directory to `~/.agents/skills/iqc`.
 
 ### Claude Code
 
-Start `claude` from the activated environment at the repository root. The
-checked-in `.mcp.json` registers IQC after accepting the client's project MCP
-trust prompt. `CLAUDE.md` imports `AGENTS.md`, and `.claude/skills/iqc` links to
+Start `claude` at the repository root. The checked-in `.mcp.json` registers
+IQC through the same `scripts/run_mcp_server.sh` launcher after accepting the
+client's project MCP trust prompt. `CLAUDE.md` imports `AGENTS.md`, and `.claude/skills/iqc` links to
 the canonical chemistry skill. Invoke it with `/iqc` or ask a chemistry question.
 
 For global registration instead:
@@ -129,15 +131,22 @@ For Codex, use the same `command = "docker"` and `args` array in its IQC
 server table. The Docker daemon must be running, and the host `work` directory
 must be writable by container UID 10001 (or override with `--user UID:GID` on
 Linux). Only mounted paths are accessible: `/work/input.xyz` means a file
-inside the mounted directory, not an arbitrary host path. Calculator scratch
-files are written under `/work`; keep each connection's workspace separate.
+inside the mounted directory, not an arbitrary host path. ORCA and vibration
+scratch directories are temporary and removed after each tool call; other
+calculator files are written under `/work`, so keep each connection's
+workspace separate.
 
 Compose is also available:
 
 ```bash
+mkdir -p work
+export IQC_UID=$(id -u) IQC_GID=$(id -g)
 docker compose --profile agent build mcp
 docker compose --profile agent run --rm -T mcp
 ```
+
+The compose service runs as `IQC_UID:IQC_GID` (default `1000:1000`) so the
+bind-mounted `work` directory stays writable.
 
 The container does not include licensed ORCA/VASP binaries or ML checkpoints.
 See `docs/docker.md` for the larger MLIP and HPC targets. For long calculations,

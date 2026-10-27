@@ -19,13 +19,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 import tempfile
 import threading
-from contextlib import redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from dataclasses import asdict, is_dataclass
 from functools import wraps
+from pathlib import Path
 from typing import Any, Optional
 
 try:
@@ -72,12 +74,35 @@ mcp = FastMCP(
 _CALC_CACHE: dict[str, Any] = {}
 
 
-def _json_default(value):
-    # Preserve numpy arrays/scalars as data, rather than repr strings. Import
-    # no scientific libraries here so startup stays cheap.
+def _jsonable(value, non_finite: list):
+    """Convert a result value to strict-JSON data, element by element.
+
+    numpy arrays/scalars become lists/numbers (no scientific imports here, so
+    startup stays cheap). Complex values follow asetools' frequency
+    convention: imaginary modes become negative reals. NaN/Inf become None and
+    are flagged in `non_finite` so a caller can tell missing from zero.
+    """
+
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return float(value)
+        non_finite.append(True)
+        return None
+    if isinstance(value, complex):
+        return _jsonable(
+            -abs(value.imag) if value.imag else value.real, non_finite
+        )
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v, non_finite) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v, non_finite) for v in value]
     if hasattr(value, "tolist"):
-        return value.tolist()
-    raise TypeError(f"Cannot encode {type(value).__name__}")
+        return _jsonable(value.tolist(), non_finite)
+    if isinstance(value, Path):
+        return str(value)
+    return repr(value)
 
 
 def _trim_results(results: dict[str, Any], keep_arrays: bool = False) -> dict[str, Any]:
@@ -92,14 +117,17 @@ def _trim_results(results: dict[str, Any], keep_arrays: bool = False) -> dict[st
     if not keep_arrays:
         drop_keys |= {"forces", "opt_forces"}
     out: dict[str, Any] = {}
+    non_finite_fields = []
     for k, v in results.items():
         if k in drop_keys:
             continue
-        try:
-            v = json.loads(json.dumps(v, default=_json_default, allow_nan=False))
-        except (TypeError, ValueError):
-            v = repr(v)
-        out[k] = v
+        non_finite: list = []
+        out[k] = _jsonable(v, non_finite)
+        if non_finite:
+            non_finite_fields.append(str(k))
+    if non_finite_fields:
+        # NaN/Inf were replaced by null; surface which fields were affected.
+        out["non_finite_fields"] = non_finite_fields
     return out
 
 
@@ -136,6 +164,7 @@ def _get_calculator(name: str, params: Optional[dict] = None):
     from iqc.asetools import get_calculator
 
     params = params or {}
+    name = name.strip().lower()  # get_calculator is case-insensitive too
     cache_key = f"{name}:" + json.dumps(params, sort_keys=True, default=str)
     cacheable = name.startswith(("mace", "uma-"))
     if cacheable and cache_key in _CALC_CACHE:
@@ -144,6 +173,31 @@ def _get_calculator(name: str, params: Optional[dict] = None):
     if cacheable:
         _CALC_CACHE[cache_key] = calc
     return calc
+
+
+@contextmanager
+def _orca_scratch(*calculators):
+    """Run ORCA calculators in temporary work directories removed on exit.
+
+    asetools otherwise names ORCA directories after `unique_name` in the
+    current directory; with a fresh name per MCP call they would accumulate.
+    A `directory` passed explicitly in calculator_params is left alone.
+    """
+
+    from iqc.asetools import _is_orca_calculator
+
+    with ExitStack() as stack:
+        seen = set()
+        for calc in calculators:
+            if not _is_orca_calculator(calc) or id(calc) in seen:
+                continue
+            seen.add(id(calc))
+            if Path(getattr(calc, "directory", ".")) != Path("."):
+                continue
+            calc.directory = stack.enter_context(
+                tempfile.TemporaryDirectory(prefix="iqc_mcp_orca_")
+            )
+        yield
 
 
 # --------------------------------------------------------------------------- #
@@ -252,7 +306,11 @@ def list_calculators() -> dict:
                 "name": "pyscf",
                 "type": "DFT/HF",
                 "dipole": True,
-                "notes": "Requires pyscf. Set method, xc, and basis explicitly.",
+                "notes": (
+                    "Requires pyscf. Set method, xc, and basis explicitly. "
+                    "Dipoles (IR) only for HF/DFT; MP2/CCSD methods are "
+                    "energy-only."
+                ),
             },
             {
                 "name": "pyscf-ccsd(t)",
@@ -315,13 +373,14 @@ def run_single_point(
 
     atoms = _load_atoms(smiles, xyz)
     calc = _get_calculator(calculator, calculator_params)
-    atoms, results = _rsp(
-        atoms,
-        calculator=calc,
-        unique_name="mcp_single_" + os.urandom(6).hex(),
-        charge=charge,
-        multiplicity=multiplicity,
-    )
+    with _orca_scratch(calc):
+        atoms, results = _rsp(
+            atoms,
+            calculator=calc,
+            unique_name="mcp_single_" + os.urandom(6).hex(),
+            charge=charge,
+            multiplicity=multiplicity,
+        )
     out = _trim_results(results, keep_arrays=keep_forces)
     out["formula"] = atoms.get_chemical_formula() if atoms is not None else ""
     return out
@@ -359,15 +418,16 @@ def run_optimization(
 
     atoms = _load_atoms(smiles, xyz)
     calc = _get_calculator(calculator, calculator_params)
-    atoms, results = _ropt(
-        atoms,
-        calculator=calc,
-        unique_name="mcp_opt_" + os.urandom(6).hex(),
-        fmax=fmax,
-        max_steps=max_steps,
-        charge=charge,
-        multiplicity=multiplicity,
-    )
+    with _orca_scratch(calc):
+        atoms, results = _ropt(
+            atoms,
+            calculator=calc,
+            unique_name="mcp_opt_" + os.urandom(6).hex(),
+            fmax=fmax,
+            max_steps=max_steps,
+            charge=charge,
+            multiplicity=multiplicity,
+        )
     return _trim_results(results)
 
 
@@ -406,7 +466,9 @@ def run_vibrations(
 
     atoms = _load_atoms(smiles, xyz)
     calc = _get_calculator(calculator, calculator_params)
-    with tempfile.TemporaryDirectory(prefix="iqc_mcp_vib_") as vib_dir:
+    with _orca_scratch(calc), tempfile.TemporaryDirectory(
+        prefix="iqc_mcp_vib_"
+    ) as vib_dir:
         atoms, results = _rvib(
             atoms,
             calculator=calc,
@@ -446,7 +508,9 @@ def run_thermo(
 
     atoms = _load_atoms(smiles, xyz)
     calc = _get_calculator(calculator, calculator_params)
-    with tempfile.TemporaryDirectory(prefix="iqc_mcp_thermo_") as vib_dir:
+    with _orca_scratch(calc), tempfile.TemporaryDirectory(
+        prefix="iqc_mcp_thermo_"
+    ) as vib_dir:
         thermo, results = _rth(
             atoms,
             calculator=calc,
@@ -469,6 +533,9 @@ def run_ir(
     optimization_calculator: Optional[str] = None,
     vibration_calculator: Optional[str] = None,
     dipole_calculator: Optional[str] = None,
+    optimization_calculator_params: Optional[dict] = None,
+    vibration_calculator_params: Optional[dict] = None,
+    dipole_calculator_params: Optional[dict] = None,
     optimize: bool = True,
     delta: float = 0.01,
     fmax: float = 0.01,
@@ -481,16 +548,22 @@ def run_ir(
 
     Three roles (optimization, vibration, dipole) can use different
     calculators. Roles fall back to `calculator`. The **dipole** role must be
-    a calculator that implements dipoles (`xtb`, `orca`, or `mace-polar`) —
-    `mace`, `emt`, and `uma-*` will fail at the dipole step.
+    a calculator that implements dipoles (`xtb`, `orca`, `mace-polar`, or
+    `pyscf` with HF/DFT) — `mace`, `emt`, `uma-*`, and correlated PySCF
+    methods fail before any finite-difference work starts.
 
     Args:
         smiles | xyz: Input structure.
         calculator: Fallback calculator for all three roles.
-        calculator_params: Extra kwargs applied to whichever calculator
-            instances `calculator`-name resolves to (shared by all roles).
+        calculator_params: Extra kwargs for `calculator`, and the default
+            for any role override without its own `*_calculator_params`.
         optimization_calculator, vibration_calculator, dipole_calculator:
             Per-role overrides (calculator name).
+        optimization_calculator_params, vibration_calculator_params,
+        dipole_calculator_params: Per-role calculator kwargs, e.g.
+            dipole_calculator="orca" with
+            dipole_calculator_params={"orcasimpleinput": "B3LYP def2-SVP"}
+            alongside calculator="mace".
         optimize: Pre-optimize geometry.
         delta: Finite-difference displacement in Å.
         sparse_spectrum: If True, only points above `intensity_threshold`
@@ -506,23 +579,19 @@ def run_ir(
 
     atoms = _load_atoms(smiles, xyz)
     fallback = _get_calculator(calculator, calculator_params) if calculator else None
-    opt_c = (
-        _get_calculator(optimization_calculator, calculator_params)
-        if optimization_calculator
-        else None
-    )
-    vib_c = (
-        _get_calculator(vibration_calculator, calculator_params)
-        if vibration_calculator
-        else None
-    )
-    dip_c = (
-        _get_calculator(dipole_calculator, calculator_params)
-        if dipole_calculator
-        else None
-    )
 
-    with tempfile.TemporaryDirectory(prefix="iqc_mcp_ir_") as vib_dir:
+    def role(name, params):
+        if not name:
+            return None
+        return _get_calculator(name, calculator_params if params is None else params)
+
+    opt_c = role(optimization_calculator, optimization_calculator_params)
+    vib_c = role(vibration_calculator, vibration_calculator_params)
+    dip_c = role(dipole_calculator, dipole_calculator_params)
+
+    with _orca_scratch(fallback, opt_c, vib_c, dip_c), tempfile.TemporaryDirectory(
+        prefix="iqc_mcp_ir_"
+    ) as vib_dir:
         atoms, results = _rir(
             atoms,
             calculator=fallback,
@@ -603,6 +672,15 @@ def main() -> None:
         )
         os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
         sys.stdout = protocol_stdout
+        # Likewise keep JSON-RPC input off fd 0, so child processes (mpirun,
+        # file-IO engines) that read stdin cannot consume client requests.
+        protocol_stdin = os.fdopen(
+            os.dup(sys.stdin.fileno()), "r", encoding="utf-8"
+        )
+        devnull = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(devnull, sys.stdin.fileno())
+        os.close(devnull)
+        sys.stdin = protocol_stdin
 
     mcp.run(transport=args.transport)
 

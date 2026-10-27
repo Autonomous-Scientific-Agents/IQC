@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "iqc": {
-      "command": "python",
-      "args": ["-m", "iqc.mcp_server"],
+      "command": "sh",
+      "args": ["scripts/run_mcp_server.sh"],
       "env": {
         "IQC_DISABLE_MPI": "1",
         "OMP_NUM_THREADS": "1",
