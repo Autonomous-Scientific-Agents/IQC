@@ -87,7 +87,7 @@ _CALC_CACHE: dict[str, Any] = {}
 _MAX_LIST_LEN = 1000
 
 # Paths into a tool's TemporaryDirectory are gone by the time we respond.
-_TEMP_PATH_KEYS = {"ir_plot", "normal_mode_data"}
+_TEMP_PATH_KEYS = {"ir_plot"}
 
 # Complex parts this small relative to the other are treated as zero.
 _COMPLEX_RTOL = 1e-6

@@ -3755,11 +3755,6 @@ def run_ir(
                 warning = f"IR spectrum plot could not be generated: {e}"
                 logging.warning(warning)
                 results["warnings"].append(warning)
-
-        results["normal_mode_data"] = (
-            "Normal modes saved as .traj files with prefix "
-            f"{os.path.abspath(ir_name)}"
-        )
     except Exception as e:
         error = f"Error in IR analysis: {e}\n"
         results["error"] += error

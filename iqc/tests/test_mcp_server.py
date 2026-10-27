@@ -529,7 +529,6 @@ def test_launcher_serves_checkout_from_any_directory(tmp_path):
 def test_temporary_paths_and_large_lists_are_omitted():
     results = {
         "ir_plot": "/tmp/iqc_mcp_ir_x/spectrum.png",
-        "normal_mode_data": "Normal modes saved as .traj files with prefix /tmp/x",
         "spectrum_frequencies": list(range(3700)),
         "vibrational_frequencies_cm^-1": [100.0, 200.0],
     }
@@ -540,7 +539,7 @@ def test_temporary_paths_and_large_lists_are_omitted():
     }
     kept = server._trim_results(results, keep_arrays=True)
     assert len(kept["spectrum_frequencies"]) == 3700
-    assert "ir_plot" not in kept and "normal_mode_data" not in kept
+    assert "ir_plot" not in kept
 
 
 def test_launcher_rejects_interpreter_with_only_mcp(tmp_path):
