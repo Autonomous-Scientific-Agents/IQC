@@ -1522,6 +1522,36 @@ def test_run_ir_falls_back_to_single_calculator(tmp_path, monkeypatch):
     assert results["error"] == ""
 
 
+def test_run_ir_reports_only_files_it_writes(tmp_path, monkeypatch):
+    """No claim about normal-mode .traj files (none are written), and no PNG
+    or ir_plot when plot_spectrum=False."""
+    monkeypatch.chdir(tmp_path)
+    h2 = Atoms("H2", positions=[[0, 0, 0], [0, 0, 0.74]], cell=[10, 10, 10], pbc=False)
+
+    class _ZeroCalc:
+        def get_forces(self, atoms):
+            return np.zeros((len(atoms), 3))
+
+        def get_dipole_moment(self, atoms):
+            return np.zeros(3)
+
+    _, results = run_ir(
+        h2,
+        calculator=_ZeroCalc(),
+        optimize=False,
+        unique_name="h2_files",
+        vib_dir=str(tmp_path / "ir"),
+        delta=0.01,
+        plot_spectrum=False,
+    )
+
+    assert results["error"] == ""
+    assert "normal_mode_data" not in results
+    assert "ir_plot" not in results
+    assert not list(tmp_path.rglob("*.png"))
+    assert not list(tmp_path.rglob("*.traj"))
+
+
 def test_numerical_force_calculator_caches_repeated_stencils(water_atoms):
     """Repeated get_forces() at the same geometry must reuse the FD stencil.
 
